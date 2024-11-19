@@ -14,8 +14,7 @@ import obspy
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from scipy import signal
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 # import warnings
@@ -364,8 +363,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                 print(f"Reading {tmp_hdf5_keys}")
                 self.data_list = pd.read_csv(tmp_hdf5_keys, header=None, names=["trace_id"])["trace_id"].values.tolist()
         elif data_list is not None:
-            with open(data_list, "r") as f:
-                self.data_list = f.read().splitlines()
+                self.data_list = data_list
         elif data_path is not None:
             self.data_list = [x for x in sorted(list(glob(os.path.join(data_path, f"{prefix}*.{format}"))))]
         else:
@@ -729,13 +727,14 @@ class SeismicTraceIterableDataset(IterableDataset):
     def read_mseed(self, fname, response_path=None, response_xml=None, highpass_filter=False, sampling_rate=100):
         try:
             stream = obspy.Stream()
-            for tmp in fname.split(","):
-                with fsspec.open(tmp, "rb") as fs:
-                    meta = obspy.read(fs, format="MSEED")
-                    if response_path is not None:
-                        inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
-                        meta = meta.remove_sensitivity(inv)
-                    stream += meta
+            fname_list = glob(fname)
+            for tmp in fname_list:
+                # with fsspec.open(tmp, "rb") as fs:
+                meta = obspy.read(tmp) #, format="MSEED")
+                if response_path is not None:
+                    inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
+                    meta = meta.remove_sensitivity(inv)
+                stream += meta
                 # stream += obspy.read(tmp)
             stream = stream.merge(fill_value="latest")
             if (response_path is None) and (response_xml is not None):
@@ -927,7 +926,7 @@ class SeismicTraceIterableDataset(IterableDataset):
 
     def sample(self, data_list):
         for fname in data_list:
-            if self.format == "mseed":
+            if self.format == "mseed" or self.format == 'SAC': # TODO: check
                 meta = self.read_mseed(
                     fname,
                     response_path=self.response_path,
@@ -936,6 +935,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                     sampling_rate=self.sampling_rate,
                 )
                 fname = fname.split(",")[0]  ##E,N,Z
+                print(fname)
             elif (self.format == "h5") and (self.dataset == "seismic_trace"):
                 meta = self.read_hdf5(fname)
             elif (self.format == "h5") and (self.dataset == "das"):

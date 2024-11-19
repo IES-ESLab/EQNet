@@ -1,3 +1,5 @@
-from eqnet import models
-from eqnet import data
-from eqnet import utils
+from . import (
+    data,  # noqa: F401
+    models,  # noqa: F401
+    utils,  # noqa: F401
+)

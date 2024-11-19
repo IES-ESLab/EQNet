@@ -1,13 +1,13 @@
 # sample a batch of data with different number of stations
 
-import numpy as np
 import math
-from torch.utils.data.sampler import Sampler, BatchSampler
-from glob import glob
 from collections import defaultdict
 from itertools import chain, repeat
 
-import datasets
+import numpy as np
+from torch.utils.data.sampler import BatchSampler, Sampler
+
+# import datasets
 
 class StationSampler(BatchSampler):
     '''
