@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 from datetime import datetime, timedelta
@@ -5,20 +6,29 @@ from glob import glob
 
 import fsspec
 import h5py
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy
 import scipy.signal
 import torch
-import torch.multiprocessing as mp
-import torch.nn as nn
 import torch.nn.functional as F
-from scipy.interpolate import interp1d
 from torch.utils.data import Dataset, IterableDataset
 
-# mp.set_start_method("spawn", force=True)
 
+# mp.set_start_method("spawn", force=True)
+def h5_filter(data_path: str, prefix, suffix, format='h5'):
+    data_list= glob(os.path.join(data_path, f"{prefix}*{suffix}.{format}"))
+    real_list = []
+    for file in data_list:
+        try:
+            with h5py.File(file, "r") as fp:
+                ds = fp["data"]
+
+        except Exception as e:
+            logging.error(f"Error reading HDF5 file {file}: {e}") 
+            continue
+        real_list.append(file)
+    return real_list
 def normalize(data: torch.Tensor):
     """channel-wise normalization
 
@@ -531,14 +541,19 @@ class DASIterableDataset(IterableDataset):
             if type(data_list) == list:
                 self.data_list = []
                 for data_list_ in data_list:
-                    with open(data_list_, "r") as f:
+                    with open(data_list_) as f:
                         # read lines without \n
                         self.data_list += f.read().rstrip("\n").split("\n")
             else:
-                with open(data_list, "r") as f:
+                with open(data_list) as f:
                     self.data_list = f.read().rstrip("\n").split("\n")
         else:
-            self.data_list = glob(os.path.join(self.data_path, f"{prefix}*{suffix}.{format}"))
+            self.data_list = h5_filter(
+                data_path=self.data_path,
+                prefix=self.prefix,
+                suffix=self.suffix,
+                format=self.format
+                )
 
         if not training:
             self.data_list = self.data_list[rank::world_size]
@@ -563,10 +578,10 @@ class DASIterableDataset(IterableDataset):
             if type(label_list) is list:
                 self.label_list = []
                 for label_list_ in label_list:
-                    with open(label_list_, "r") as f:
+                    with open(label_list_) as f:
                         self.label_list += f.read().rstrip("\n").split("\n")
             else:
-                with open(label_list, "r") as f:
+                with open(label_list) as f:
                     self.label_list = f.read().rstrip("\n").split("\n")
             if training:
                 self.label_list = self.label_list[: len(self.label_list) // world_size * world_size]
@@ -577,16 +592,16 @@ class DASIterableDataset(IterableDataset):
             #     for label_path_ in label_path:
             #         self.label_list += glob(label_path_ + f"/*.csv")
             # else:
-            self.label_list = glob(self.label_path + f"/*.csv")
+            self.label_list = glob(self.label_path + "/*.csv")
         self.min_picks = kwargs["min_picks"] if "min_picks" in kwargs else 500
         if noise_list is not None:
             if type(noise_list) is list:
                 self.noise_list = []
                 for noise_list_ in noise_list:
-                    with open(noise_list_, "r") as f:
+                    with open(noise_list_) as f:
                         self.noise_list += f.read().rstrip("\n").split("\n")
             else:
-                with open(noise_list, "r") as f:
+                with open(noise_list) as f:
                     self.noise_list = f.read().rstrip("\n").split("\n")
         self.stack_noise = stack_noise
         self.stack_event = stack_event
@@ -920,7 +935,7 @@ class DASIterableDataset(IterableDataset):
                                 )
                             ):
                                 print(
-                                    f"Skip existing file",
+                                    "Skip existing file",
                                     os.path.join(
                                         self.pick_path,
                                         os.path.splitext(file.split("/")[-1])[0] + f"_{i:04d}_{j:04d}.csv",
