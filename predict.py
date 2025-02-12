@@ -4,14 +4,12 @@ import time
 from contextlib import nullcontext
 from glob import glob
 
+import eqnet
 import matplotlib
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
 import torch.utils.data
-from tqdm import tqdm
-
-import eqnet
 import utils
 import wandb
 from eqnet.data import DASIterableDataset, SeismicTraceIterableDataset
@@ -27,6 +25,7 @@ from eqnet.utils import (
     plot_phasenet,
     plot_phasenet_plus,
 )
+from tqdm import tqdm
 
 # mp.set_start_method("spawn", force=True)
 matplotlib.use("agg")
@@ -146,7 +145,6 @@ def pred_phasenet_plus(args, model, data_loader, pick_path, event_path, figure_p
                     phases=args.phases,
                     polarity_score=polarity_scores,
                     waveform=meta["data"],
-                    window_amp=[10, 5],  # s
                 )
 
             if ("event_center" in output) and (output["event_center"] is not None):
@@ -165,6 +163,7 @@ def pred_phasenet_plus(args, model, data_loader, pick_path, event_path, figure_p
                     dt=dt,
                     vmin=args.min_prob,
                     event_time=event_time,
+                    waveform=meta["data"],
                 )
 
             for i in range(len(meta["file_name"])):
@@ -498,7 +497,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--add_polarity", action="store_true", help="If use polarity information")
     parser.add_argument("--add_event", action="store_true", help="If use event information")
     parser.add_argument("--sampling_rate", type=float, default=100.0, help="sampling rate; default 100.0 Hz")
-    parser.add_argument("--highpass_filter", type=float, default=None, help="highpass filter; default 0.0 is no filter")
+    parser.add_argument("--highpass_filter", type=float, default=0.0, help="highpass filter; default 0.0 is no filter")
     parser.add_argument("--response_path", default=None, type=str, help="response path")
     parser.add_argument("--response_xml", default=None, type=str, help="response xml file")
     parser.add_argument("--subdir_level", default=0, type=int, help="folder depth for data list")
