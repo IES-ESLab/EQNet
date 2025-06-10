@@ -62,10 +62,10 @@ class MaskDecoder(nn.Module):
         #     [MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3) for i in range(self.num_mask_tokens)]
         # )
         self.output_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=(4, 1), stride=(4, 1)),
+            nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=(1, 4), stride=(1, 4)),
             LayerNorm2d(transformer_dim // 4),
             activation(),
-            nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=(4, 1), stride=(4, 1)),
+            nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=(1, 4), stride=(1, 4)),
             activation(),
         )
         self.output_hypernetworks_mlps = nn.ModuleList(

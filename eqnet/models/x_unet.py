@@ -111,6 +111,7 @@ class STFT(nn.Module):
         hop_length=4,
         window_fn=torch.hann_window,
         magnitude=True,
+        normalize_freq=False,
         discard_zero_freq=True,
         **kwargs,
     ):
@@ -119,6 +120,7 @@ class STFT(nn.Module):
         self.hop_length = hop_length
         self.window_fn = window_fn
         self.magnitude = magnitude
+        self.normalize_freq = normalize_freq
         self.discard_zero_freq = discard_zero_freq
         self.register_buffer("window", window_fn(n_fft))
         self.window_fn = window_fn
@@ -142,14 +144,18 @@ class STFT(nn.Module):
         # stft = stft[..., :-1, :]
         if self.discard_zero_freq:
             stft = stft.narrow(dim=-3, start=1, length=stft.shape[-3] - 1)
+        nf, nt, _ = stft.shape[-3:]
         if self.magnitude:
             stft = torch.norm(stft, dim=-1, keepdim=False)  # nb, ...., nf, nt
-            nf, nt = stft.shape[-2:]
             stft = stft.view(nb, nc, ns, nf, nt)  # nb, nc, ns, nf, nt
         else:
-            nf, nt, _ = stft.shape[-3:]
             stft = stft.view(nb, nc, ns, nf, nt, 2)  # nb, nc, ns, nf, nt, 2
             stft = stft.permute(0, 1, 5, 2, 3, 4).contiguous().view(nb, nc * 2, ns, nf, nt)  # nb, nc * 2, nt, nf
+
+        if self.normalize_freq:
+            vmax = torch.max(torch.abs(stft), dim=-2, keepdim=True)[0]
+            vmax[vmax == 0.0] = 1.0
+            stft = stft / vmax
 
         return stft
 
@@ -722,8 +728,8 @@ class XUnet(nn.Module):
 
         ## STFT
         if self.add_stft:
+            self.stft = STFT(n_fft=64 + 1, hop_length=self.downsample_per_stage[0][1])
             self.spec_init = nn.Sequential(
-                STFT(hop_length=self.downsample_per_stage[0][1]),
                 nn.Conv3d(
                     channels,
                     init_dim,
@@ -783,10 +789,6 @@ class XUnet(nn.Module):
 
     def forward(self, x):
 
-        # FIXME: HARDCODED for (batch, channel, station, time)
-        # could extend to (batch, channel, station, freq, time)
-        x = x.permute(0, 1, 3, 2)
-
         is_image = x.ndim == 4
 
         # validations
@@ -838,8 +840,12 @@ class XUnet(nn.Module):
             x = downsample(x)
 
         if self.add_stft:
-            x_stft = self.spec_init(x_origin)
-            sgram = x_stft.clone()
+            x_stft = self.stft(x_origin)
+            if self.training:
+                sgram = x_stft.clone()
+            else:
+                sgram = None
+            x_stft = self.spec_init(x_stft)
             for i, (init_block, blocks, merge_freq, merge_branch, downsample) in enumerate(self.spec_down):
                 x_stft = init_block(x_stft)
 
@@ -891,7 +897,7 @@ class XUnet(nn.Module):
 
         # final convolution
 
-        out = self.final_conv(x)
+        out_phase = self.final_conv(x)
 
         # polarity
         if self.add_polarity:
@@ -915,7 +921,7 @@ class XUnet(nn.Module):
             out_event = None
 
         if is_image:
-            out = rearrange(out, "b c 1 h w -> b c h w")
+            out_phase = rearrange(out_phase, "b c 1 h w -> b c h w")
             if self.add_polarity:
                 out_polarity = rearrange(out_polarity, "b c 1 h w -> b c h w")
             if self.add_event:
@@ -923,17 +929,9 @@ class XUnet(nn.Module):
             if self.add_prompt:
                 out_prompt = rearrange(out_prompt, "b c 1 h w -> b c h w")
 
-        # FIXME: HARDCODED
-        out_phase = out.permute(0, 1, 3, 2)
-        if out_polarity is not None:
-            out_polarity = out_polarity.permute(0, 1, 3, 2)
-        if out_event is not None:
-            out_event = out_event.permute(0, 1, 3, 2)
-        if out_prompt is not None:
-            out_prompt = out_prompt.permute(0, 1, 3, 2)
         out = {"phase": out_phase, "polarity": out_polarity, "event": out_event, "prompt": out_prompt}
-        if self.add_stft:
-            out["spectrogram"] = sgram.squeeze(2).permute(0, 1, 3, 2)
+        if self.add_stft and self.training:
+            out["spectrogram"] = sgram.squeeze(2)  ## nb, nc, nx, nf, nt -> nb, nc, nf, nt
         return out
 
 

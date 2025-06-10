@@ -144,30 +144,37 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 ## station location
                 station_location[0, i] = round(
                     self.hdf5_fp[trace_id].attrs["longitude"]
-                    * np.cos(np.radians(self.hdf5_fp[trace_id].attrs["latitude"]))
-                    * self.degree2km,
+                    # * np.cos(np.radians(self.hdf5_fp[trace_id].attrs["latitude"]))
+                    * np.cos(np.radians(self.hdf5_fp[event_id].attrs["latitude"])) * self.degree2km,
                     2,
                 )
                 station_location[1, i] = round(self.hdf5_fp[trace_id].attrs["latitude"] * self.degree2km, 2)
                 station_location[2, i] = round(-self.hdf5_fp[trace_id].attrs["elevation_m"] / 1e3, 2)
 
                 if i == 0:
-                    prompt = np.array([c0, dx, dy])  # t, x, y
+                    # prompt = np.array([c0, dx, dy])  # t, x, y
+                    prompt = np.array([c0, 0, 0])  ## relative to the selected station
                     prompt_location = np.array(
                         [self.hdf5_fp[trace_id].attrs["longitude"], self.hdf5_fp[trace_id].attrs["latitude"]]
                     )
                 # position.append([dx, dy])
                 dx = round(
-                    (prompt_location[0] - self.hdf5_fp[trace_id].attrs["longitude"])
+                    (self.hdf5_fp[trace_id].attrs["longitude"] - prompt_location[0])
                     * np.cos(np.radians(prompt_location[1]))
                     * self.degree2km,
                     2,
                 )
                 dy = round(
-                    (prompt_location[1] - self.hdf5_fp[trace_id].attrs["latitude"]) * self.degree2km,
+                    (self.hdf5_fp[trace_id].attrs["latitude"] - prompt_location[1]) * self.degree2km,
                     2,
                 )
                 position.append([dx, dy])
+
+                # print(
+                #     f"{station_location[0, i] - station_location[0, 0]=:.2f} {station_location[1, i] - station_location[1, 0]=:.2f}"
+                # )
+                # print(f"{dx = :.2f}, {dy = :.2f}")
+                # print(f"{prompt_location[0] = :.2f}, {prompt_location[1] = :.2f}")
 
             std = np.std(data, axis=1, keepdims=True)
             std[std == 0] = 1.0
@@ -201,6 +208,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 ],
                 axis=-1,
             )  # [nt, nsta, 3]
+
+            # print(f"{position[0,:,:] = }")
 
             prompt[0] = prompt[0] / self.nt  # [0 - 1]
             prompt[1] = prompt[1] / 100  # scale by 100 km
@@ -240,18 +249,39 @@ class SeismicNetworkIterableDataset(IterableDataset):
             event_time_old = event_time_new
             ###
 
+            ## FIXME: after update data loader
+            data = data.transpose(0, 2, 1)  # 3, nx, nt
+            phase_pick = phase_pick.transpose(0, 2, 1)  # 3, nx, nt
+            phase_mask = phase_mask.transpose(0, 2, 1)  # 1, nx, nt
+            event_center = event_center.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_time = event_time.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_mask = event_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            polarity = polarity.transpose(0, 2, 1)  # 1, nx, nt//20
+            polarity_mask = polarity_mask.transpose(0, 2, 1)  # 1, nx, nt//20
+            prompt_center = prompt_center.transpose(0, 2, 1)  # 1, nx, nt//16
+            prompt_mask = prompt_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            position = position.transpose(1, 0, 2)  # nx, nt, 3
+
+            polarity = polarity[..., :: self.polarity_feature_scale]
+            polarity_mask = polarity_mask[..., :: self.polarity_feature_scale]
+            event_center = event_center[..., :: self.event_feature_scale]
+            event_time = event_time[..., :: self.event_feature_scale]
+            event_mask = event_mask[..., :: self.event_feature_scale]
+            prompt_center = prompt_center[..., :: self.event_feature_scale]
+            prompt_mask = prompt_mask[..., :: self.event_feature_scale]
+
             yield {
                 "data": torch.from_numpy(data).float(),
                 "phase_pick": torch.from_numpy(phase_pick).float(),
                 "phase_mask": torch.from_numpy(phase_mask).float(),
-                "polarity": torch.from_numpy(polarity[:, :: self.polarity_feature_scale]).float(),
-                "polarity_mask": torch.from_numpy(polarity_mask[:, :: self.polarity_feature_scale]).float(),
-                "event_center": torch.from_numpy(event_center[:, :: self.event_feature_scale]).float(),
-                "event_time": torch.from_numpy(event_time[:, :: self.event_feature_scale]).float(),
-                "event_mask": torch.from_numpy(event_mask[:, :: self.event_feature_scale]).float(),
+                "polarity": torch.from_numpy(polarity).float(),
+                "polarity_mask": torch.from_numpy(polarity_mask).float(),
+                "event_center": torch.from_numpy(event_center).float(),
+                "event_time": torch.from_numpy(event_time).float(),
+                "event_mask": torch.from_numpy(event_mask).float(),
                 "station_location": torch.from_numpy(station_location).float(),
-                "prompt_center": torch.from_numpy(prompt_center[:, :: self.event_feature_scale]).float(),
-                "prompt_mask": torch.from_numpy(prompt_mask[:, :: self.event_feature_scale]).float(),
+                "prompt_center": torch.from_numpy(prompt_center).float(),
+                "prompt_mask": torch.from_numpy(prompt_mask).float(),
                 "prompt": torch.tensor(prompt),
                 "position": torch.tensor(position),
             }
@@ -354,19 +384,20 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 station_location[2, i] = round(-self.hdf5_fp[trace_id].attrs["elevation_m"] / 1e3, 2)
 
                 if i == 0:
-                    prompt = np.array([c0, dx, dy])  # t, x, y
+                    # prompt = np.array([c0, dx, dy])  # t, x, y
+                    prompt = np.array([c0, 0, 0])
                     prompt_location = np.array(
                         [self.hdf5_fp[trace_id].attrs["longitude"], self.hdf5_fp[trace_id].attrs["latitude"]]
                     )
                 # position.append([dx, dy])
                 dx = round(
-                    (prompt_location[0] - self.hdf5_fp[trace_id].attrs["longitude"])
+                    (self.hdf5_fp[trace_id].attrs["longitude"] - prompt_location[0])
                     * np.cos(np.radians(prompt_location[1]))
                     * self.degree2km,
                     2,
                 )
                 dy = round(
-                    (prompt_location[1] - self.hdf5_fp[trace_id].attrs["latitude"]) * self.degree2km,
+                    (self.hdf5_fp[trace_id].attrs["latitude"] - prompt_location[1]) * self.degree2km,
                     2,
                 )
                 position.append([dx, dy])

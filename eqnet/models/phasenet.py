@@ -7,188 +7,7 @@ from torch.nn import functional as F
 from .resnet1d import BasicBlock, Bottleneck, ResNet
 from .unet import UNet
 from .x_unet import XUnet
-
-default_cfg = {
-    "backbone": "unet",
-    "head": "unet",
-    "preprocess": {
-        "moving_norm": {
-            "flag": True,
-            "window": 1024,
-            "stride": 128,
-        },
-        "padding": {
-            "flag": True,
-            "nt": 1024,
-            "nx": 1,
-        },
-    },
-    "backbone_cfg": {
-        "in_channels": 3,
-    },
-    "head_cfg": {
-        "output_channels": 3,
-    },
-}
-
 from .prompt import MaskDecoder, PromptEncoder, TwoWayTransformer
-
-
-class FCNHead(nn.Module):
-    # class FCNHead(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super(FCNHead, self).__init__()
-        inter_channels = in_channels // 4
-        self.channels = out_channels
-        self.layers = nn.Sequential(
-            *[
-                nn.Conv1d(in_channels, inter_channels, 3, padding=1, bias=False),
-                nn.BatchNorm1d(inter_channels),
-                nn.ReLU(),
-                # nn.Dropout(0.1),
-                nn.Conv1d(inter_channels, out_channels, 1),
-            ]
-        )
-        # super(FCNHead, self).__init__(*layers)
-
-    def forward(self, features, targets=None):
-        x = features["phase"]
-        bt, st, ch, nt = x.shape  # batch, station, channel, time
-        x = x.view(bt * st, ch, nt)
-
-        x = self.layers(x)
-        x = F.interpolate(x, scale_factor=32, mode="linear", align_corners=False)
-
-        x = x.view(bt, st, x.shape[1], x.shape[2])
-        x = x.permute(0, 2, 3, 1)  # batch, channel, time, station
-
-        loss = None
-        if targets is not None:
-            loss = self.losses(x, targets)
-
-        return x, loss
-
-    def losses(self, inputs, targets):
-        inputs = inputs.float()
-
-        if self.out_channels == 1:
-            loss = F.binary_cross_entropy_with_logits(inputs, targets)
-        else:
-            loss = -torch.sum(targets.float() * F.log_softmax(inputs, dim=1), dim=1).mean()
-
-        return loss
-
-
-class DeepLabHead(nn.Module):
-    # class DeepLabHead(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int, scale_factor=1) -> None:
-        super(DeepLabHead, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.scale_factor = scale_factor
-        self.layers = nn.Sequential(
-            *[
-                # super().__init__(
-                ASPP(in_channels, [12, 24, 36]),
-                nn.Conv1d(256, 256, 3, padding=1, bias=False),
-                nn.BatchNorm1d(256),
-                nn.ReLU(),
-                nn.Conv1d(256, out_channels, 1),
-            ]
-        )
-
-    def forward(self, features, targets=None, mask=None):
-        x = features["phase"]
-        bt, st, ch, nt = x.shape  # batch, station, channel, time
-        x = x.view(bt * st, ch, nt)
-
-        x = self.layers(x)
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode="linear", align_corners=False)
-
-        x = x.view(bt, st, x.shape[1], x.shape[2])
-        x = x.permute(0, 2, 3, 1)
-
-        if self.training:
-            return None, self.losses(x, targets, mask)
-        return x, {}
-
-    def losses(self, inputs, targets, mask=None):
-        inputs = inputs.float()
-
-        if self.out_channels == 1:
-            loss = F.binary_cross_entropy_with_logits(inputs, targets, weight=mask)
-        else:
-            loss = torch.sum(-targets.float() * F.log_softmax(inputs, dim=1), dim=1).mean()
-
-        return loss
-
-
-class ASPPConv(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int, dilation: int) -> None:
-        modules = [
-            nn.Conv1d(
-                in_channels,
-                out_channels,
-                3,
-                padding=dilation,
-                dilation=dilation,
-                bias=False,
-            ),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
-        ]
-        super().__init__(*modules)
-
-
-class ASPPPooling(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        size = x.shape[-1]
-        for mod in self:
-            x = mod(x)
-        return F.interpolate(x, size=size, mode="linear", align_corners=False)
-
-
-class ASPP(nn.Module):
-    def __init__(self, in_channels: int, atrous_rates: List[int], out_channels: int = 256) -> None:
-        super().__init__()
-        modules = []
-        modules.append(
-            nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, 1, bias=False),
-                nn.BatchNorm1d(out_channels),
-                nn.ReLU(),
-            )
-        )
-
-        rates = tuple(atrous_rates)
-        for rate in rates:
-            modules.append(ASPPConv(in_channels, out_channels, rate))
-
-        modules.append(ASPPPooling(in_channels, out_channels))
-
-        self.convs = nn.ModuleList(modules)
-
-        self.project = nn.Sequential(
-            nn.Conv1d(len(self.convs) * out_channels, out_channels, 1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _res = []
-        for conv in self.convs:
-            _res.append(conv(x))
-        res = torch.cat(_res, dim=1)
-        return self.project(res)
 
 
 class UNetHead(nn.Module):
@@ -215,7 +34,7 @@ class UNetHead(nn.Module):
 
     def losses(self, inputs, targets, mask=None):
         """
-        targets: (batch, channel, time, station) or (batch, 1, time, station)
+        targets: (batch, channel, station, time)
         """
         inputs = inputs.float()
         log_targets = torch.nan_to_num(torch.log(targets))
@@ -410,8 +229,8 @@ class PhaseNet(nn.Module):
             # image_size = [256, 8]
             # elif backbone == "xunet":
             prompt_embed_dim = 32 * 4
-            image_embedding_size = [16, 8]
-            image_size = [16 * 16, 8]
+            image_embedding_size = [8, 16]
+            image_size = [8, 16 * 16]
 
             self.prompt_encoder = PromptEncoder(
                 embed_dim=prompt_embed_dim,
@@ -474,9 +293,9 @@ class PhaseNet(nn.Module):
         if self.add_prompt:
             ### FIXME: HARDCODED
             points = batched_inputs["prompt"].unsqueeze(1)  # [B, 1, 3]
-            pos = batched_inputs["position"]  # [B, T, S, 3]
-            B, T, S, _ = pos.shape
-            pos = pos.view(B, T * S, 3)
+            pos = batched_inputs["position"]  # [B, S, T, 3]
+            B, S, T, _ = pos.shape
+            pos = pos.view(B, S * T, 3)
             labels = torch.ones((points.shape[0], points.shape[1]))
             points = (points, labels)
             labels = torch.ones((pos.shape[0], pos.shape[1]))
@@ -484,11 +303,11 @@ class PhaseNet(nn.Module):
             if self.training:
                 # image_size = [256, 8]
                 # image_embedding_size = [256, 8]
-                image_size = [256, 8]
-                image_embedding_size = [16, 8]
+                image_size = [8, 256]
+                image_embedding_size = [8, 16]
             else:
-                image_size = (T, S)
-                image_embedding_size = (T, S)
+                image_size = (S, T)
+                image_embedding_size = (S, T)
             # print(f"{image_size=}")
             # point_embeddings, dense_embeddings = self.prompt_encoder(points=points, boxes=None, masks=None)
             # pos_embeddings, _ = self.prompt_encoder(points=pos, boxes=None, masks=None)
@@ -498,8 +317,8 @@ class PhaseNet(nn.Module):
             pos_embeddings, _ = self.prompt_encoder(
                 points=pos, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
             )
-            C = point_embeddings.shape[-1]
-            pos_embeddings = pos_embeddings.reshape(B, C, T, S)
+            C = point_embeddings.shape[-1]  # BxNxC
+            pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, T, S)  # BxCxSxT
 
             low_res_masks = []
             iou_predictions = []

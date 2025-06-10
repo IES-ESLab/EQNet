@@ -961,6 +961,17 @@ class SeismicTraceIterableDataset(IterableDataset):
 
                 waveform = np.nan_to_num(waveform.astype(np.float16))
 
+                ## FIXME: after update data loader
+                waveform = waveform.transpose(0, 2, 1)  # 3, nx, nt
+                phase_pick = phase_pick.transpose(0, 2, 1)  # 3, nx, nt
+                phase_mask = phase_mask.transpose(0, 2, 1)  # 1, nx, nt
+                event_center = event_center.transpose(0, 2, 1)  # 1, nx, nt//16
+                event_time = event_time.transpose(0, 2, 1)  # 1, nx, nt//16
+                event_mask = event_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+                polarity = polarity.transpose(0, 2, 1)  # 1, nx, nt//20
+                polarity_mask = polarity_mask.transpose(0, 2, 1)  # 1, nx, nt//20
+                # station_location  (3, nx)
+
                 yield {
                     "data": torch.from_numpy(waveform).float(),
                     "phase_pick": torch.from_numpy(phase_pick).float(),
