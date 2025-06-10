@@ -14,7 +14,7 @@ from tqdm import tqdm
 import eqnet
 import utils
 import wandb
-from eqnet.data import DASIterableDataset, SeismicTraceIterableDataset
+from eqnet.data import DASIterableDataset, SeismicNetworkIterableDataset, SeismicTraceIterableDataset
 from eqnet.models.unet import moving_normalize
 from eqnet.utils import (
     detect_peaks,
@@ -27,6 +27,7 @@ from eqnet.utils import (
     plot_phasenet,
     plot_phasenet_plus,
     plot_phasenet_tf,
+    plot_phasenet_prompt,
 )
 
 # mp.set_start_method("spawn", force=True)
@@ -67,7 +68,7 @@ def pred_phasenet(args, model, data_loader, pick_path, event_path, figure_path):
                 output = model(meta)
                 meta, output = postprocess(meta, output)
 
-            dt = meta["dt_s"] if "dt_s" in meta else [torch.tensor(0.01)] * len(meta["data"])
+            dt = meta["dt_s"] if "dt_s" in meta else torch.tensor([0.01] * len(meta["data"]))
 
             if "phase" in output:
                 phase_scores = torch.softmax(output["phase"], dim=1)  # [batch, nch, nt, nsta]
@@ -171,6 +172,21 @@ def pred_phasenet(args, model, data_loader, pick_path, event_path, figure_path):
                         polarity_scores.cpu().float() if polarity_scores is not None else None,
                         event_center.cpu().float() if "event_center" in output else None,
                         event_time.cpu().float() if "event_time" in output else None,
+                        phase_picks=phase_picks,
+                        event_detects=event_detects,
+                        file_name=meta["file_name"],
+                        dt=dt,
+                        figure_dir=figure_path,
+                    )
+                elif args.model == "phasenet_prompt":
+                    prompt_center = output["prompt_center"]
+                    plot_phasenet_prompt(
+                        meta,
+                        phase_scores.cpu().float(),
+                        polarity_scores.cpu().float() if polarity_scores is not None else None,
+                        event_center.cpu().float() if "event_center" in output else None,
+                        event_time.cpu().float() if "event_time" in output else None,
+                        prompt_center.cpu().float() if "prompt_center" in output else None,
                         phase_picks=phase_picks,
                         event_detects=event_detects,
                         file_name=meta["file_name"],
@@ -349,6 +365,9 @@ def main(args):
             world_size=world_size,
         )
         sampler = None
+    elif args.model == "phasenet_prompt":
+        dataset = SeismicNetworkIterableDataset(hdf5_file=args.hdf5_file, training=False)
+        sampler = None
     else:
         raise ("Unknown model")
 
@@ -374,7 +393,7 @@ def main(args):
 
     if args.resume:
         print(f"Loading checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         # model.load_state_dict(checkpoint["model"], strict=True)
         # print("Loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint["epoch"]))
     else:

@@ -199,7 +199,6 @@ def train_one_epoch(
         if processed_samples >= total_samples:
             break
 
-
     plot_results(meta, model, output, args, epoch, "train")
     del meta, output, loss
 
@@ -445,7 +444,7 @@ def main(args):
             dataset_test = dataset
             test_sampler = None
     elif args.model == "phasenet_prompt":
-        dataset = SeismicNetworkIterableDataset(hdf5_file=args.hdf5_file)
+        dataset = SeismicNetworkIterableDataset(hdf5_file=args.hdf5_file, training=True)
         train_sampler = None
         dataset_test = dataset
         test_sampler = None
@@ -486,11 +485,7 @@ def main(args):
             drop_last=False,
         )
 
-    model = eqnet.models.__dict__[args.model].build_model(
-        backbone=args.backbone,
-        in_channels=1,
-        out_channels=(len(args.phases) + 1),
-    )
+    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone)
     logger.info("Model:\n{}".format(model))
 
     print("Model:\n{}".format(model))
@@ -562,8 +557,7 @@ def main(args):
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu],
-            find_unused_parameters=True ## FIXME: What layers are not used?
+            model, device_ids=[args.gpu], find_unused_parameters=True  ## FIXME: What layers are not used?
         )
         model_without_ddp = model.module
 
@@ -577,7 +571,7 @@ def main(args):
     if args.resume:
         if args.checkpoint is not None:
             print(f"Loading model and optimizer from checkpoint '{args.checkpoint}'")
-            checkpoint = torch.load(args.resume, map_location="cpu")
+            checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         elif os.path.isfile(args.output_dir + "/checkpoint.pth"):
             print(f"Loading model and optimizer from checkpoint '{args.output_dir}/checkpoint.pth'")
             checkpoint = torch.load(args.output_dir + "/checkpoint.pth", map_location="cpu")
@@ -585,13 +579,13 @@ def main(args):
             print(f"No checkpoint found")
         if checkpoint is not None:
             model_without_ddp.load_state_dict(checkpoint["model"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            args.start_epoch = checkpoint["epoch"] + 1
-            if model_ema:
-                model_ema.load_state_dict(checkpoint["model_ema"])
-            if scaler:
-                scaler.load_state_dict(checkpoint["scaler"])
+        #     optimizer.load_state_dict(checkpoint["optimizer"])
+        #     lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        #     args.start_epoch = checkpoint["epoch"] + 1
+        #     if model_ema:
+        #         model_ema.load_state_dict(checkpoint["model_ema"])
+        #     if scaler:
+        #         scaler.load_state_dict(checkpoint["scaler"])
 
     start_time = time.time()
     best_loss = float("inf")

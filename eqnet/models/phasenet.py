@@ -193,7 +193,7 @@ class ASPP(nn.Module):
 
 class UNetHead(nn.Module):
     def __init__(
-        self, in_channels: int, out_channels: int, kernel_size=(7, 1), padding=(3, 0), feature_names: str = "phase"
+        self, in_channels: int, out_channels: int, kernel_size=(1, 1), padding=(0, 0), feature_names: str = "phase"
     ) -> None:
         super().__init__()
         self.out_channels = out_channels
@@ -201,24 +201,16 @@ class UNetHead(nn.Module):
         self.layers = nn.Conv2d(
             in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding
         )
-        # self.layers = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(1, 1), padding=(0, 0))
-        # self.layers = nn.Sequential(
-        #     nn.Conv2d(
-        #         in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size, padding=padding, bias=False
-        #     ),
-        #     nn.BatchNorm2d(num_features=in_channels),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(1, 1), padding=(0, 0)),
-        # )
 
     def forward(self, features, targets=None, mask=None):
+
         x = features[self.feature_names]
         x = self.layers(x)
 
         loss = None
         if targets is not None:
             loss = self.losses(x, targets, mask)
+
         return x, loss
 
     def losses(self, inputs, targets, mask=None):
@@ -295,8 +287,8 @@ class EventHead(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size=(7, 1),
-        padding=(3, 0),
+        kernel_size=(1, 1),
+        padding=(0, 0),
         scaling=1000.0,
         feature_names: str = "event",
     ) -> None:
@@ -348,21 +340,19 @@ class EventHead(nn.Module):
 class PhaseNet(nn.Module):
     def __init__(
         self,
-        backbone="unet",
-        init_features=16,
-        upsample="conv_transpose",  # "interpolate", "conv_transpose"
-        log_scale=True,
-        spectrogram=False,
+        backbone="xunet",
+        log_scale=False,
+        add_stft=False,
         add_polarity=False,
         add_event=False,
-        add_prompt=True,
+        add_prompt=False,
         event_center_loss_weight=1.0,
         event_time_loss_weight=1.0,
         polarity_loss_weight=1.0,
     ) -> None:
         super().__init__()
         self.backbone_name = backbone
-        self.spectrogram = spectrogram
+        self.add_stft = add_stft
         self.add_event = add_event
         self.add_polarity = add_polarity
         self.add_prompt = add_prompt
@@ -370,99 +360,78 @@ class PhaseNet(nn.Module):
         self.event_time_loss_weight = event_time_loss_weight
         self.polarity_loss_weight = polarity_loss_weight
 
-        if backbone == "resnet18":
-            self.backbone = ResNet(BasicBlock, [2, 2, 2, 2])  # ResNet18
-        elif backbone == "resnet50":
-            self.backbone = ResNet(Bottleneck, [3, 4, 6, 3])  # ResNet50
-        elif backbone == "unet":
+        if backbone == "unet":
             self.backbone = UNet(
-                init_features=init_features,
-                upsample=upsample,
+                init_features=8,
+                upsample="conv_transpose",
                 log_scale=log_scale,
-                spectrogram=spectrogram,
+                add_stft=add_stft,
                 add_polarity=add_polarity,
                 add_event=add_event,
+                add_prompt=add_prompt,
             )
         elif backbone == "xunet":
             self.backbone = XUnet(
                 channels=3,
-                dim=init_features,
-                out_dim=init_features,
-                use_convnext=True,
-                weight_standardize=True,
-                num_self_attn_per_stage=(0, 0, 1, 1),
-                dim_mults=(1, 2, 4, 8),
-                nested_unet_depths=(7, 4, 2, 1),  # nested unet depths, from unet-squared paper
-                consolidate_upsample_fmaps=True,  # whether to consolidate outputs from all upsample blocks, used in unet-squared paper
+                dim=16,
+                out_dim=32,
                 log_scale=log_scale,
+                add_stft=add_stft,
                 add_polarity=add_polarity,
                 add_event=add_event,
+                add_prompt=add_prompt,
             )
         else:
-            raise ValueError("backbone only supports resnet18, resnet50, or unet")
+            raise ValueError("backbone only supports unet or xunet")
 
-        if backbone in ["unet", "xunet"]:
-            kernel_size = (7, 1)
-            padding = (3, 0)
-            self.phase_picker = UNetHead(
-                init_features, 3, kernel_size=kernel_size, padding=padding, feature_names="phase"
-            )
-            if self.add_event:
-                if self.backbone_name == "xunet":
-                    self.event_detector = UNetHead(
-                        init_features * 8, 1, kernel_size=kernel_size, padding=padding, feature_names="event"
-                    )
-                    self.event_timer = EventHead(
-                        init_features * 8, 1, kernel_size=kernel_size, padding=padding, feature_names="event"
-                    )
-                else:
-                    self.event_detector = UNetHead(
-                        init_features, 1, kernel_size=kernel_size, padding=padding, feature_names="event"
-                    )
-                    self.event_timer = EventHead(
-                        init_features, 1, kernel_size=kernel_size, padding=padding, feature_names="event"
-                    )
-                
-                # #### FIXME: HARDCODED
-                if self.add_prompt:
-                    prompt_embed_dim = 16
-                    image_embedding_size = [256, 8]
-                    image_size = [256, 8]
-
-                    self.prompt_encoder=PromptEncoder(
-                        embed_dim=prompt_embed_dim,
-                        image_embedding_size=image_embedding_size,
-                        input_image_size=image_size,
-                        mask_in_chans=16,
-                    )
-                    self.mask_decoder=MaskDecoder(
-                        num_multimask_outputs=1,
-                        transformer=TwoWayTransformer(
-                            depth=2,
-                            embedding_dim=prompt_embed_dim,
-                            mlp_dim=512,
-                            num_heads=4,
-                        ),
-                        transformer_dim=prompt_embed_dim,
-                        iou_head_depth=3,
-                        iou_head_hidden_dim=16,
-                    )
-                # ####
-
-                
+        if backbone == "unet":
+            self.phase_picker = UNetHead(16, 3, feature_names="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(
-                    init_features, 1, kernel_size=kernel_size, padding=padding, feature_names="polarity"
-                )
-                # self.polarity_picker = UNetHead(16, 1, feature_names="polarity")
+                self.polarity_picker = UNetHead(16, 1, feature_names="polarity")
+            if self.add_event:
+                self.event_detector = UNetHead(16, 1, feature_names="event")
+                self.event_timer = EventHead(16, 1, feature_names="event")
+
+        elif backbone == "xunet":
+            self.phase_picker = UNetHead(32, 3, feature_names="phase")
+            if self.add_polarity:
+                self.polarity_picker = UNetHead(32, 1, feature_names="polarity")
+            if self.add_event:
+                self.event_detector = UNetHead(32, 1, feature_names="event")
+                self.event_timer = EventHead(32, 1, feature_names="event")
+
         else:
-            self.phase_picker = DeepLabHead(128, 3, scale_factor=32)
-            if self.add_event:
-                self.event_detector = DeepLabHead(128, 1, scale_factor=2)
-                self.event_timer = EventHead(128, 1, scale_factor=2)
-            if self.add_polarity:
-                self.polarity_picker = DeepLabHead(128, 1, scale_factor=32)
+            raise ValueError("backbone only supports unet or xunet")
+        ##### FIXME: HARDCODED
+        if self.add_prompt:
+            # if backbone == "unet":
+            # prompt_embed_dim = 16
+            # image_embedding_size = [256, 8]
+            # image_size = [256, 8]
+            # elif backbone == "xunet":
+            prompt_embed_dim = 32 * 4
+            image_embedding_size = [16, 8]
+            image_size = [16 * 16, 8]
 
+            self.prompt_encoder = PromptEncoder(
+                embed_dim=prompt_embed_dim,
+                image_embedding_size=image_embedding_size,
+                input_image_size=image_size,
+                mask_in_chans=16,
+            )
+            self.mask_decoder = MaskDecoder(
+                num_multimask_outputs=1,
+                transformer=TwoWayTransformer(
+                    depth=2,
+                    embedding_dim=prompt_embed_dim,
+                    mlp_dim=512,
+                    num_heads=4,
+                ),
+                transformer_dim=prompt_embed_dim,
+                iou_head_depth=3,
+                iou_head_hidden_dim=16,
+            )
+        #####
 
     @property
     def device(self):
@@ -502,30 +471,50 @@ class PhaseNet(nn.Module):
                 output["loss_event_time"] = loss_event_time * self.event_time_loss_weight
                 output["loss"] += loss_event_time * self.event_time_loss_weight
 
-
+        if self.add_prompt:
             ### FIXME: HARDCODED
-            points = batched_inputs["prompt"].unsqueeze(1) # [B, 1, 3]
-            pos = batched_inputs["position"] # [B, T, S, 3]
+            points = batched_inputs["prompt"].unsqueeze(1)  # [B, 1, 3]
+            pos = batched_inputs["position"]  # [B, T, S, 3]
             B, T, S, _ = pos.shape
-            pos = pos.view(B, T*S, 3)
+            pos = pos.view(B, T * S, 3)
             labels = torch.ones((points.shape[0], points.shape[1]))
             points = (points, labels)
             labels = torch.ones((pos.shape[0], pos.shape[1]))
             pos = (pos, labels)
-            point_embeddings, dense_embeddings = self.prompt_encoder(points=points, boxes=None, masks=None)
-            pos_embeddings, _ = self.prompt_encoder(points=pos, boxes=None, masks=None)
+            if self.training:
+                # image_size = [256, 8]
+                # image_embedding_size = [256, 8]
+                image_size = [256, 8]
+                image_embedding_size = [16, 8]
+            else:
+                image_size = (T, S)
+                image_embedding_size = (T, S)
+            # print(f"{image_size=}")
+            # point_embeddings, dense_embeddings = self.prompt_encoder(points=points, boxes=None, masks=None)
+            # pos_embeddings, _ = self.prompt_encoder(points=pos, boxes=None, masks=None)
+            point_embeddings, dense_embeddings = self.prompt_encoder(
+                points=points, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
+            )
+            pos_embeddings, _ = self.prompt_encoder(
+                points=pos, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
+            )
             C = point_embeddings.shape[-1]
             pos_embeddings = pos_embeddings.reshape(B, C, T, S)
 
             low_res_masks = []
             iou_predictions = []
-            image_embeddings = features["event"]
-            for i in range(B): ## FIXME: Don't understand why have to use loop here
+            image_embeddings = features["prompt"]
+            # print(f"{image_embeddings.shape=}")
+            # print(f"{point_embeddings.shape=}")
+            # print(f"{pos_embeddings.shape=}")
+            # print(f"{dense_embeddings.shape=}")
+
+            for i in range(B):  ## FIXME: Don't understand why have to use loop here
                 low_res_masks_, iou_predictions_ = self.mask_decoder(
-                    image_embeddings=image_embeddings[i:i+1],
-                    image_pe=pos_embeddings[i:i+1],
-                    sparse_prompt_embeddings=point_embeddings[i:i+1],
-                    dense_prompt_embeddings=dense_embeddings[i:i+1],
+                    image_embeddings=image_embeddings[i : i + 1],
+                    image_pe=pos_embeddings[i : i + 1],
+                    sparse_prompt_embeddings=point_embeddings[i : i + 1],
+                    dense_prompt_embeddings=dense_embeddings[i : i + 1],
                     multimask_output=False,
                 )
 
@@ -548,10 +537,13 @@ class PhaseNet(nn.Module):
             # loss_prompt = torch.mean(focal_loss) * 100
 
             prob = inputs.sigmoid()
-            min_loss = -(targets * torch.nan_to_num(torch.log(targets)) + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
+            min_loss = -(
+                targets * torch.nan_to_num(torch.log(targets))
+                + (1 - targets) * torch.nan_to_num(torch.log(1 - targets))
+            )
             ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
             p_t = prob * targets + (1 - prob) * (1 - targets)
-            gamma=2.0
+            gamma = 2.0
             loss_prompt = ce_loss * ((1 - p_t) ** gamma)
             loss_prompt = 10 * torch.mean(loss_prompt)
 
@@ -566,7 +558,7 @@ class PhaseNet(nn.Module):
             if loss_polarity is not None:
                 output["loss_polarity"] = loss_polarity * self.polarity_loss_weight
                 output["loss"] += loss_polarity * self.polarity_loss_weight
-        if self.spectrogram:
+        if self.add_stft:
             output["spectrogram"] = features["spectrogram"]
 
         return output
@@ -574,13 +566,11 @@ class PhaseNet(nn.Module):
 
 def build_model(
     backbone="unet",
-    init_features=16,
     log_scale=False,
     *args,
     **kwargs,
 ) -> PhaseNet:
     return PhaseNet(
         backbone=backbone,
-        init_features=init_features,
         log_scale=log_scale,
     )

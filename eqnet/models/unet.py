@@ -137,22 +137,24 @@ class UNet(nn.Module):
         padding=(3, 0),
         moving_norm=(1024, 128),
         upsample="conv_transpose",
-        add_polarity=False,
-        add_event=False,
         add_stft=False,
         log_scale=False,
-        spectrogram=False,
+        add_polarity=False,
+        add_event=False,
+        add_prompt=False,
     ):
         super(UNet, self).__init__()
 
         features = init_features
-        self.add_polarity = add_polarity
-        self.add_event = add_event
-        self.add_stft = add_stft
+
         self.moving_norm = moving_norm
         self.log_scale = log_scale
-        self.spectrogram = spectrogram
-        if self.spectrogram:
+        self.add_stft = add_stft
+        self.add_polarity = add_polarity
+        self.add_event = add_event
+        self.add_prompt = add_prompt
+
+        if self.add_stft:
             self.n_fft = 64
             self.stft = STFT(
                 n_fft=self.n_fft,
@@ -215,7 +217,7 @@ class UNet(nn.Module):
             features * 8, features * 16, kernel_size=kernel_size, stride=stride, padding=padding, name="enc5"
         )
 
-        extra_features = 1 if self.spectrogram else 0
+        extra_features = 1 if self.add_stft else 0
         if upsample == "interpolate":
             self.upconv54 = nn.Sequential(
                 OrderedDict(
@@ -286,7 +288,7 @@ class UNet(nn.Module):
             name="dec2",
         )
         self.output_conv = self.encoder_block(
-            features * 2, features, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="output"
+            features * 2, features * 2, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="output"
         )
 
         if self.add_polarity:
@@ -294,12 +296,17 @@ class UNet(nn.Module):
                 1, features, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="enc1_polarity"
             )
             self.output_polarity = self.encoder_block(
-                features * 2, features, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="output_polarity"
+                features * 2,
+                features * 2,
+                kernel_size=kernel_size,
+                stride=(1, 1),
+                padding=padding,
+                name="output_polarity",
             )
 
         if self.add_event:
             self.output_event = self.encoder_block(
-                features * 4, features, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="output_event"
+                features * 4, features * 2, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="output_event"
             )
 
         if (init_stride[0] > 1) or (init_stride[1] > 1):
@@ -309,7 +316,7 @@ class UNet(nn.Module):
 
     def forward(self, x):
         bt, ch, nt, nx = x.shape  # batch, channel, time, station
-        if self.spectrogram:
+        if self.add_stft:
             assert nx == 1
             sgram = torch.squeeze(x, -1)  # bt, ch, nt, nx=1 => bt, ch, nt
             sgram = self.stft(sgram)  # bt, ch, nt => bt, ch*2, nt, nf
@@ -339,11 +346,16 @@ class UNet(nn.Module):
         enc4 = self.encoder34(enc3)
         enc5 = self.encoder45(enc4)
 
-        if self.spectrogram:
+        if self.add_stft:
             enc2 = torch.cat((enc2, enc2_tf), dim=1)
             enc3 = torch.cat((enc3, enc3_tf), dim=1)
             enc4 = torch.cat((enc4, enc4_tf), dim=1)
             enc5 = torch.cat((enc5, enc5_tf), dim=1)
+
+        if self.add_prompt:
+            out_prompt = enc5.clone()
+        else:
+            out_prompt = None
 
         dec4 = self.upconv54(enc5)
 
@@ -379,8 +391,8 @@ class UNet(nn.Module):
         # TODO: Check AGAIN if these part is needed.
         # out_phase = out_phase[:, :, :nt, :nx]
 
-        result = {"phase": out_phase, "polarity": out_polarity, "event": out_event}
-        if self.spectrogram:
+        result = {"phase": out_phase, "polarity": out_polarity, "event": out_event, "prompt": out_prompt}
+        if self.add_stft:
             result["spectrogram"] = sgram
 
         return result

@@ -177,7 +177,7 @@ def stack_event(
     for i in range(random.randint(1, 10)):
 
         if (amp_signal1 == 0) or (amp_noise1 == 0) or (amp_signal2 == 0) or (amp_noise2 == 0):
-            #print(f"not stack because of amp_signal1={amp_signal1}, amp_noise1={amp_noise1}, amp_signal2={amp_signal2}, amp_noise2={amp_noise2}")
+            # print(f"not stack because of amp_signal1={amp_signal1}, amp_noise1={amp_noise1}, amp_signal2={amp_signal2}, amp_noise2={amp_noise2}")
             break
 
         tries = 0
@@ -185,7 +185,7 @@ def stack_event(
             min_ratio2 = np.log10(amp_noise1 / amp_signal2)
             max_ratio2 = np.log10(amp_signal1 / amp_noise2)
             if min_ratio2 > max_ratio2:
-                #print(f"not stack {meta2['trace_id']} to {meta1['trace_id']} at {i}-th because of snr mismatching min_ratio2 > max_ratio2: {min_ratio2} > {max_ratio2}, {amp_noise1 = }, {amp_signal1 = }, {amp_noise2 = }, {amp_signal2 = }")
+                # print(f"not stack {meta2['trace_id']} to {meta1['trace_id']} at {i}-th because of snr mismatching min_ratio2 > max_ratio2: {min_ratio2} > {max_ratio2}, {amp_noise1 = }, {amp_signal1 = }, {amp_noise2 = }, {amp_signal2 = }")
                 # print(f"min_ratio2 > max_ratio2: {min_ratio2} > {max_ratio2}, {amp_noise1 = }, {amp_signal1 = }, {amp_noise2 = }, {amp_signal2 = }")
                 break
 
@@ -217,7 +217,7 @@ def stack_event(
             ratio2 = 10 ** (random.uniform(max(-3, min_ratio2), min(3, max_ratio2)))
             flip = random.choice([-1.0, 1.0])  ## flip waveform2 polarity
             waveform1 = waveform1 + waveform2_ * ratio2 * flip
-            #amp_noise1 = amp_noise1 + amp_noise2 * ratio2
+            # amp_noise1 = amp_noise1 + amp_noise2 * ratio2
             amp_noise1 = max(amp_noise1, amp_noise2 * ratio2)
             amp_signal1 = min(amp_signal1, amp_signal2 * ratio2)
 
@@ -249,7 +249,7 @@ def stack_event(
 
         # if tries == max_tries:
         #     print(f"stack {i}-th event fails after {max_tries} tries")
-    #if failed:
+    # if failed:
     #    print("stack event failed")
 
     return {
@@ -279,7 +279,7 @@ def cut_noise(
     phase_mask = meta["phase_mask"].copy()  # nt, 1
     idx = np.min(np.argmax(phase_mask, axis=0))
     for _ in range(10):
-        shift = 0 if idx<20 else random.randint(-idx + 10, 0)
+        shift = 0 if idx < 20 else random.randint(-idx + 10, 0)
         waveform_ = np.roll(waveform, shift, axis=1)
         phase_mask_ = np.roll(phase_mask, shift, axis=0)
         if phase_mask_[-nt:, :].sum() == 0:
@@ -584,8 +584,8 @@ class SeismicTraceIterableDataset(IterableDataset):
         else:
             # return snr[-1], signals[-1], noises[-1]
             # return np.max(snr), np.max(signals), np.max(noises)
-            #return np.max(snr).item(), np.std(signals).item(), np.std(noises).item()
-        # else:
+            # return np.max(snr).item(), np.std(signals).item(), np.std(noises).item()
+            # else:
             idx = np.argmax(snr).item()
             return snr[idx], signals[idx], noises[idx]
 
@@ -633,12 +633,12 @@ class SeismicTraceIterableDataset(IterableDataset):
 
         ## phase picks
         attrs = dict(hdf5_fp[trace_id].attrs)
-        #idxs = np.argsort(attrs["phase_index"])
-        #attrs["event_id"] = np.array(attrs["event_id"])[idxs]
-        #attrs["phase_index"] = attrs["phase_index"][idxs]
-        #attrs["phase_type"] = np.array(attrs["phase_type"])[idxs]
-        #attrs["phase_score"] = np.array(attrs["phase_score"])[idxs]
-        #attrs["phase_time"] = np.array(attrs["phase_time"])[idxs]
+        # idxs = np.argsort(attrs["phase_index"])
+        # attrs["event_id"] = np.array(attrs["event_id"])[idxs]
+        # attrs["phase_index"] = attrs["phase_index"][idxs]
+        # attrs["phase_type"] = np.array(attrs["phase_type"])[idxs]
+        # attrs["phase_score"] = np.array(attrs["phase_score"])[idxs]
+        # attrs["phase_time"] = np.array(attrs["phase_time"])[idxs]
         meta = {}
 
         for phase in self.phases:
@@ -657,7 +657,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         snr, amp_signal, amp_noise = self.calc_snr(waveform, meta["P"])
         if snr == 0:
             return None
-        #print(f"{trace_id}: {snr = }, {amp_signal = }, {amp_noise = }")
+        # print(f"{trace_id}: {snr = }, {amp_signal = }, {amp_noise = }")
         # if snr < self.min_snr:
         #     return None
 
@@ -695,8 +695,8 @@ class SeismicTraceIterableDataset(IterableDataset):
         duration = []
         event_time0 = datetime.fromisoformat(hdf5_fp[event_id].attrs["event_time"])
         for e in event_ids:
-            if len(e.split('_'))>1: # skip non-catalog events
-                duration.append([0,0])
+            if len(e.split("_")) > 1:  # skip non-catalog events
+                duration.append([0, 0])
                 continue
             tmp_min = np.min(attrs["phase_index"][attrs["event_id"] == e]).item()
             tmp_max = np.max(attrs["phase_index"][attrs["event_id"] == e]).item()
@@ -705,8 +705,10 @@ class SeismicTraceIterableDataset(IterableDataset):
             s_picks = attrs["phase_index"][(attrs["event_id"] == e) & (attrs["phase_type"] == "S")]
             if len(p_picks) == 0 or len(s_picks) == 0:  # need both P and S
                 continue
-            if not len(p_picks) == len(s_picks): #FIXME: temp
-                print(f"{trace_id} has unmatched P&S pair at {e}: len(p_picks)={len(p_picks)}, len(s_picks)={len(s_picks)}, p_picks={p_picks}, s_picks={s_picks}")
+            if not len(p_picks) == len(s_picks):  # FIXME: temp
+                print(
+                    f"{trace_id} has unmatched P&S pair at {e}: len(p_picks)={len(p_picks)}, len(s_picks)={len(s_picks)}, p_picks={p_picks}, s_picks={s_picks}"
+                )
             p_idx, s_idx = p_picks[0], s_picks[0]
             # duration.append([np.min(attrs["phase_index"][attrs["event_id"] == e]).item(), np.max(attrs["phase_index"][attrs["event_id"] == e]).item()])
             if s_idx <= p_idx:
@@ -716,8 +718,8 @@ class SeismicTraceIterableDataset(IterableDataset):
                 continue
             if len(attrs["phase_index"][attrs["event_id"] == e]) <= 1:  # need both P and S
                 continue
-            #c0.append(np.mean(attrs["phase_index"][attrs["event_id"] == e]).item())
-            c0.append((p_idx+s_idx)/2)
+            # c0.append(np.mean(attrs["phase_index"][attrs["event_id"] == e]).item())
+            c0.append((p_idx + s_idx) / 2)
             shift_t0 = (
                 int(
                     round(
@@ -878,8 +880,8 @@ class SeismicTraceIterableDataset(IterableDataset):
                     continue
 
                 # if self.stack_event and (random.random() < 0.6):
-                #stack_count = 0
-                #if self.stack_event:
+                # stack_count = 0
+                # if self.stack_event:
                 #    stack_times = np.random.choice(([1, 2, 3]), p=[0.3, 0.5, 0.2])
                 #    max_tries = 20
                 #    for itry in range(max_tries):
@@ -914,7 +916,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                     if meta2 is not None:
                         meta, is_failed = stack_event(meta, meta2)
 
-                #meta = cut_data(meta, min_point=self.phase_width[0] * 2 * max(1, (stack_count+1)//2), nt=self.nt)
+                # meta = cut_data(meta, min_point=self.phase_width[0] * 2 * max(1, (stack_count+1)//2), nt=self.nt)
                 meta = cut_data(meta, min_point=self.phase_width[0] * 2)
 
                 if self.stack_noise:
