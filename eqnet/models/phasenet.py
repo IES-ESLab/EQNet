@@ -12,18 +12,18 @@ from .prompt import MaskDecoder, PromptEncoder, TwoWayTransformer
 
 class UNetHead(nn.Module):
     def __init__(
-        self, in_channels: int, out_channels: int, kernel_size=(1, 1), padding=(0, 0), feature_names: str = "phase"
+        self, in_channels: int, out_channels: int, kernel_size=(1, 1), padding=(0, 0), feature_name: str = "phase"
     ) -> None:
         super().__init__()
         self.out_channels = out_channels
-        self.feature_names = feature_names
+        self.feature_name = feature_name
         self.layers = nn.Conv2d(
             in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding
         )
 
     def forward(self, features, targets=None, mask=None):
 
-        x = features[self.feature_names]
+        x = features[self.feature_name]
         x = self.layers(x)
 
         loss = None
@@ -109,11 +109,11 @@ class EventHead(nn.Module):
         kernel_size=(1, 1),
         padding=(0, 0),
         scaling=1000.0,
-        feature_names: str = "event",
+        feature_name: str = "event",
     ) -> None:
         super().__init__()
         self.out_channels = out_channels
-        self.feature_names = feature_names
+        self.feature_name = feature_name
         self.scaling = scaling
         # self.layers = nn.Conv2d(
         #     in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding
@@ -132,7 +132,7 @@ class EventHead(nn.Module):
         )
 
     def forward(self, features, targets=None, mask=None):
-        x = features[self.feature_names]
+        x = features[self.feature_name]
         x = self.layers(x) * self.scaling
 
         loss = None
@@ -156,6 +156,106 @@ class EventHead(nn.Module):
         return loss
 
 
+class PromptHead(nn.Module):
+    def __init__(self, prompt_embed_dim=32 * 4, input_size=[8, 16 * 16], embedding_size=[8, 16], feature_name="prompt"):
+        super().__init__()
+
+        self.prompt_embed_dim = prompt_embed_dim
+        self.input_size = input_size
+        self.embedding_size = embedding_size
+        self.feature_name = feature_name
+
+        self.prompt_encoder = PromptEncoder(
+            embed_dim=prompt_embed_dim,
+            image_embedding_size=embedding_size,
+            input_image_size=input_size,
+            mask_in_chans=16,
+        )
+        self.mask_decoder = MaskDecoder(
+            num_multimask_outputs=0,
+            transformer=TwoWayTransformer(
+                depth=2,
+                embedding_dim=prompt_embed_dim,
+                mlp_dim=512,
+                num_heads=4,
+            ),
+            transformer_dim=prompt_embed_dim,
+            iou_head_depth=3,
+            iou_head_hidden_dim=16,
+        )
+
+    def forward(self, features, points, pos, targets=None):
+
+        B, S, T, _ = pos.shape
+        pos = pos.view(B, S * T, 3)
+        labels = torch.ones((points.shape[0], points.shape[1]))
+        points = (points, labels)
+        labels = torch.ones((pos.shape[0], pos.shape[1]))
+        pos = (pos, labels)
+        if self.training:  ## FIXME
+            image_size = self.input_size
+            image_embedding_size = self.embedding_size
+        else:
+            image_size = (S, T)
+            image_embedding_size = (S, T)
+
+        point_embeddings, dense_embeddings = self.prompt_encoder(
+            points=points, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
+        )
+        pos_embeddings, _ = self.prompt_encoder(
+            points=pos, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
+        )
+        C = point_embeddings.shape[-1]  # BxNxC
+        pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, T, S)  # BxCxSxT
+
+        low_res_masks = []
+        iou_predictions = []
+        image_embeddings = features[self.feature_name]
+
+        for i in range(B):  ## FIXME: Don't understand why have to use loop here
+            low_res_masks_, iou_predictions_ = self.mask_decoder(
+                image_embeddings=image_embeddings[i : i + 1],
+                image_pe=pos_embeddings[i : i + 1],
+                sparse_prompt_embeddings=point_embeddings[i : i + 1],
+                dense_prompt_embeddings=dense_embeddings[i : i + 1],
+                multimask_output=False,
+            )
+
+            low_res_masks.append(low_res_masks_)
+            iou_predictions.append(iou_predictions_)
+
+        low_res_masks = torch.cat(low_res_masks, dim=0)
+        iou_predictions = torch.cat(iou_predictions, dim=0)
+
+        loss = None
+        if targets is not None:
+            loss = self.losses(low_res_masks, targets)
+
+        return low_res_masks, loss
+
+    def losses(self, inputs, targets):
+
+        inputs = inputs.float()
+        prob = inputs.sigmoid()
+
+        # ## focal loss
+        # bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        # pt = torch.exp(-bce_loss) # probability of the correct class
+        # focal_loss = (1 - pt) ** 2 * bce_loss # alpha=1, gamma=2
+        # loss = torch.mean(focal_loss) * 100
+
+        min_loss = -(
+            targets * torch.nan_to_num(torch.log(targets)) + (1 - targets) * torch.nan_to_num(torch.log(1 - targets))
+        )
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
+        p_t = prob * targets + (1 - prob) * (1 - targets)
+        gamma = 2.0
+        loss = ce_loss * ((1 - p_t) ** gamma)
+        loss = 10 * torch.mean(loss)
+
+        return loss
+
+
 class PhaseNet(nn.Module):
     def __init__(
         self,
@@ -168,6 +268,7 @@ class PhaseNet(nn.Module):
         event_center_loss_weight=1.0,
         event_time_loss_weight=1.0,
         polarity_loss_weight=1.0,
+        prompt_loss_weight=1.0,
     ) -> None:
         super().__init__()
         self.backbone_name = backbone
@@ -178,6 +279,7 @@ class PhaseNet(nn.Module):
         self.event_center_loss_weight = event_center_loss_weight
         self.event_time_loss_weight = event_time_loss_weight
         self.polarity_loss_weight = polarity_loss_weight
+        self.prompt_loss_weight = prompt_loss_weight
 
         if backbone == "unet":
             self.backbone = UNet(
@@ -204,53 +306,25 @@ class PhaseNet(nn.Module):
             raise ValueError("backbone only supports unet or xunet")
 
         if backbone == "unet":
-            self.phase_picker = UNetHead(16, 3, feature_names="phase")
+            self.phase_picker = UNetHead(16, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(16, 1, feature_names="polarity")
+                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(16, 1, feature_names="event")
-                self.event_timer = EventHead(16, 1, feature_names="event")
+                self.event_detector = UNetHead(16, 1, feature_name="event")
+                self.event_timer = EventHead(16, 1, feature_name="event")
 
         elif backbone == "xunet":
-            self.phase_picker = UNetHead(32, 3, feature_names="phase")
+            self.phase_picker = UNetHead(32, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(32, 1, feature_names="polarity")
+                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(32, 1, feature_names="event")
-                self.event_timer = EventHead(32, 1, feature_names="event")
+                self.event_detector = UNetHead(32, 1, feature_name="event")
+                self.event_timer = EventHead(32, 1, feature_name="event")
 
         else:
             raise ValueError("backbone only supports unet or xunet")
-        ##### FIXME: HARDCODED
         if self.add_prompt:
-            # if backbone == "unet":
-            # prompt_embed_dim = 16
-            # image_embedding_size = [256, 8]
-            # image_size = [256, 8]
-            # elif backbone == "xunet":
-            prompt_embed_dim = 32 * 4
-            image_embedding_size = [8, 16]
-            image_size = [8, 16 * 16]
-
-            self.prompt_encoder = PromptEncoder(
-                embed_dim=prompt_embed_dim,
-                image_embedding_size=image_embedding_size,
-                input_image_size=image_size,
-                mask_in_chans=16,
-            )
-            self.mask_decoder = MaskDecoder(
-                num_multimask_outputs=0,
-                transformer=TwoWayTransformer(
-                    depth=2,
-                    embedding_dim=prompt_embed_dim,
-                    mlp_dim=512,
-                    num_heads=4,
-                ),
-                transformer_dim=prompt_embed_dim,
-                iou_head_depth=3,
-                iou_head_hidden_dim=16,
-            )
-        #####
+            self.prompt_picker = PromptHead(feature_name="prompt")
 
     @property
     def device(self):
@@ -265,6 +339,7 @@ class PhaseNet(nn.Module):
         event_mask = batched_inputs["event_mask"].to(self.device) if "event_mask" in batched_inputs else None
         polarity = batched_inputs["polarity"].to(self.device) if "polarity" in batched_inputs else None
         polarity_mask = batched_inputs["polarity_mask"].to(self.device) if "polarity_mask" in batched_inputs else None
+        prompt_center = batched_inputs["prompt_center"].float() if "prompt_center" in batched_inputs else None
 
         if self.backbone_name == "swin2":
             station_location = batched_inputs["station_location"].to(self.device)
@@ -291,85 +366,14 @@ class PhaseNet(nn.Module):
                 output["loss"] += loss_event_time * self.event_time_loss_weight
 
         if self.add_prompt:
-            ### FIXME: HARDCODED
             points = batched_inputs["prompt"].unsqueeze(1)  # [B, 1, 3]
             pos = batched_inputs["position"]  # [B, S, T, 3]
-            B, S, T, _ = pos.shape
-            pos = pos.view(B, S * T, 3)
-            labels = torch.ones((points.shape[0], points.shape[1]))
-            points = (points, labels)
-            labels = torch.ones((pos.shape[0], pos.shape[1]))
-            pos = (pos, labels)
-            if self.training:
-                # image_size = [256, 8]
-                # image_embedding_size = [256, 8]
-                image_size = [8, 256]
-                image_embedding_size = [8, 16]
-            else:
-                image_size = (S, T)
-                image_embedding_size = (S, T)
-            # print(f"{image_size=}")
-            # point_embeddings, dense_embeddings = self.prompt_encoder(points=points, boxes=None, masks=None)
-            # pos_embeddings, _ = self.prompt_encoder(points=pos, boxes=None, masks=None)
-            point_embeddings, dense_embeddings = self.prompt_encoder(
-                points=points, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
-            )
-            pos_embeddings, _ = self.prompt_encoder(
-                points=pos, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
-            )
-            C = point_embeddings.shape[-1]  # BxNxC
-            pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, T, S)  # BxCxSxT
-
-            low_res_masks = []
-            iou_predictions = []
-            image_embeddings = features["prompt"]
-            # print(f"{image_embeddings.shape=}")
-            # print(f"{point_embeddings.shape=}")
-            # print(f"{pos_embeddings.shape=}")
-            # print(f"{dense_embeddings.shape=}")
-
-            for i in range(B):  ## FIXME: Don't understand why have to use loop here
-                low_res_masks_, iou_predictions_ = self.mask_decoder(
-                    image_embeddings=image_embeddings[i : i + 1],
-                    image_pe=pos_embeddings[i : i + 1],
-                    sparse_prompt_embeddings=point_embeddings[i : i + 1],
-                    dense_prompt_embeddings=dense_embeddings[i : i + 1],
-                    multimask_output=False,
-                )
-
-                low_res_masks.append(low_res_masks_)
-                iou_predictions.append(iou_predictions_)
-
-            low_res_masks = torch.cat(low_res_masks, dim=0)
-            iou_predictions = torch.cat(iou_predictions, dim=0)
-
-            targets = batched_inputs["prompt_center"].float()
-            mask = batched_inputs["prompt_mask"].float()
-            inputs = low_res_masks.float()
-            # min_loss = -(targets * torch.nan_to_num(torch.log(targets)) + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
-            # loss_prompt = torch.mean(F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss)
-
-            # ## focal loss
-            # bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-            # pt = torch.exp(-bce_loss) # probability of the correct class
-            # focal_loss = (1 - pt) ** 2 * bce_loss # alpha=1, gamma=2
-            # loss_prompt = torch.mean(focal_loss) * 100
-
-            prob = inputs.sigmoid()
-            min_loss = -(
-                targets * torch.nan_to_num(torch.log(targets))
-                + (1 - targets) * torch.nan_to_num(torch.log(1 - targets))
-            )
-            ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
-            p_t = prob * targets + (1 - prob) * (1 - targets)
-            gamma = 2.0
-            loss_prompt = ce_loss * ((1 - p_t) ** gamma)
-            loss_prompt = 10 * torch.mean(loss_prompt)
-
-            output["loss_prompt"] = loss_prompt
-            output["prompt_center"] = torch.sigmoid(low_res_masks)
-            output["loss"] += loss_prompt
-            ####
+            output_prompt, loss_prompt = self.prompt_picker(features, points, pos, prompt_center)
+            output["prompt"] = output_prompt
+            if loss_prompt is not None:
+                output["prompt_center"] = torch.sigmoid(output_prompt)
+                output["loss_prompt"] = loss_prompt * self.prompt_loss_weight
+                output["loss"] += loss_prompt * self.prompt_loss_weight
 
         if self.add_polarity:
             output_polarity, loss_polarity = self.polarity_picker(features, polarity, mask=polarity_mask)
