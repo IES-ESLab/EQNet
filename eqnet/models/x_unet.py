@@ -57,21 +57,20 @@ def log_transform(x):
 #     )
 
 
-def Upsample(dim, dim_out, scale_factor=(1, 2)):
-    if scale_factor[0] == 1:
-        kernel_size = (1, 1, scale_factor[1] * 2)
-        padding = (0, 0, scale_factor[1] // 2)
-    else:
-        kernel_size = (1, scale_factor[0] * 2, scale_factor[1] * 2)
-        padding = (0, scale_factor[0] // 2, scale_factor[1] // 2)
-    stride = (1, scale_factor[0], scale_factor[1])
+def Upsample(dim, dim_out, stride=(1, 1, 4)):
+
+    kernel_size = tuple(s * 2 if s > 1 else 1 for s in stride)
+    padding = tuple(s // 2 for s in stride)
+
+    # return nn.ConvTranspose3d(dim, dim_out, kernel_size, stride, padding, output_padding) # (1,1,7) (1,1,4) (0,0,3)
     return nn.ConvTranspose3d(dim, dim_out, kernel_size, stride, padding)
 
 
-def Downsample(dim, dim_out, scale_factor=(1, 2)):
+def Downsample(dim, dim_out, stride=(1, 1, 4)):
+
     return nn.Sequential(
-        Rearrange("b c f (h s1) (w s2) -> b (c s1 s2) f h w", s1=scale_factor[0], s2=scale_factor[1]),
-        nn.Conv3d(dim * scale_factor[0] * scale_factor[1], dim_out, 1),
+        Rearrange("b c (f s1) (h s2) (w s3) -> b (c s1 s2 s3) f h w", s1=stride[0], s2=stride[1], s3=stride[2]),
+        nn.Conv3d(dim * stride[0] * stride[1] * stride[2], dim_out, 1),
     )
 
 
@@ -217,15 +216,13 @@ class Block(nn.Module):
         dim_out,
         groups=8,
         weight_standardize=False,
-        station_kernel_size=1,
-        freq_kernel_size=1,
-        time_kernel_size=3,
+        kernel_size=(1, 1, 7),
     ):
         super().__init__()
-        kernel_conv_kwargs = partial(kernel_and_same_pad, station_kernel_size)
+        kernel_conv_kwargs = partial(kernel_and_same_pad, kernel_size[0])
         conv = nn.Conv3d if not weight_standardize else WeightStandardizedConv3d
 
-        self.proj = conv(dim, dim_out, **kernel_conv_kwargs(freq_kernel_size, time_kernel_size))
+        self.proj = conv(dim, dim_out, **kernel_conv_kwargs(kernel_size[1], kernel_size[2]))
         self.norm = RMSNorm(dim_out)
         self.act = nn.SiLU()
 
@@ -240,9 +237,7 @@ class ResnetBlock(nn.Module):
         self,
         dim,
         dim_out,
-        station_kernel_size=1,
-        freq_kernel_size=1,
-        time_kernel_size=3,
+        kernel_size=(1, 1, 7),
         nested_unet_depth=0,
         nested_unet_dim=32,
         weight_standardize=False,
@@ -252,9 +247,7 @@ class ResnetBlock(nn.Module):
             dim,
             dim_out,
             weight_standardize=weight_standardize,
-            station_kernel_size=station_kernel_size,
-            freq_kernel_size=freq_kernel_size,
-            time_kernel_size=time_kernel_size,
+            kernel_size=kernel_size,
         )
 
         if nested_unet_depth > 0:
@@ -262,9 +255,7 @@ class ResnetBlock(nn.Module):
                 dim_out,
                 depth=nested_unet_depth,
                 M=nested_unet_dim,
-                station_kernel_size=station_kernel_size,
-                freq_kernel_size=freq_kernel_size,
-                time_kernel_size=time_kernel_size,
+                kernel_size=kernel_size,
                 weight_standardize=weight_standardize,
                 add_residual=True,
             )
@@ -273,9 +264,7 @@ class ResnetBlock(nn.Module):
                 dim_out,
                 dim_out,
                 weight_standardize=weight_standardize,
-                station_kernel_size=station_kernel_size,
-                freq_kernel_size=freq_kernel_size,
-                time_kernel_size=time_kernel_size,
+                kernel_size=kernel_size,
             )
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
@@ -311,29 +300,30 @@ class ConvNextBlock(nn.Module):
         dim_out,
         *,
         mult=2,
-        station_kernel_size=1,
-        freq_kernel_size=1,
-        time_kernel_size=3,
+        kernel_size=(1, 1, 7),
         nested_unet_depth=0,
         nested_unet_dim=32,
     ):
         super().__init__()
-        kernel_conv_kwargs = partial(kernel_and_same_pad, station_kernel_size)
+        kernel_conv_kwargs = partial(kernel_and_same_pad, kernel_size[0])
 
-        self.ds_conv = nn.Conv3d(dim, dim, **kernel_conv_kwargs(freq_kernel_size, time_kernel_size + 4), groups=dim)
+        init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+        self.ds_conv = nn.Conv3d(dim, dim, **kernel_conv_kwargs(init_kernel_size[1], init_kernel_size[2]), groups=dim)
 
         inner_dim = dim_out * mult
 
         self.net = nn.Sequential(
             LayerNorm(dim),
-            nn.Conv3d(dim, inner_dim, **kernel_conv_kwargs(freq_kernel_size, time_kernel_size), groups=dim_out),
+            nn.Conv3d(dim, inner_dim, **kernel_conv_kwargs(kernel_size[1], kernel_size[2]), groups=dim_out),
             nn.GELU(),
             GRN(inner_dim),
-            nn.Conv3d(inner_dim, dim_out, **kernel_conv_kwargs(freq_kernel_size, time_kernel_size), groups=dim_out),
+            nn.Conv3d(inner_dim, dim_out, **kernel_conv_kwargs(kernel_size[1], kernel_size[2]), groups=dim_out),
         )
 
         self.nested_unet = (
-            NestedResidualUnet(dim_out, depth=nested_unet_depth, M=nested_unet_dim, add_residual=True)
+            NestedResidualUnet(
+                dim_out, kernel_size=kernel_size, depth=nested_unet_depth, M=nested_unet_dim, add_residual=True
+            )
             if nested_unet_depth > 0
             else nn.Identity()
         )
@@ -458,6 +448,11 @@ def kernel_and_same_pad(*kernel_size):
     return dict(kernel_size=kernel_size, padding=paddings)
 
 
+def kernel_and_output_padding(*kernel_size):
+    paddings = tuple(map(lambda k: k // 2, kernel_size))
+    return dict(kernel_size=kernel_size, padding=paddings, output_padding=paddings)
+
+
 class XUnet(nn.Module):
 
     @beartype
@@ -466,9 +461,7 @@ class XUnet(nn.Module):
         dim,
         init_dim=None,
         out_dim=None,
-        station_kernel_size=1,
-        freq_kernel_size=3,
-        time_kernel_size=7,
+        kernel_size=(1, 1, 7),
         dim_mults: MaybeTuple(int) = (1, 2, 4, 8),
         num_blocks_per_stage: MaybeTuple(int) = (2, 2, 2, 2),
         num_self_attn_per_stage: MaybeTuple(int) = (0, 0, 0, 1),
@@ -489,27 +482,27 @@ class XUnet(nn.Module):
     ):
         super().__init__()
 
+        self.kernel_size = kernel_size
         self.log_scale = log_scale
         self.add_stft = add_stft
         self.add_polarity = add_polarity
         self.add_event = add_event
         self.add_prompt = add_prompt
 
-        self.train_as_images = station_kernel_size == 1  ## FIXME
+        self.train_as_images = kernel_size[0] == 1
 
         self.skip_scale = skip_scale
         self.channels = channels
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv3d(
-            channels, init_dim, **kernel_and_same_pad(station_kernel_size, 1, time_kernel_size + 4)
-        )
+        init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+        self.init_conv = nn.Conv3d(channels, init_dim, **kernel_and_same_pad(*init_kernel_size))
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        self.downsample_per_stage = ((1, 4), (1, 4), (1, 4), (1, 4))
-        self.upsample_per_stage = ((1, 4), (1, 4), (1, 4), (1, 4))
+        self.scale_factor = [tuple(map(lambda k: k // 2 + 1, kernel_size))] * 4
+
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
 
@@ -520,17 +513,13 @@ class XUnet(nn.Module):
         blocks = (
             partial(
                 ConvNextBlock,
-                station_kernel_size=station_kernel_size,
-                freq_kernel_size=1,
-                time_kernel_size=time_kernel_size,
+                kernel_size=kernel_size,
             )
             if use_convnext
             else partial(
                 ResnetBlock,
                 weight_standardize=weight_standardize,
-                station_kernel_size=station_kernel_size,
-                freq_kernel_size=1,
-                time_kernel_size=time_kernel_size,
+                kernel_size=kernel_size,
             )
         )
 
@@ -593,7 +582,12 @@ class XUnet(nn.Module):
                                 for _ in range(self_attn_blocks)
                             ]
                         ),
-                        Downsample(dim_in, dim_out, scale_factor=self.downsample_per_stage[ind]),
+                        Downsample(
+                            dim_in,
+                            dim_out,
+                            stride=self.scale_factor[ind],
+                            # **kernel_and_same_pad(*kernel_size)
+                        ),
                     ]
                 )
             )
@@ -609,7 +603,12 @@ class XUnet(nn.Module):
             mid_dim, mid_dim, nested_unet_depth=mid_nested_unet_depth, nested_unet_dim=nested_unet_dim
         )
 
-        self.mid_upsample = Upsample(mid_dim, dims[-2], scale_factor=self.upsample_per_stage[-1])
+        self.mid_upsample = Upsample(
+            mid_dim,
+            dims[-2],
+            stride=self.scale_factor[-1],
+            # **kernel_and_output_padding(*kernel_size),
+        )
 
         # ups
 
@@ -645,7 +644,12 @@ class XUnet(nn.Module):
                             ]
                         ),
                         (
-                            Upsample(dim_out, dim_in, scale_factor=self.upsample_per_stage[ind])
+                            Upsample(
+                                dim_out,
+                                dim_in,
+                                stride=self.scale_factor[ind],
+                                # **kernel_and_output_padding(*kernel_size),
+                            )
                             if not is_last
                             else nn.Identity()
                         ),
@@ -669,7 +673,7 @@ class XUnet(nn.Module):
 
         self.final_conv = nn.Sequential(
             blocks(final_dim_in + dim, dim),
-            nn.Conv3d(dim, out_dim, **kernel_and_same_pad(station_kernel_size, 1, time_kernel_size)),
+            nn.Conv3d(dim, out_dim, **kernel_and_same_pad(*kernel_size)),
         )
 
         ## Polarity
@@ -680,9 +684,8 @@ class XUnet(nn.Module):
             heads = attn_heads[0]
             dim_head = attn_dim_head[0]
             dim_in = dims[0]
-            self.polarity_init = nn.Conv3d(
-                1, init_dim, **kernel_and_same_pad(station_kernel_size, 1, time_kernel_size + 4)
-            )
+            init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+            self.polarity_init = nn.Conv3d(1, init_dim, **kernel_and_same_pad(*init_kernel_size))
             self.polarity_encoder = nn.ModuleList([])
             self.polarity_encoder.append(
                 nn.ModuleList(
@@ -707,7 +710,7 @@ class XUnet(nn.Module):
             )
             self.polarity_final = nn.Sequential(
                 blocks(dim_in * 2, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim),
-                nn.Conv3d(dim_in, out_dim, **kernel_and_same_pad(station_kernel_size, 1, time_kernel_size)),
+                nn.Conv3d(dim_in, out_dim, **kernel_and_same_pad(*kernel_size)),
             )
 
         ## Event
@@ -722,34 +725,36 @@ class XUnet(nn.Module):
             dim_in = dims[level]
             self.event_final = nn.Sequential(
                 blocks(dim_in, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim),
-                Upsample(dim_in, dim_in, scale_factor=self.upsample_per_stage[-1]),
-                nn.Conv3d(dim_in, out_dim, **kernel_and_same_pad(station_kernel_size, 1, time_kernel_size)),
+                Upsample(
+                    dim_in,
+                    dim_in,
+                    stride=self.scale_factor[-1],
+                    # **kernel_and_output_padding(*kernel_size),
+                ),
+                nn.Conv3d(dim_in, out_dim, **kernel_and_same_pad(*kernel_size)),
             )
 
         ## STFT
         if self.add_stft:
-            self.stft = STFT(n_fft=64 + 1, hop_length=self.downsample_per_stage[0][1])
+            self.stft = STFT(n_fft=64 + 1, hop_length=self.scale_factor[0][-1])
+            self.kernel_size_stft = [kernel_size[0], 3, kernel_size[2]]
             self.spec_init = nn.Sequential(
                 nn.Conv3d(
                     channels,
                     init_dim,
-                    **kernel_and_same_pad(station_kernel_size, freq_kernel_size, time_kernel_size),
+                    **kernel_and_same_pad(*self.kernel_size_stft),
                 ),
             )
             blocks_stft = (
                 partial(
                     ConvNextBlock,
-                    station_kernel_size=station_kernel_size,
-                    freq_kernel_size=freq_kernel_size,
-                    time_kernel_size=time_kernel_size,
+                    kernel_size=self.kernel_size_stft,
                 )
                 if use_convnext
                 else partial(
                     ResnetBlock,
                     weight_standardize=weight_standardize,
-                    station_kernel_size=station_kernel_size,
-                    freq_kernel_size=freq_kernel_size,
-                    time_kernel_size=time_kernel_size,
+                    kernel_size=self.kernel_size_stft,
                 )
             )
             self.spec_down = nn.ModuleList([])
@@ -777,7 +782,12 @@ class XUnet(nn.Module):
                             ),
                             MergeFrequency(32),
                             MergeBranch(dim_in),
-                            Downsample(dim_in, dim_out, scale_factor=self.downsample_per_stage[ind]),
+                            Downsample(
+                                dim_in,
+                                dim_out,
+                                stride=self.scale_factor[ind],
+                                # **kernel_and_same_pad(*kernel_size),
+                            ),
                         ]
                     )
                 )
@@ -944,11 +954,11 @@ class PixelShuffleUpsample(nn.Module):
         dim,
         dim_out=None,
         # scale_factor = 2
-        scale_factor=(1, 2),
+        scale_factor=(1, 1, 4),
     ):
         super().__init__()
         # self.scale_squared = scale_factor ** 2
-        self.scale_squared = scale_factor[0] * scale_factor[1]
+        self.scale_squared = scale_factor[0] * scale_factor[1] * scale_factor[2]
         dim_out = default(dim_out, dim)
         conv = nn.Conv3d(dim, dim_out * self.scale_squared, 1)
 
@@ -959,7 +969,14 @@ class PixelShuffleUpsample(nn.Module):
         # )
 
         self.net = nn.Sequential(
-            conv, nn.SiLU(), Rearrange("b (c r s) f h w -> b c f (h r) (w s)", r=scale_factor[0], s=scale_factor[1])
+            conv,
+            nn.SiLU(),
+            Rearrange(
+                "b (c r s t) f h w -> b c (f r) (h s) (w t)",
+                r=scale_factor[0],
+                s=scale_factor[1],
+                t=scale_factor[2],
+            ),
         )
 
         self.init_conv_(conv)
@@ -985,9 +1002,7 @@ class NestedResidualUnet(nn.Module):
         *,
         depth,
         M=32,
-        station_kernel_size=1,
-        freq_kernel_size=1,
-        time_kernel_size=3,
+        kernel_size=(1, 1, 7),
         add_residual=False,
         skip_scale=2**-0.5,
         weight_standardize=False,
@@ -997,6 +1012,8 @@ class NestedResidualUnet(nn.Module):
         self.depth = depth
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
+        self.kernel_size = kernel_size
+        scale_factor = tuple([k // 2 + 1 for k in kernel_size])
 
         conv = WeightStandardizedConv3d if weight_standardize else nn.Conv3d
 
@@ -1010,15 +1027,25 @@ class NestedResidualUnet(nn.Module):
             #     nn.SiLU()
             # )
 
-            down = nn.Sequential(conv(dim_in, M, (1, 1, 4), stride=(1, 1, 2), padding=(0, 0, 1)), RMSNorm(M), nn.SiLU())
+            down = nn.Sequential(
+                conv(
+                    dim_in,
+                    M,
+                    kernel_size=tuple(k * 2 if k > 1 else 1 for k in scale_factor),
+                    stride=scale_factor,
+                    padding=tuple(k // 2 for k in scale_factor),
+                ),
+                RMSNorm(M),
+                nn.SiLU(),
+            )
 
-            up = nn.Sequential(PixelShuffleUpsample(2 * M, dim_in), RMSNorm(dim_in), nn.SiLU())
+            up = nn.Sequential(PixelShuffleUpsample(2 * M, dim_in, scale_factor), RMSNorm(dim_in), nn.SiLU())
 
             self.downs.append(down)
             self.ups.append(up)
 
         self.mid = nn.Sequential(
-            conv(M, M, **kernel_and_same_pad(station_kernel_size, freq_kernel_size, time_kernel_size)),
+            conv(M, M, **kernel_and_same_pad(*kernel_size)),
             RMSNorm(M),
             nn.SiLU(),
         )

@@ -20,9 +20,9 @@ bucket = "quakeflow_das"
 figure_path = Path("debug_figures")
 figure_path.mkdir(exist_ok=True)
 plot_figure = False
-# label_path = Path("results/training_v0")
+label_path = Path("results/training_v0")
 # label_path = Path("results/training_v1")
-label_path = Path("results/training_v2")
+# label_path = Path("results/training_v2")
 if label_path.exists():
     print(f"Warning: {label_path} exist!")
     raise FileExistsError
@@ -30,9 +30,9 @@ else:
     label_path.mkdir(parents=True)
 fs = fsspec.filesystem(protocol.replace("://", ""))
 folders = ["mammoth_north", "mammoth_south", "ridgecrest_north", "ridgecrest_south"]
-# picker = "phasenet"
+picker = "phasenet"
 # picker = "phasenet_das"
-picker = "phasenet_das_v1"
+# picker = "phasenet_das_v1"
 
 
 # %%
@@ -68,7 +68,7 @@ for folder in folders:
         f.write("\n".join(noise_list))
 
     ## label list
-    for file in tqdm(gamma_events):
+    for i, file in tqdm(enumerate(gamma_events)):
         picks = pd.read_csv(protocol + file, parse_dates=["phase_time"])
         idx = picks["event_index"] != -1
         idx_p = idx & (picks["phase_type"] == "P")
@@ -108,6 +108,9 @@ for folder in folders:
         if len(picks) > 0:
             # print(f'{label_path / f"{folder}" / "labels" / (get_eventid(file) + ".csv")}')
             picks.to_csv(label_path / f"{folder}" / "labels" / (get_eventid(file) + ".csv"), index=False)
+
+        if i > 16:
+            break
 
 # %%
 labels = []

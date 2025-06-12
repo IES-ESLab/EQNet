@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 
+from torchinfo import summary
 import datasets
 import eqnet
 import utils
@@ -29,7 +30,6 @@ from eqnet.models.unet import moving_normalize
 from eqnet.utils.station_sampler import StationSampler, create_groups, cut_reorder_keys
 
 matplotlib.use("agg")
-wandb.require("core")
 logger = logging.getLogger("EQNet")
 # mp.set_start_method("spawn", force=True)
 
@@ -487,17 +487,16 @@ def main(args):
 
     model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone)
     logger.info("Model:\n{}".format(model))
+    print("Model: {}".format(model))
 
-    print("Model:\n{}".format(model))
-
-    total_params = 0
-    print("Trainable parameters in the model:")
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            num_params = param.numel()
-            total_params += num_params
-            print(f"{name}: {param.shape}, {num_params}")
-    print(f"Total number of trainable parameters: {total_params}")
+    summary(
+        model,
+        input_data=[next(iter(data_loader))],
+        depth=5 if args.backbone == "xunet" else 3,
+        mode="train",
+        # col_names=["output_size", "num_params", "kernel_size"],
+        # verbose=2,
+    )
 
     model.to(device)
     if args.compile:
@@ -545,7 +544,7 @@ def main(args):
     optimizer = torch.optim.AdamW(
         parameters, lr=1.0, weight_decay=args.weight_decay
     )  # lr multiplied by lr in lr_scheduler
-    iters_per_epoch = len(data_loader)
+    iters_per_epoch = max(1, len(data_loader))
     warmup_steps = args.lr_warmup_epochs * iters_per_epoch
     max_lr = args.lr
     min_lr = args.lr * args.lr_min_ratio

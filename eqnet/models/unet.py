@@ -159,58 +159,6 @@ class UNet(nn.Module):
         self.add_event = add_event
         self.add_prompt = add_prompt
 
-        if self.add_stft:
-            self.n_fft = 64 + 1
-            self.stft = STFT(
-                n_fft=self.n_fft,
-                hop_length=stride[-1],
-                window_fn=torch.hann_window,
-                magnitude=True,
-                discard_zero_freq=True,
-            )
-            kernel_size_tf = (3, kernel_size[-1])  # 3 for frequency
-            padding_tf = (1, padding[-1])
-            self.encoder12_tf = self.encoder_block(
-                in_channels,
-                features,
-                kernel_size=kernel_size_tf,
-                stride=(1, 1),
-                padding=padding_tf,
-                name="enc2_tf",
-            )
-            self.encoder23_tf = self.encoder_block(
-                features,
-                features * 2,
-                kernel_size=kernel_size_tf,
-                stride=stride,
-                padding=padding_tf,
-                name="enc3_tf",
-            )
-            self.encoder34_tf = self.encoder_block(
-                features * 2,
-                features * 4,
-                kernel_size=kernel_size_tf,
-                stride=stride,
-                padding=padding_tf,
-                name="enc4_tf",
-            )
-            self.encoder45_tf = self.encoder_block(
-                features * 4,
-                features * 8,
-                kernel_size=kernel_size_tf,
-                stride=stride,
-                padding=padding_tf,
-                name="enc5_tf",
-            )
-            self.merge_freq2 = MergeFrequency(self.n_fft // 2)
-            self.merge_freq3 = MergeFrequency(self.n_fft // 2)
-            self.merge_freq4 = MergeFrequency(self.n_fft // 2)
-            self.merge_freq5 = MergeFrequency(self.n_fft // 2)
-            self.merge_branch2 = MergeBranch(features * 3, features * 2)
-            self.merge_branch3 = MergeBranch(features * 6, features * 4)
-            self.merge_branch4 = MergeBranch(features * 12, features * 8)
-            self.merge_branch5 = MergeBranch(features * 24, features * 16)
-
         self.input_conv = self.encoder_block(
             in_channels, features, kernel_size=kernel_size, stride=init_stride, padding=padding, name="enc1"
         )
@@ -318,38 +266,70 @@ class UNet(nn.Module):
                 features * 4, features * 2, kernel_size=kernel_size, stride=(1, 1), padding=padding, name="output_event"
             )
 
+        if self.add_stft:
+            self.n_fft = 64 + 1
+            self.stft = STFT(
+                n_fft=self.n_fft,
+                hop_length=stride[-1],
+                window_fn=torch.hann_window,
+                magnitude=True,
+                discard_zero_freq=True,
+            )
+            kernel_size_tf = (3, kernel_size[-1])  # 3 for frequency
+            padding_tf = (1, padding[-1])
+            self.encoder12_tf = self.encoder_block(
+                in_channels,
+                features,
+                kernel_size=kernel_size_tf,
+                stride=(1, 1),
+                padding=padding_tf,
+                name="enc2_tf",
+            )
+            self.encoder23_tf = self.encoder_block(
+                features,
+                features * 2,
+                kernel_size=kernel_size_tf,
+                stride=stride,
+                padding=padding_tf,
+                name="enc3_tf",
+            )
+            self.encoder34_tf = self.encoder_block(
+                features * 2,
+                features * 4,
+                kernel_size=kernel_size_tf,
+                stride=stride,
+                padding=padding_tf,
+                name="enc4_tf",
+            )
+            self.encoder45_tf = self.encoder_block(
+                features * 4,
+                features * 8,
+                kernel_size=kernel_size_tf,
+                stride=stride,
+                padding=padding_tf,
+                name="enc5_tf",
+            )
+            self.merge_freq2 = MergeFrequency(self.n_fft // 2)
+            self.merge_freq3 = MergeFrequency(self.n_fft // 2)
+            self.merge_freq4 = MergeFrequency(self.n_fft // 2)
+            self.merge_freq5 = MergeFrequency(self.n_fft // 2)
+            self.merge_branch2 = MergeBranch(features * 3, features * 2)
+            self.merge_branch3 = MergeBranch(features * 6, features * 4)
+            self.merge_branch4 = MergeBranch(features * 12, features * 8)
+            self.merge_branch5 = MergeBranch(features * 24, features * 16)
+
+        if (init_stride[0] > 1) or (init_stride[1] > 1):
+            self.output_upsample = nn.Upsample(scale_factor=init_stride, mode="bilinear", align_corners=False)
+        else:
+            self.output_upsample = None
+
     def forward(self, x):
 
         x = moving_normalize(x, filter=self.moving_norm[0], stride=self.moving_norm[1])
         if self.log_scale:
             x = log_transform(x)
 
-        if self.add_stft:
-            nb, nc, nx, nt = x.shape
-            sgram = x.clone()
-            sgram = sgram.permute(0, 2, 1, 3).reshape(nb * nx, nc, nt)  # nb*nx, nc, nt
-            sgram = self.stft(sgram)  # nb*nx, nc, nf, nt
-            enc2_tf = self.encoder12_tf(sgram)  # nb*nx, nc, nf, nt
-            enc3_tf = self.encoder23_tf(enc2_tf)
-            enc4_tf = self.encoder34_tf(enc3_tf)
-            enc5_tf = self.encoder45_tf(enc4_tf)
-
-            enc2_tf = self.merge_freq2(enc2_tf)  # nb*nx, nc, nt
-            nc, nt = enc2_tf.shape[-2:]
-            enc2_tf = enc2_tf.view(nb, nx, nc, nt).permute(0, 2, 1, 3)  # nb, nc, nx, nt
-
-            enc3_tf = self.merge_freq3(enc3_tf)
-            nc, nt = enc3_tf.shape[-2:]
-            enc3_tf = enc3_tf.view(nb, nx, nc, nt).permute(0, 2, 1, 3)
-
-            enc4_tf = self.merge_freq4(enc4_tf)
-            nc, nt = enc4_tf.shape[-2:]
-            enc4_tf = enc4_tf.view(nb, nx, nc, nt).permute(0, 2, 1, 3)
-
-            enc5_tf = self.merge_freq5(enc5_tf)
-            nc, nt = enc5_tf.shape[-2:]
-            enc5_tf = enc5_tf.view(nb, nx, nc, nt).permute(0, 2, 1, 3)
-
+        # polarity
         if self.add_polarity:
             z = x[:, -1:, :, :]  ## last channel is vertical component
             # clip z to [-1, 1] after normalization
@@ -363,6 +343,24 @@ class UNet(nn.Module):
         enc5 = self.encoder45(enc4)
 
         if self.add_stft:
+            nb, nc, nx, nt = x.shape
+            sgram = x.clone()
+            sgram = sgram.permute(0, 2, 1, 3).reshape(nb * nx, nc, nt)  # nb*nx, nc, nt
+            sgram = self.stft(sgram)  # nb*nx, nc, nf, nt
+            enc2_tf = self.encoder12_tf(sgram)  # nb*nx, nc, nf, nt
+            enc3_tf = self.encoder23_tf(enc2_tf)
+            enc4_tf = self.encoder34_tf(enc3_tf)
+            enc5_tf = self.encoder45_tf(enc4_tf)
+
+            enc2_tf = self.merge_freq2(enc2_tf)  # nb*nx, nc, nt
+            enc2_tf = enc2_tf.view(nb, nx, *enc2_tf.shape[-2:]).permute(0, 2, 1, 3)  # nb, nc, nx, nt
+            enc3_tf = self.merge_freq3(enc3_tf)
+            enc3_tf = enc3_tf.view(nb, nx, *enc3_tf.shape[-2:]).permute(0, 2, 1, 3)
+            enc4_tf = self.merge_freq4(enc4_tf)
+            enc4_tf = enc4_tf.view(nb, nx, *enc4_tf.shape[-2:]).permute(0, 2, 1, 3)
+            enc5_tf = self.merge_freq5(enc5_tf)
+            enc5_tf = enc5_tf.view(nb, nx, *enc5_tf.shape[-2:]).permute(0, 2, 1, 3)
+
             enc2 = self.merge_branch2(enc2, enc2_tf)
             enc3 = self.merge_branch3(enc3, enc3_tf)
             enc4 = self.merge_branch4(enc4, enc4_tf)
@@ -392,6 +390,15 @@ class UNet(nn.Module):
             out_polarity = None
         dec1 = torch.cat((dec1, enc1), dim=1)
         out_phase = self.output_conv(dec1)
+
+        if self.output_upsample is not None:
+            out_phase = self.output_upsample(out_phase)
+            if self.add_polarity:
+                out_polarity = self.output_upsample(out_polarity)
+            if self.add_event:
+                out_event = self.output_upsample(out_event)
+            if self.add_prompt:
+                out_prompt = self.output_upsample(out_prompt)
 
         result = {"phase": out_phase, "polarity": out_polarity, "event": out_event, "prompt": out_prompt}
 

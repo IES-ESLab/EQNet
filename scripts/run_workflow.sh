@@ -8,7 +8,7 @@ python run_gamma.py --folder=mammoth_north --picker=phasenet && python run_gamma
 # edit hardcoding in build_training.py
 python build_training.py
 
-python train_phasenet_das.py --resume --data_path=results/training_v0/ > log_train_phasenet_das.txt 2>&1 
+python train_phasenet_das.py --data_path=results/training_v0/ > log_train_phasenet_das.txt 2>&1 
 
 #### Training PhasetNet-DAS v1 #####
 # edit hardcoded model in build_training.py
@@ -19,7 +19,7 @@ python run_gamma.py --folder=mammoth_north --picker=phasenet_das && python run_g
 # edit hardcoded model in build_training.py
 python build_training.py
 
-python train_phasenet_das.py --resume --data_path=results/training_v0/ > log_train_phasenet_das.txt 2>&1 
+python train_phasenet_das.py --resume --data_path=results/training_v1/ > log_train_phasenet_das.txt 2>&1 
 
 #### Training PhasetNet-DAS v2 #####
 # edit hardcoded model in build_training.py

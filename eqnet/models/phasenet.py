@@ -239,7 +239,7 @@ class PhaseNet(nn.Module):
                 mask_in_chans=16,
             )
             self.mask_decoder = MaskDecoder(
-                num_multimask_outputs=1,
+                num_multimask_outputs=0,
                 transformer=TwoWayTransformer(
                     depth=2,
                     embedding_dim=prompt_embed_dim,
@@ -377,7 +377,7 @@ class PhaseNet(nn.Module):
             if loss_polarity is not None:
                 output["loss_polarity"] = loss_polarity * self.polarity_loss_weight
                 output["loss"] += loss_polarity * self.polarity_loss_weight
-        if self.add_stft:
+        if self.add_stft and self.training:
             output["spectrogram"] = features["spectrogram"]
 
         return output
