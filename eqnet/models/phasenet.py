@@ -312,6 +312,8 @@ class PhaseNet(nn.Module):
             if self.add_event:
                 self.event_detector = UNetHead(16, 1, feature_name="event")
                 self.event_timer = EventHead(16, 1, feature_name="event")
+            if self.add_prompt:
+                self.prompt_picker = PromptHead(feature_name="prompt")
 
         elif backbone == "xunet":
             self.phase_picker = UNetHead(32, 3, feature_name="phase")
@@ -320,11 +322,11 @@ class PhaseNet(nn.Module):
             if self.add_event:
                 self.event_detector = UNetHead(32, 1, feature_name="event")
                 self.event_timer = EventHead(32, 1, feature_name="event")
+            if self.add_prompt:
+                self.prompt_picker = PromptHead(feature_name="prompt")
 
         else:
             raise ValueError("backbone only supports unet or xunet")
-        if self.add_prompt:
-            self.prompt_picker = PromptHead(feature_name="prompt")
 
     @property
     def device(self):
@@ -353,6 +355,17 @@ class PhaseNet(nn.Module):
         if loss_phase is not None:
             output["loss_phase"] = loss_phase
             output["loss"] += loss_phase
+
+        if self.add_polarity:
+            output_polarity, loss_polarity = self.polarity_picker(features, polarity, mask=polarity_mask)
+            output["polarity"] = output_polarity
+            if loss_polarity is not None:
+                output["loss_polarity"] = loss_polarity * self.polarity_loss_weight
+                output["loss"] += loss_polarity * self.polarity_loss_weight
+
+        if self.add_stft and self.training:
+            output["spectrogram"] = features["spectrogram"]
+
         if self.add_event:
             output_event_center, loss_event_center = self.event_detector(features, event_center)
             output["event_center"] = output_event_center
@@ -374,15 +387,6 @@ class PhaseNet(nn.Module):
                 output["prompt_center"] = torch.sigmoid(output_prompt)
                 output["loss_prompt"] = loss_prompt * self.prompt_loss_weight
                 output["loss"] += loss_prompt * self.prompt_loss_weight
-
-        if self.add_polarity:
-            output_polarity, loss_polarity = self.polarity_picker(features, polarity, mask=polarity_mask)
-            output["polarity"] = output_polarity
-            if loss_polarity is not None:
-                output["loss_polarity"] = loss_polarity * self.polarity_loss_weight
-                output["loss"] += loss_polarity * self.polarity_loss_weight
-        if self.add_stft and self.training:
-            output["spectrogram"] = features["spectrogram"]
 
         return output
 
