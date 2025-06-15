@@ -41,15 +41,26 @@ class PhaseNetDAS(PhaseNet):
         self.polarity_loss_weight = polarity_loss_weight
 
         if backbone == "unet":
+            # self.backbone = UNet(
+            #     in_channels=1,
+            #     init_features=8,
+            #     # init_stride=(4, 4),
+            #     kernel_size=(7, 7),
+            #     stride=(4, 4),
+            #     padding=(3, 3),
+            #     # moving_norm=(2048, 256),
+            #     upsample="conv_transpose",
+            #     log_scale=log_scale,
+            #     add_stft=add_stft,
+            #     add_polarity=add_polarity,
+            #     add_event=add_event,
+            #     add_prompt=add_prompt,
+            # )
             self.backbone = UNet(
-                in_channels=1,
-                init_features=8,
-                # init_stride=(4, 4),
+                channels=1,
+                dim=8,
+                out_dim=16,
                 kernel_size=(7, 7),
-                stride=(4, 4),
-                padding=(3, 3),
-                # moving_norm=(2048, 256),
-                upsample="conv_transpose",
                 log_scale=log_scale,
                 add_stft=add_stft,
                 add_polarity=add_polarity,
@@ -72,20 +83,20 @@ class PhaseNetDAS(PhaseNet):
             raise ValueError(f"Invalid backbone: {backbone}")
 
         if backbone == "unet":
-            self.phase_picker = UNetHead(16, 3, feature_names="phase")
+            self.phase_picker = UNetHead(16, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(16, 1, feature_names="polarity")
+                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(16, 1, feature_names="event")
-                self.event_timer = EventHead(16, 1, feature_names="event")
+                self.event_detector = UNetHead(16, 1, feature_name="event")
+                self.event_timer = EventHead(16, 1, feature_name="event")
 
         elif backbone == "xunet":
-            self.phase_picker = UNetHead(16, 3, feature_names="phase")
+            self.phase_picker = UNetHead(16, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(16, 1, feature_names="polarity")
+                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(16, 1, feature_names="event")
-                self.event_timer = EventHead(16, 1, feature_names="event")
+                self.event_detector = UNetHead(16, 1, feature_name="event")
+                self.event_timer = EventHead(16, 1, feature_name="event")
         else:
             raise ValueError("backbone only supports unet or xunet")
 

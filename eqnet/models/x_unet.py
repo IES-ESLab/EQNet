@@ -1,3 +1,4 @@
+# U-Net implementation adapted from:  https://github.com/lucidrains/x-unet/blob/main/x_unet/x_unet.py
 import math
 from functools import partial
 
@@ -43,6 +44,39 @@ def cast_tuple(val, length=None):
 def log_transform(x):
     x = torch.sign(x) * torch.log(1.0 + torch.abs(x))
     return x
+
+
+def moving_normalize(data, filter=1024, stride=128):
+    nb, nch, nx, nf, nt = data.shape
+    data = data.view(nb, nch, nx * nf, nt)
+
+    if nt % stride == 0:
+        pad = max(filter - stride, 0)
+    else:
+        pad = max(filter - (nt % stride), 0)
+    pad1 = pad // 2
+    pad2 = pad - pad1
+    # padding = filter // 2
+
+    with torch.no_grad():
+        data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
+        # data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
+        mean = F.avg_pool2d(data_, kernel_size=(1, filter), stride=(1, stride), count_include_pad=False)
+        mean = F.interpolate(mean, scale_factor=(1, stride), mode="bilinear", align_corners=False)[:, :, :nx, :nt]
+        data -= mean
+
+        data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
+        # data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
+        # std = (F.lp_pool2d(data_, norm_type=2, kernel_size=(filter, 1), stride=(stride, 1)) / ((filter) ** 0.5))
+        std = F.avg_pool2d(torch.abs(data_), kernel_size=(1, filter), stride=(1, stride), count_include_pad=False)
+        std = torch.mean(std, dim=(1,), keepdim=True)  ## keep relative amplitude between channels
+        std = F.interpolate(std, scale_factor=(1, stride), mode="bilinear", align_corners=False)[:, :, :nx, :nt]
+        std[std == 0.0] = 1.0
+        data = data / std
+
+        data = data.view(nb, nch, nx, nf, nt)
+
+    return data
 
 
 # helper classes
@@ -474,6 +508,7 @@ class XUnet(nn.Module):
         weight_standardize=False,
         attn_heads: MaybeTuple(int) = 8,
         attn_dim_head: MaybeTuple(int) = 32,
+        moving_norm=(1024, 128),
         log_scale=False,
         add_stft=False,
         add_polarity=False,
@@ -483,6 +518,7 @@ class XUnet(nn.Module):
         super().__init__()
 
         self.kernel_size = kernel_size
+        self.moving_norm = moving_norm
         self.log_scale = log_scale
         self.add_stft = add_stft
         self.add_polarity = add_polarity
@@ -586,7 +622,6 @@ class XUnet(nn.Module):
                             dim_in,
                             dim_out,
                             stride=self.scale_factor[ind],
-                            # **kernel_and_same_pad(*kernel_size)
                         ),
                     ]
                 )
@@ -607,7 +642,6 @@ class XUnet(nn.Module):
             mid_dim,
             dims[-2],
             stride=self.scale_factor[-1],
-            # **kernel_and_output_padding(*kernel_size),
         )
 
         # ups
@@ -648,7 +682,6 @@ class XUnet(nn.Module):
                                 dim_out,
                                 dim_in,
                                 stride=self.scale_factor[ind],
-                                # **kernel_and_output_padding(*kernel_size),
                             )
                             if not is_last
                             else nn.Identity()
@@ -672,8 +705,8 @@ class XUnet(nn.Module):
         final_dim_in = self.consolidator.final_dim_out
 
         self.final_conv = nn.Sequential(
-            blocks(final_dim_in + dim, dim),
-            nn.Conv3d(dim, out_dim, **kernel_and_same_pad(*kernel_size)),
+            blocks(final_dim_in + dim, max(dim, out_dim)),
+            nn.Conv3d(max(dim, out_dim), out_dim, **kernel_and_same_pad(*kernel_size)),
         )
 
         ## Polarity
@@ -780,14 +813,9 @@ class XUnet(nn.Module):
                                     for _ in range(num_blocks - 1)
                                 ]
                             ),
+                            Downsample(dim_in, dim_out, stride=self.scale_factor[ind]),
                             MergeFrequency(32),
                             MergeBranch(dim_in),
-                            Downsample(
-                                dim_in,
-                                dim_out,
-                                stride=self.scale_factor[ind],
-                                # **kernel_and_same_pad(*kernel_size),
-                            ),
                         ]
                     )
                 )
@@ -815,6 +843,7 @@ class XUnet(nn.Module):
         if is_image:
             x = rearrange(x, "b c h w -> b c 1 h w")
 
+        x = moving_normalize(x, filter=self.moving_norm[0], stride=self.moving_norm[1])
         if self.log_scale:
             x = log_transform(x)
 
@@ -826,7 +855,8 @@ class XUnet(nn.Module):
         x = self.init_conv(x)
 
         if self.add_polarity:
-            x_polarity = self.polarity_init(x_origin[:, -1:, :, :, :])
+            # x_polarity = self.polarity_init(x_origin[:, -1:, :, :, :])
+            x_polarity = self.polarity_init(torch.clamp(x_origin[:, -1:, :, :, :], -1.0, 1.0))
 
         # residual
 
@@ -851,12 +881,13 @@ class XUnet(nn.Module):
 
         if self.add_stft:
             x_stft = self.stft(x_origin)
-            if self.training:
+            # if self.training:
+            if True:
                 sgram = x_stft.clone()
             else:
                 sgram = None
             x_stft = self.spec_init(x_stft)
-            for i, (init_block, blocks, merge_freq, merge_branch, downsample) in enumerate(self.spec_down):
+            for i, (init_block, blocks, downsample, merge_freq, merge_branch) in enumerate(self.spec_down):
                 x_stft = init_block(x_stft)
 
                 for block in blocks:
@@ -904,6 +935,7 @@ class XUnet(nn.Module):
         # final residual
 
         x = torch.cat((x, r), dim=1)
+        # x = torch.cat((x, down_hiddens.pop()), dim=1)
 
         # final convolution
 
@@ -940,8 +972,10 @@ class XUnet(nn.Module):
                 out_prompt = rearrange(out_prompt, "b c 1 h w -> b c h w")
 
         out = {"phase": out_phase, "polarity": out_polarity, "event": out_event, "prompt": out_prompt}
-        if self.add_stft and self.training:
+        # if self.add_stft and self.training:
+        if self.add_stft:
             out["spectrogram"] = sgram.squeeze(2)  ## nb, nc, nx, nf, nt -> nb, nc, nf, nt
+
         return out
 
 
@@ -1063,9 +1097,13 @@ class NestedResidualUnet(nn.Module):
 
         layers = len(self.ups)
 
-        # for dim_name, size in (('height', h), ('width', w)):
-        #     assert divisible_by(size, 2 ** layers), f'{dim_name} dimension {size} must be divisible by {2 ** layers} ({layers} layers in nested unet)'
-        #     assert (size % (2 ** self.depth)) == 0, f'the unet has too much depth for the image {dim_name} ({size}) being passed in'
+        # for dim_name, size in (("height", h), ("width", w)):
+        #     assert divisible_by(
+        #         size, 2**layers
+        #     ), f"{dim_name} dimension {size} must be divisible by {2 ** layers} ({layers} layers in nested unet)"
+        #     assert (
+        #         size % (2**self.depth)
+        #     ) == 0, f"the unet has too much depth for the image {dim_name} ({size}) being passed in"
         assert divisible_by(
             w, 2**layers
         ), f"width dimension {w} must be divisible by {2 ** layers} ({layers} layers in nested unet)"
@@ -1099,3 +1137,35 @@ class NestedResidualUnet(nn.Module):
             x = F.silu(x)
 
         return x
+
+
+# example
+
+if __name__ == "__main__":
+
+    from torchinfo import summary
+    from torchviz import make_dot
+
+    model = XUnet(
+        dim=8,
+        out_dim=16,
+        dim_mults=(1, 2, 4, 8),
+        add_polarity=True,
+        add_event=True,
+        add_stft=True,
+    )
+
+    # print(model)
+    data = torch.randn(7, 3, 1, 4096)
+
+    summary(model, input_size=data.shape, depth=5)
+
+    model.to("cpu")
+    out = model(data)
+
+    dot = make_dot(out["phase"], params=dict(model.named_parameters()))
+    dot.render("x_unet", format="png")
+
+    for k, v in out.items():
+        if v is not None:
+            print(f"{k}: {v.shape}")

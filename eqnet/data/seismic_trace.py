@@ -1218,6 +1218,10 @@ class SeismicTraceIterableDataset(IterableDataset):
                 data = meta["waveform"]
                 _, nt, nx = meta["waveform"].shape
                 data = padding(data, min_nt=self.min_nt, min_nx=self.min_nx)
+
+                ## FIXME: shift to (nx, nt)
+                data = np.transpose(data, (0, 2, 1))  # More explicit numpy transpose with axis order
+
                 yield {
                     "data": data,
                     "nx": nx,
@@ -1235,6 +1239,10 @@ class SeismicTraceIterableDataset(IterableDataset):
                         data = meta["waveform"][:, i : i + self.nt, j : j + self.nx]
                         _, nt_, nx_ = data.shape
                         data = padding(data, min_nt=self.min_nt, min_nx=self.min_nx)
+
+                        ## FIXME: shift to (nx, nt)
+                        data = np.transpose(data, (0, 2, 1))  # More explicit numpy transpose with axis order
+
                         yield {
                             "data": data,
                             "nx": nx_,

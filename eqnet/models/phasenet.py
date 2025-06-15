@@ -187,17 +187,14 @@ class PromptHead(nn.Module):
     def forward(self, features, points, pos, targets=None):
 
         B, S, T, _ = pos.shape
+
         pos = pos.view(B, S * T, 3)
         labels = torch.ones((points.shape[0], points.shape[1]))
         points = (points, labels)
         labels = torch.ones((pos.shape[0], pos.shape[1]))
         pos = (pos, labels)
-        if self.training:  ## FIXME
-            image_size = self.input_size
-            image_embedding_size = self.embedding_size
-        else:
-            image_size = (S, T)
-            image_embedding_size = (S, T)
+        image_size = (S, T * 16)
+        image_embedding_size = (S, T)
 
         point_embeddings, dense_embeddings = self.prompt_encoder(
             points=points, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
@@ -206,7 +203,22 @@ class PromptHead(nn.Module):
             points=pos, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
         )
         C = point_embeddings.shape[-1]  # BxNxC
-        pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, T, S)  # BxCxSxT
+        pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, S, T)  # Bx(ST)xC -> BxSxTxC
+
+        # ## DEBUG pos_embeddings
+        # import matplotlib.pyplot as plt
+        # plt.figure(figsize=(12, 5))
+        # plt.subplot(1, 3, 1)
+        # plt.pcolormesh(pos_embeddings[0, :, 0, :].detach().cpu().numpy())
+        # plt.colorbar()
+        # plt.xlabel("Time")
+        # plt.subplot(1, 3, 2)
+        # plt.pcolormesh(pos_embeddings[0, :, :, 0].detach().cpu().numpy())
+        # plt.colorbar()
+        # plt.xlabel("Station")
+        # plt.savefig("pos_embeddings.png")
+        # plt.close()
+        # raise
 
         low_res_masks = []
         iou_predictions = []
@@ -282,9 +294,19 @@ class PhaseNet(nn.Module):
         self.prompt_loss_weight = prompt_loss_weight
 
         if backbone == "unet":
+            # self.backbone = UNet(
+            #     init_features=8,
+            #     upsample="conv_transpose",
+            #     log_scale=log_scale,
+            #     add_stft=add_stft,
+            #     add_polarity=add_polarity,
+            #     add_event=add_event,
+            #     add_prompt=add_prompt,
+            # )
             self.backbone = UNet(
-                init_features=8,
-                upsample="conv_transpose",
+                channels=3,
+                dim=8,
+                out_dim=16,
                 log_scale=log_scale,
                 add_stft=add_stft,
                 add_polarity=add_polarity,
@@ -313,7 +335,7 @@ class PhaseNet(nn.Module):
                 self.event_detector = UNetHead(16, 1, feature_name="event")
                 self.event_timer = EventHead(16, 1, feature_name="event")
             if self.add_prompt:
-                self.prompt_picker = PromptHead(feature_name="prompt")
+                self.prompt_picker = PromptHead(prompt_embed_dim=64, feature_name="prompt")
 
         elif backbone == "xunet":
             self.phase_picker = UNetHead(32, 3, feature_name="phase")
@@ -323,7 +345,7 @@ class PhaseNet(nn.Module):
                 self.event_detector = UNetHead(32, 1, feature_name="event")
                 self.event_timer = EventHead(32, 1, feature_name="event")
             if self.add_prompt:
-                self.prompt_picker = PromptHead(feature_name="prompt")
+                self.prompt_picker = PromptHead(prompt_embed_dim=128, feature_name="prompt")
 
         else:
             raise ValueError("backbone only supports unet or xunet")
@@ -363,7 +385,8 @@ class PhaseNet(nn.Module):
                 output["loss_polarity"] = loss_polarity * self.polarity_loss_weight
                 output["loss"] += loss_polarity * self.polarity_loss_weight
 
-        if self.add_stft and self.training:
+        # if self.add_stft and self.training:
+        if self.add_stft:
             output["spectrogram"] = features["spectrogram"]
 
         if self.add_event:

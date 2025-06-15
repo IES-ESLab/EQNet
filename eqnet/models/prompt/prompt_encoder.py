@@ -194,12 +194,29 @@ class PositionEmbeddingRandom(nn.Module):
             "positional_encoding_gaussian_matrix",
             scale * torch.randn((3, num_pos_feats)),
         )
+        # self.register_buffer(
+        #     "positional_encoding_gaussian_matrix_time",
+        #     scale * torch.randn((1, num_pos_feats//2)),
+        # )
+        # self.register_buffer(
+        #     "positional_encoding_gaussian_matrix_space",
+        #     scale * torch.randn((2, num_pos_feats//2)),
+        # )
 
     def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
         """Positionally encode points that are normalized to [0,1]."""
         # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
-        coords = 2 * coords - 1
+        # coords = 2 * coords - 1
         coords = coords @ self.positional_encoding_gaussian_matrix
+
+        # coords_time = coords[:, :, 0:1]
+        # coords_space = coords[:, :, 1:3]
+
+        # coords_time = coords_time @ self.positional_encoding_gaussian_matrix_time
+        # coords_space = coords_space @ self.positional_encoding_gaussian_matrix_space
+
+        # coords = torch.cat([coords_time, coords_space], dim=-1)
+
         coords = 2 * np.pi * coords
         # outputs d_1 x ... x d_n x C shape
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)

@@ -64,10 +64,14 @@ class SeismicNetworkIterableDataset(IterableDataset):
             event_id = event_ids[idx]
             station_ids = list(self.hdf5_fp[event_id].keys())
             event_time_index = self.hdf5_fp[event_id].attrs["event_time_index"]
-            # if len(station_ids) < num_station:
-            #     continue
+            if len(station_ids) < num_station:
+                continue
             # else:
             station_ids = np.random.choice(station_ids, num_station, replace=True)
+
+            # # sort station_ids by distance
+            # dists = [self.hdf5_fp[event_id + "/" + x].attrs["distance_km"] for x in station_ids]
+            # station_ids = [x for _, x in sorted(zip(dists, station_ids))]
 
             data = np.zeros([3, self.nt0, len(station_ids)])
             phase_pick = np.zeros([3, self.nt0, len(station_ids)])
@@ -211,10 +215,10 @@ class SeismicNetworkIterableDataset(IterableDataset):
 
             # print(f"{position[0,:,:] = }")
 
-            prompt[0] = prompt[0] / self.nt  # [0 - 1]
+            prompt[0] = prompt[0] / (1024 * 4)  # [0 - 1]
             prompt[1] = prompt[1] / 100  # scale by 100 km
             prompt[2] = prompt[2] / 100  # scale by 100 km
-            position[:, :, 0] = position[:, :, 0] / self.nt  # [0 - 1]
+            position[:, :, 0] = position[:, :, 0] / (1024 * 4)  # [0 - 1]
             position[:, :, 0] = position[:, :, 0] - prompt[0]
             prompt[0] = 0
             position[:, :, 1] = position[:, :, 1] / 100  # scale by 100 km
@@ -288,14 +292,32 @@ class SeismicNetworkIterableDataset(IterableDataset):
 
     def sample(self, event_ids):
 
-        for event_id in event_ids:
+        self.nt = 1024 * 4
+
+        # for event_id in event_ids:
+        for event_id in ["nc71129659", "nc73829386"]:
 
             station_ids = list(self.hdf5_fp[event_id].keys())
             event_time_index = self.hdf5_fp[event_id].attrs["event_time_index"]
 
-            num_station = 8
+            # sort station_ids by distance
+            dists = [self.hdf5_fp[event_id + "/" + x].attrs["distance_km"] for x in station_ids]
+            # dists = [self.hdf5_fp[event_id + "/" + x].attrs["latitude"] for x in station_ids]
+            # dists = [self.hdf5_fp[event_id + "/" + x].attrs["longitude"] for x in station_ids]
+            station_ids = [x for _, x in sorted(zip(dists, station_ids))]
 
-            if len(station_ids) <= num_station:
+            num_station = 8
+            # print(f"{len(station_ids) = }")
+            # shift station_ids by n
+            n = np.random.randint(0, len(station_ids))
+            station_ids = station_ids[n:] + station_ids[:n]
+            file_name = f"{event_id}_{n}"
+
+            station_ids = station_ids[:num_station]
+
+            # file_name = event_id
+
+            if len(station_ids) < num_station:
                 continue
             # # else:
 
@@ -338,14 +360,15 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 ## TODO: how to deal with multiple phases
                 # center = (self.hdf5_fp[trace_id].attrs["phase_index"][::2] + self.hdf5_fp[trace_id].attrs["phase_index"][1::2])/2.0
                 ## assuming only one event with both P and S picks
-                c0 = (
-                    (self.hdf5_fp[trace_id].attrs["p_phase_index"]) + (self.hdf5_fp[trace_id].attrs["s_phase_index"])
-                ) / 2.0
+                if "s_phase_index" in self.hdf5_fp[trace_id].attrs:
+                    s_phase_index = self.hdf5_fp[trace_id].attrs["s_phase_index"]
+                else:
+                    s_phase_index = self.hdf5_fp[trace_id].attrs["p_phase_index"] + 10
+
+                c0 = ((self.hdf5_fp[trace_id].attrs["p_phase_index"]) + (s_phase_index)) / 2.0
                 t0 = event_time_index
                 c0_width = (
-                    ((self.hdf5_fp[trace_id].attrs["s_phase_index"]) - (self.hdf5_fp[trace_id].attrs["p_phase_index"]))
-                    * self.sampling_rate
-                    / 200.0
+                    ((s_phase_index) - (self.hdf5_fp[trace_id].attrs["p_phase_index"])) * self.sampling_rate / 200.0
                 ).max()
                 dx = round(
                     (self.hdf5_fp[event_id].attrs["longitude"] - self.hdf5_fp[trace_id].attrs["longitude"])
@@ -376,8 +399,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 ## station location
                 station_location[0, i] = round(
                     self.hdf5_fp[trace_id].attrs["longitude"]
-                    * np.cos(np.radians(self.hdf5_fp[trace_id].attrs["latitude"]))
-                    * self.degree2km,
+                    # * np.cos(np.radians(self.hdf5_fp[trace_id].attrs["latitude"]))
+                    * np.cos(np.radians(self.hdf5_fp[event_id].attrs["latitude"])) * self.degree2km,
                     2,
                 )
                 station_location[1, i] = round(self.hdf5_fp[trace_id].attrs["latitude"] * self.degree2km, 2)
@@ -385,7 +408,7 @@ class SeismicNetworkIterableDataset(IterableDataset):
 
                 if i == 0:
                     # prompt = np.array([c0, dx, dy])  # t, x, y
-                    prompt = np.array([c0, 0, 0])
+                    prompt = np.array([c0, 0, 0])  ## relative to the selected station
                     prompt_location = np.array(
                         [self.hdf5_fp[trace_id].attrs["longitude"], self.hdf5_fp[trace_id].attrs["latitude"]]
                     )
@@ -436,7 +459,7 @@ class SeismicNetworkIterableDataset(IterableDataset):
             prompt_mask = prompt_mask[np.newaxis, ii : ii + self.nt, :]
 
             prompt[0] -= ii  # [3,] ## FIXME: Double check if the prompt and position time is the same
-            t = np.arange(self.nt)[:: self.event_feature_scale]  # [nt]
+            t = np.arange(self.nt)[:: self.prompt_feature_scale]  # [nt]
             position = np.array(position)  # [nsta, 2]
             position = np.stack(
                 [
@@ -447,10 +470,10 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 axis=-1,
             )  # [nt, nsta, 3]
 
-            prompt[0] = prompt[0] / self.nt  # [0 - 1]
+            prompt[0] = prompt[0] / (1024 * 4)  # [0 - 1]
             prompt[1] = prompt[1] / 100  # scale by 100 km
             prompt[2] = prompt[2] / 100  # scale by 100 km
-            position[:, :, 0] = position[:, :, 0] / self.nt  # [0 - 1]
+            position[:, :, 0] = position[:, :, 0] / (1024 * 4)  # [0 - 1]
             position[:, :, 0] = position[:, :, 0] - prompt[0]
             prompt[0] = 0
             position[:, :, 1] = position[:, :, 1] / 100  # scale by 100 km
@@ -465,24 +488,45 @@ class SeismicNetworkIterableDataset(IterableDataset):
             # polarity = tmp_polarity + polarity
             # polarity_mask = tmp_polarity_mask + polarity_mask
 
+            ## FIXME: after update data loader
+            data = data.transpose(0, 2, 1)  # 3, nx, nt
+            phase_pick = phase_pick.transpose(0, 2, 1)  # 3, nx, nt
+            phase_mask = phase_mask.transpose(0, 2, 1)  # 1, nx, nt
+            event_center = event_center.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_time = event_time.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_mask = event_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            polarity = polarity.transpose(0, 2, 1)  # 1, nx, nt//20
+            polarity_mask = polarity_mask.transpose(0, 2, 1)  # 1, nx, nt//20
+            prompt_center = prompt_center.transpose(0, 2, 1)  # 1, nx, nt//16
+            prompt_mask = prompt_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            position = position.transpose(1, 0, 2)  # nx, nt, 3
+
+            polarity = polarity[..., :: self.polarity_feature_scale]
+            polarity_mask = polarity_mask[..., :: self.polarity_feature_scale]
+            event_center = event_center[..., :: self.event_feature_scale]
+            event_time = event_time[..., :: self.event_feature_scale]
+            event_mask = event_mask[..., :: self.event_feature_scale]
+            prompt_center = prompt_center[..., :: self.event_feature_scale]
+            prompt_mask = prompt_mask[..., :: self.event_feature_scale]
+
             yield {
                 "data": torch.from_numpy(data).float(),
                 "phase_pick": torch.from_numpy(phase_pick).float(),
                 "phase_mask": torch.from_numpy(phase_mask).float(),
-                "polarity": torch.from_numpy(polarity[:, :: self.polarity_feature_scale]).float(),
-                "polarity_mask": torch.from_numpy(polarity_mask[:, :: self.polarity_feature_scale]).float(),
-                "event_center": torch.from_numpy(event_center[:, :: self.event_feature_scale]).float(),
-                "event_time": torch.from_numpy(event_time[:, :: self.event_feature_scale]).float(),
-                "event_mask": torch.from_numpy(event_mask[:, :: self.event_feature_scale]).float(),
+                "polarity": torch.from_numpy(polarity).float(),
+                "polarity_mask": torch.from_numpy(polarity_mask).float(),
+                "event_center": torch.from_numpy(event_center).float(),
+                "event_time": torch.from_numpy(event_time).float(),
+                "event_mask": torch.from_numpy(event_mask).float(),
                 "station_location": torch.from_numpy(station_location).float(),
-                "prompt_center": torch.from_numpy(prompt_center[:, :: self.event_feature_scale]).float(),
-                "prompt_mask": torch.from_numpy(prompt_mask[:, :: self.event_feature_scale]).float(),
+                "prompt_center": torch.from_numpy(prompt_center).float(),
+                "prompt_mask": torch.from_numpy(prompt_mask).float(),
                 "prompt": torch.tensor(prompt),
                 "position": torch.tensor(position),
                 "nt": self.nt,
                 "nx": len(station_ids),
                 "dt": 0.01,
-                "file_name": event_id,
+                "file_name": file_name,
                 # "station_id": station_ids.tolist(),
                 "station_id": station_ids,
             }

@@ -37,21 +37,27 @@ logger = logging.getLogger()
 
 def postprocess(meta, output, polarity_scale=1, event_scale=16, spectrogram_scale=4):
     nt, nx = meta["nt"], meta["nx"]
-    data = meta["data"][:, :, :nt, :nx]
+    # data = meta["data"][:, :, :nt, :nx]
+    data = meta["data"][:, :, :nx, :nt]
     # data = moving_normalize(data)
     meta["data"] = data
     if "phase" in output:
-        output["phase"] = output["phase"][:, :, :nt, :nx]
+        # output["phase"] = output["phase"][:, :, :nt, :nx]
+        output["phase"] = output["phase"][:, :, :nx, :nt]
     if "polarity" in output:
-        output["polarity"] = output["polarity"][:, :, : (nt - 1) // polarity_scale + 1, :nx]
+        # output["polarity"] = output["polarity"][:, :, : (nt - 1) // polarity_scale + 1, :nx]
+        output["polarity"] = output["polarity"][:, :, :nx, : (nt - 1) // polarity_scale + 1]
     if "event_center" in output:
-        output["event_center"] = output["event_center"][:, :, : (nt - 1) // event_scale + 1, :nx]
+        # output["event_center"] = output["event_center"][:, :, : (nt - 1) // event_scale + 1, :nx]
+        output["event_center"] = output["event_center"][:, :, :nx, : (nt - 1) // event_scale + 1]
     if "event_time" in output:
-        output["event_time"] = output["event_time"][:, :, : (nt - 1) // event_scale + 1, :nx]
+        # output["event_time"] = output["event_time"][:, :, : (nt - 1) // event_scale + 1, :nx]
+        output["event_time"] = output["event_time"][:, :, :nx, : (nt - 1) // event_scale + 1]
     if "spectrogram" in output:
-        output["spectrogram"] = output["spectrogram"][
-            :, :, : (nt - 1) // spectrogram_scale + 1, :
-        ]  ## FIXME: does not support multiple channels
+        # output["spectrogram"] = output["spectrogram"][
+        #     :, :, : (nt - 1) // spectrogram_scale + 1, :
+        # ]  ## FIXME: does not support multiple channels
+        output["spectrogram"] = output["spectrogram"][:, :, :, : (nt - 1) // spectrogram_scale + 1]
     return meta, output
 
 
@@ -145,7 +151,6 @@ def pred_phasenet(args, model, data_loader, pick_path, event_path, figure_path):
                     plot_phasenet(
                         meta,
                         phase_scores.cpu().float(),
-                        polarity_scores.cpu().float() if polarity_scores is not None else None,
                         phase_picks=phase_picks,
                         file_name=meta["file_name"],
                         dt=dt,
@@ -380,11 +385,7 @@ def main(args):
         drop_last=False,
     )
 
-    model = eqnet.models.__dict__[args.model].build_model(
-        backbone=args.backbone,
-        in_channels=1,
-        out_channels=(len(args.phases) + 1),
-    )
+    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone)
     logger.info("Model:\n{}".format(model))
 
     model.to(device)

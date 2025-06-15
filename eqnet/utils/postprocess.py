@@ -15,24 +15,29 @@ from tqdm import tqdm
 
 
 def detect_peaks(scores, vmin=0.3, kernel=101, stride=1, K=0, dt=0.01):
-    nb, nc, nt, nx = scores.shape
+    # nb, nc, nt, nx = scores.shape
+    nb, nc, nx, nt = scores.shape
     pad = kernel // 2
-    smax = F.max_pool2d(scores, (kernel, 1), stride=(stride, 1), padding=(pad, 0))[:, :, :nt, :]
+    # smax = F.max_pool2d(scores, (kernel, 1), stride=(stride, 1), padding=(pad, 0))[:, :, :nt, :]
+    smax = F.max_pool2d(scores, (1, kernel), stride=(1, stride), padding=(0, pad))[:, :, :, :nt]
     keep = (smax == scores).float()
     scores = scores * keep
     # if there are multiple peaks with the same score, keep the first one
-    pos = torch.arange(nt, 0, -1, device=scores.device)[None, None, :, None].float()
-    sfirst = F.max_pool2d(keep * pos, (kernel, 1), stride=(stride, 1), padding=(pad, 0))[:, :, :nt, :]
+    # pos = torch.arange(nt, 0, -1, device=scores.device)[None, None, :, None].float()
+    pos = torch.arange(nt, 0, -1, device=scores.device)[None, None, None, :].float()
+    # sfirst = F.max_pool2d(keep * pos, (kernel, 1), stride=(stride, 1), padding=(pad, 0))[:, :, :nt, :]
+    sfirst = F.max_pool2d(keep * pos, (1, kernel), stride=(1, stride), padding=(0, pad))[:, :, :, :nt]
     scores = scores * (sfirst == pos).float()
 
-    batch, chn, nt, ns = scores.size()
-    scores = torch.transpose(scores, 2, 3)  # [nb, nc, nt, nx] -> [nb, nc, nx, nt]
+    # batch, chn, nt, ns = scores.size()
+    # scores = torch.transpose(scores, 2, 3)  # [nb, nc, nt, nx] -> [nb, nc, nx, nt]
     if K == 0:
         K = max(round(nt / (30.0 / dt) * 10.0), 3)  # maximum 10 picks per 30 seconds
-    if chn == 1:
+    if nc == 1:
         topk_scores, topk_inds = torch.topk(scores, K)
     else:
-        topk_scores, topk_inds = torch.topk(scores[:, 1:, :, :].view(batch, chn - 1, ns, -1), K)
+        # topk_scores, topk_inds = torch.topk(scores[:, 1:, :, :].view(batch, chn - 1, ns, -1), K)
+        topk_scores, topk_inds = torch.topk(scores[:, 1:, :, :].view(nb, nc - 1, nx, -1), K)
     # topk_inds = topk_inds % nt
 
     return topk_scores.detach().cpu(), topk_inds.detach().cpu()
@@ -141,7 +146,8 @@ def extract_picks(
                         #     f"{(polarity_score[i, 1, index.item()//polarity_scale, k].item() - polarity_score[i, 2, index.item()//polarity_scale, k].item()):.3f}"
                         # )
                         # score = polarity_score[i, 1, :, k] - polarity_score[i, 2, :, k]
-                        score = (polarity_score[i, 0, :, k] - 0.5) * 2.0
+                        # score = (polarity_score[i, 0, :, k] - 0.5) * 2.0
+                        score = (polarity_score[i, 0, k, :] - 0.5) * 2.0
                         score = score[max(0, index.item() // polarity_scale - 3) : index.item() // polarity_scale + 3]
                         idx = torch.argmax(torch.abs(score))
                         pick_dict["phase_polarity"] = round(score[idx].item(), 3)
@@ -153,7 +159,8 @@ def extract_picks(
                             if ii < len(topk_index_ijk) - 1
                             else j1 + window_amp_i
                         )
-                        pick_dict["phase_amplitude"] = f"{torch.max(waveform_amp[i, j1:j2, k]).item():.3e}"
+                        # pick_dict["phase_amplitude"] = f"{torch.max(waveform_amp[i, j1:j2, k]).item():.3e}"
+                        pick_dict["phase_amplitude"] = f"{torch.max(waveform_amp[i, k, j1:j2]).item():.3e}"
 
                     picks_per_file.append(pick_dict)
 
@@ -201,7 +208,7 @@ def extract_events(
     else:
         begin_channel_index = [0 for i in range(batch)]
     if ("begin_time_index" in kwargs) and (kwargs["begin_time_index"] is not None):
-        begin_time_index = [x.item()/event_scale for x in kwargs["begin_time_index"]]
+        begin_time_index = [x.item() / event_scale for x in kwargs["begin_time_index"]]
     else:
         begin_time_index = [0 for i in range(batch)]
 
@@ -248,9 +255,11 @@ def extract_events(
                         }
 
                         if event_time is not None:
-                            t0 = center_time - timedelta(seconds=event_time[i, 0, index.item(), k].item() * dt[i])
+                            # t0 = center_time - timedelta(seconds=event_time[i, 0, index.item(), k].item() * dt[i])
+                            t0 = center_time - timedelta(seconds=event_time[i, 0, k, index.item()].item() * dt[i])
                             event_dict["event_time"] = t0.strftime("%Y-%m-%dT%H:%M:%S.%f")
-                            event_dict["travel_time"] = event_time[i, 0, index.item(), k].item() * dt[i]
+                            # event_dict["travel_time"] = event_time[i, 0, index.item(), k].item() * dt[i]
+                            event_dict["travel_time"] = event_time[i, 0, k, index.item()].item() * dt[i]
                             if event_dict["travel_time"] <= 0:
                                 continue
 
@@ -260,7 +269,9 @@ def extract_events(
                                 2,
                                 event_time[i, 0, index.item(), k].item() * 2.0 * (VPVS_RATIO - 1) / (VPVS_RATIO + 1),
                             )  # 2 is to prevent error of torch.max()
-                            itp = max(0, index.item() * event_scale - int(ps_delta * 0.5)) # waveform is not downsampled
+                            itp = max(
+                                0, index.item() * event_scale - int(ps_delta * 0.5)
+                            )  # waveform is not downsampled
                             its = max(0, index.item() * event_scale + int(ps_delta * 0.5))
 
                             # p_amp = torch.max(torch.abs(waveform[i, :, itp : min(itp + p_window, its), k]))

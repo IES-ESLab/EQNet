@@ -455,83 +455,62 @@ def plot_phasenet_prompt_train(
 def plot_phasenet(
     meta,
     phase,
-    picks=None,
-    phases=None,
+    phase_picks=None,
     dt=0.01,
     nt=6000 * 10,
-    epoch=0,
     file_name=None,
     figure_dir="figures",
     **kwargs,
 ):
-    nb0, nc0, nt0, ns0 = phase.shape
+    nb, nc, ns, nt = phase.shape
     chn_name = ["E", "N", "Z"]
-    # normalize = lambda x: (x - torch.mean(x, dim=2, keepdim=True)) / torch.std(x, dim=2, keepdim=True) / 10
-    # waveform_raw = normalize(meta["waveform_raw"])
-    # waveform = normalize(meta["waveform"])
-    # waveform = meta["waveform"] / 3.0
+    if isinstance(dt, torch.Tensor):
+        dt = dt.item()
 
-    waveform = meta["data"]
-    # waveform = normalize(waveform)
-    # vmax = torch.std(waveform) * 3
-    # vmin = -vmax
     if "begin_time" in meta:
         begin_time = meta["begin_time"]
     else:
-        begin_time = [0] * nb0
+        begin_time = [0] * nb
 
-    for i in range(nb0):
-        dt = dt[i].item()
+    for i in range(nb):
 
-        for ii in range(0, nt0, nt):
-            plt.close("all")
-            fig, axes = plt.subplots(2, 1, figsize=(20, 10))  # , gridspec_kw={"height_ratios": [5, 5, 1, 1, 1]})
+        plt.close("all")
 
-            # j = 2
-            # # for j in range(3):
-            # for k in range(ns0):
-            #     axes[0].plot(t, phase[i, 1, ii:ii+nt, k] + k, "-C0")
-            #     axes[0].plot(t, phase[i, 2, ii:ii+nt, k] + k, "-C1")
-            #     mask = ((phase[i, 1, ii:ii+nt, k] > 0.1) | (phase[i, 2, ii:ii+nt, k] > 0.1))
-            #     axes[0].plot(t[mask], polarity[i, 0, ii:ii+nt, k][mask] + k, "-C2")
-            #     axes[0].plot(t_event, event[i, 0, ii//event_dt_ratio:(ii+nt)//event_dt_ratio, k] + k, "-C3")
-            #     axes[0].plot(t, waveform_raw[i, j, ii:ii+nt, k] + k, linewidth=0.5, color="k", label=f"{chn_name[j]}")
-            # # axes[0].set_xticklabels([])
-            # axes[0].grid("on")
+        chn_name = ["E", "N", "Z"]
 
-            # for j in range(3):
-            for k in range(ns0):
-                begin_time_i = datetime.fromisoformat(begin_time[i])
-                t = [
-                    begin_time_i + timedelta(seconds=(ii + it) * dt) for it in range(len(phase[i, 1, ii : ii + nt, k]))
-                ]
+        fig, axes = plt.subplots(4, 1, figsize=(10, 5))
+        idx = 0
+        for j in range(3):
+            t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt, freq=pd.Timedelta(seconds=dt))
+            axes[j + idx].plot(t, meta["data"][i, j, 0, :], lw=0.5, color="k", label=f"{chn_name[j]}")
+            axes[j + idx].set_xlim(t[0], t[-1])
+            axes[j + idx].set_xticklabels([])
+            axes[j + idx].grid("on")
+            axes[j + idx].legend(loc="upper right")
 
-                if ns0 == 1:
-                    for j in range(3):
-                        waveform_ijk = waveform[i, j, ii : ii + nt, k]
-                        waveform_ijk -= torch.mean(waveform_ijk)
-                        waveform_ijk /= torch.std(waveform_ijk) * 6
-                        axes[0].plot(t, waveform_ijk + j, linewidth=0.2, color="k", label=f"{chn_name[j]}")
-                else:
-                    waveform_ijk = waveform[i, 2, ii : ii + nt, k]
-                    waveform_ijk -= torch.mean(waveform_ijk)
-                    waveform_ijk /= torch.std(waveform_ijk) * 6
-                axes[0].plot(t, waveform_ijk + k, linewidth=0.2, color="k", label=f"{chn_name[2]}")
+        idx = 3
+        t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt, freq=pd.Timedelta(seconds=dt))
+        axes[idx].plot(t, phase[i, 2, 0, :], "r", lw=1.0)
+        axes[idx].plot(t, phase[i, 1, 0, :], "b", lw=1.0)
+        color = {"P": "b", "S": "r"}
+        for ii, pick in enumerate(phase_picks[i]):
+            tt = pd.to_datetime(pick["phase_time"])
+            axes[idx].plot([tt, tt], [-0.05, 1.05], f"--{color[pick['phase_type']]}", linewidth=0.8)
 
-                axes[1].plot(t, phase[i, 1, ii : ii + nt, k] + k, "-C0", linewidth=1.0)
-                axes[1].plot(t, phase[i, 2, ii : ii + nt, k] + k, "-C1", linewidth=1.0)
+        axes[idx].plot([], [], "-b", label="P-phase")
+        axes[idx].plot([], [], "-r", label="S-phase")
+        axes[idx].set_xlim(t[0], t[-1])
+        axes[idx].set_ylim(-0.05, 1.05)
+        axes[idx].set_xticklabels([])
+        axes[idx].grid("on")
+        axes[idx].legend(loc="upper right")
 
-            axes[0].grid("on")
-            axes[1].grid("on")
-
-            fig.tight_layout()
-
-            fig.savefig(
-                os.path.join(figure_dir, file_name[i].replace("/", "_") + f"_{ii:06d}.png"),
-                bbox_inches="tight",
-                dpi=300,
-            )
-            plt.close(fig)
+        fig.savefig(
+            os.path.join(figure_dir, file_name[i].replace("/", "_") + f"_{ii:06d}.png"),
+            bbox_inches="tight",
+            dpi=300,
+        )
+        plt.close(fig)
 
 
 def plot_phasenet_tf(
@@ -547,12 +526,13 @@ def plot_phasenet_tf(
     file_name=None,
     figure_dir="figures",
 ):
-    nb, nc, nt, ns = meta["data"].shape
+    # nb, nc, nt, ns = meta["data"].shape
+    nb, nc, ns, nt = meta["data"].shape
     if isinstance(dt, torch.Tensor):
         dt = dt.item()
-    nt_event = event_center.shape[2]
+    nt_event = event_center.shape[-1]
     dt_event = dt * nt / nt_event
-    # nt_polarity = polarity.shape[2]
+    # nt_polarity = polarity.shape[-1]
     # dt_polarity = dt * nt / nt_polarity
 
     if "begin_time" in meta:
@@ -560,7 +540,6 @@ def plot_phasenet_tf(
     else:
         begin_time = [0] * nb
 
-    print(f"{meta['data'].shape[0] = }")
     for i in range(meta["data"].shape[0]):
         plt.close("all")
 
@@ -571,7 +550,7 @@ def plot_phasenet_tf(
 
         for j in range(3):
             t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt, freq=pd.Timedelta(seconds=dt))
-            axes[idx + j].plot(t, meta["data"][i, j, :, 0], lw=0.5, color="k", label=f"{chn_name[j]}")
+            axes[idx + j].plot(t, meta["data"][i, j, 0, :], lw=0.5, color="k", label=f"{chn_name[j]}")
             axes[idx + j].set_xlim(t[0], t[-1])
             axes[idx + j].set_xticklabels([])
             axes[idx + j].grid("on")
@@ -582,16 +561,16 @@ def plot_phasenet_tf(
             meta["spectrogram"] = meta["spectrogram"][:, ::2, :, :]
         for j in range(3):
             # vmax = meta["spectrogram"][i, j, :, :].abs().max().item()
-            vmax = 6
-            axes[idx + j].pcolormesh(meta["spectrogram"][i, j, :, :].T, cmap="seismic", vmin=-vmax, vmax=vmax)
+            # vmax = 6
+            vmax = torch.std(meta["spectrogram"][i, j, :, :]) * 3
+            # axes[idx + j].pcolormesh(meta["spectrogram"][i, j, :, :], cmap="seismic", vmin=-vmax, vmax=vmax)
+            axes[idx + j].pcolormesh(meta["spectrogram"][i, j, :, :], vmin=0, vmax=vmax)
             axes[idx + j].set_xticklabels([])
 
         idx = 6
         t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt, freq=pd.Timedelta(seconds=dt))
-        print(phase.shape)
-        print(f"{i = }")
-        axes[idx].plot(t, phase[i, 2, :, 0], "r", lw=1.0)
-        axes[idx].plot(t, phase[i, 1, :, 0], "b", lw=1.0)
+        axes[idx].plot(t, phase[i, 2, 0, :], "r", lw=1.0)
+        axes[idx].plot(t, phase[i, 1, 0, :], "b", lw=1.0)
         color = {"P": "b", "S": "r"}
         for ii, pick in enumerate(phase_picks[i]):
             tt = pd.to_datetime(pick["phase_time"])
@@ -629,7 +608,7 @@ def plot_phasenet_tf(
 
         idx = 7
         t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt_event, freq=pd.Timedelta(seconds=dt_event))
-        axes[idx].plot(t, event_center[i, 0, :, 0], "b", label="Event")
+        axes[idx].plot(t, event_center[i, 0, 0, :], "b", label="Event")
         axes[idx].set_xlim(t[0], t[-1])
         axes[idx].set_ylim(-0.05, 1.05)
         axes[idx].grid("on")
@@ -683,12 +662,13 @@ def plot_phasenet_plus(
     figure_dir="figures",
     **kwargs,
 ):
-    nb, nc, nt, ns = meta["data"].shape
+    # nb, nc, nt, ns = meta["data"].shape
+    nb, nc, ns, nt = meta["data"].shape
     if isinstance(dt, torch.Tensor):
         dt = dt.item()
-    nt_event = event_center.shape[2]
+    nt_event = event_center.shape[-1]
     dt_event = dt * nt / nt_event
-    nt_polarity = polarity.shape[2]
+    nt_polarity = polarity.shape[-1]
     dt_polarity = dt * nt / nt_polarity
 
     if "begin_time" in meta:
@@ -715,7 +695,7 @@ def plot_phasenet_plus(
         idx = 0
         for j in range(3):
             t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt, freq=pd.Timedelta(seconds=dt))
-            axes[j + idx].plot(t, meta["data"][i, j, :, 0], lw=0.5, color="k", label=f"{chn_name[j]}")
+            axes[j + idx].plot(t, meta["data"][i, j, 0, :], lw=0.5, color="k", label=f"{chn_name[j]}")
             axes[j + idx].set_xlim(t[0], t[-1])
             axes[j + idx].set_xticklabels([])
             axes[j + idx].grid("on")
@@ -723,8 +703,8 @@ def plot_phasenet_plus(
 
         idx = 3
         t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt, freq=pd.Timedelta(seconds=dt))
-        axes[idx].plot(t, phase[i, 2, :, 0], "r", lw=1.0)
-        axes[idx].plot(t, phase[i, 1, :, 0], "b", lw=1.0)
+        axes[idx].plot(t, phase[i, 2, 0, :], "r", lw=1.0)
+        axes[idx].plot(t, phase[i, 1, 0, :], "b", lw=1.0)
         color = {"P": "b", "S": "r"}
         for ii, pick in enumerate(phase_picks[i]):
             tt = pd.to_datetime(pick["phase_time"])
@@ -763,7 +743,7 @@ def plot_phasenet_plus(
 
         idx = 5
         t = pd.date_range(pd.Timestamp(begin_time[i]), periods=nt_event, freq=pd.Timedelta(seconds=dt_event))
-        axes[idx].plot(t, event_center[i, 0, :, 0], "b", label="Event")
+        axes[idx].plot(t, event_center[i, 0, 0, :], "b", label="Event")
         axes[idx].set_xlim(t[0], t[-1])
         axes[idx].set_ylim(-0.05, 1.05)
         axes[idx].grid("on")
@@ -818,13 +798,15 @@ def plot_phasenet_prompt(
     figure_dir="figures",
     **kwargs,
 ):
-    nb, nc, nt, ns = meta["data"].shape
+    # nb, nc, nt, ns = meta["data"].shape
+    nb, nc, ns, nt = meta["data"].shape
+    print(f"{nb = }{nc = }{ns = }{nt = }")
     dt = 0.01
-    nt_event = event_center.shape[2]
+    nt_event = event_center.shape[-1]
     dt_event = dt * nt / nt_event
-    nt_polarity = polarity.shape[2]
+    nt_polarity = polarity.shape[-1]
     dt_polarity = dt * nt / nt_polarity
-    nt_prompt = prompt_center.shape[2]
+    nt_prompt = prompt_center.shape[-1]
     dt_prompt = dt * nt / nt_prompt
 
     normalize = lambda x: x / x.abs().max()
@@ -837,51 +819,62 @@ def plot_phasenet_prompt(
 
         t = torch.arange(nt) * dt
         for j in range(ns):
-            axes[0, 0].plot(t, normalize(meta["data"][i, -1, :, j]) + j, linewidth=0.5, color="k")
+            axes[0, 0].plot(t, normalize(meta["data"][i, -1, j, :]) + j, linewidth=0.5, color="k")
         axes[0, 0].set_xlim(t[0], t[-1])
-        axes[0, 0].set_xticklabels([])
+        # axes[0, 0].set_xticklabels([])
         axes[0, 0].grid("on")
 
         # t = torch.arange(nt_prompt) * dt_prompt
-        t = meta["position"][i, :, 0, 0]
-        scale = meta["position"][i, -1, 0, 0] - meta["position"][i, 0, 0, 0]  # B, T, S, 3
-        # t_prompt = (meta["prompt"][i, 0] - meta["position"][i, 0, 0, 0]) * (t[-1]-t[0]) / scale + t[0]
-        t_prompt = meta["prompt"][i, 0]
+        t = meta["position"][i, 0, :, 0]
+        t_origin = t.clone()
+        ## HARD CODE
+        dt = t[1] - t[0]
+        t = t[:, None] * 16 + torch.arange(16) * dt
+        t = t.flatten()
+
+        # scale = meta["position"][i, -1, 0, 0] - meta["position"][i, 0, 0, 0]  # B, T, S, 3
+        # # t_prompt = (meta["prompt"][i, 0] - meta["position"][i, 0, 0, 0]) * (t[-1]-t[0]) / scale + t[0]
+        t_prompt = meta["prompt"][i, 0] * 16
+
         for j in range(ns):
-            axes[0, 1].plot(t, prompt_center[i, 0, :, j] + j, "b")
-            axes[0, 1].plot(t, meta["prompt_center"][i, 0, :, j] + j, "--C0")
-            axes[0, 1].plot(t, meta["prompt_mask"][i, 0, :, j] + j, ":", color="gray")
+            axes[0, 1].plot(t_origin * 16, torch.zeros_like(t_origin) + j, ".", color="r")
+
+        for j in range(ns):
+            axes[0, 1].plot(t, prompt_center[i, 0, j, :] + j, "b")
+            axes[0, 1].plot(t, meta["prompt_center"][i, 0, j, :] + j, "--C0")
+            axes[0, 1].plot(t, meta["prompt_mask"][i, 0, j, :] + j, ":", color="gray")
         # axes[0, 1].axvline(t_prompt, color="r")
         axes[0, 1].plot([t_prompt, t_prompt], [-0.05, 1.05], "r", linewidth=1.0)
         axes[0, 1].set_xlim(t[0], t[-1])
-        axes[0, 1].set_xticklabels([])
+        # axes[0, 1].set_xticklabels([])
         axes[0, 1].grid("on")
 
         t = torch.arange(nt) * dt
+
         for j in range(ns):
-            axes[1, 0].plot(t, phase[i, 1, :, j] + j, "b")
-            axes[1, 0].plot(t, phase[i, 2, :, j] + j, "r")
-            axes[1, 0].plot(t, meta["phase_pick"][i, 1, :, j] + j, "--C0")
-            axes[1, 0].plot(t, meta["phase_pick"][i, 2, :, j] + j, "--C3")
-            axes[1, 0].plot(t, meta["phase_mask"][i, 0, :, j] + j, ":", color="gray")
+            axes[1, 0].plot(t, phase[i, 1, j, :] + j, "b")
+            axes[1, 0].plot(t, phase[i, 2, j, :] + j, "r")
+            axes[1, 0].plot(t, meta["phase_pick"][i, 1, j, :] + j, "--C0")
+            axes[1, 0].plot(t, meta["phase_pick"][i, 2, j, :] + j, "--C3")
+            axes[1, 0].plot(t, meta["phase_mask"][i, 0, j, :] + j, ":", color="gray")
         axes[1, 0].set_xlim(t[0], t[-1])
-        axes[1, 0].set_xticklabels([])
+        # axes[1, 0].set_xticklabels([])
         axes[1, 0].grid("on")
 
         t = torch.arange(nt_polarity) * dt_polarity
         for j in range(ns):
-            axes[2, 0].plot(t, polarity[i, 0, :, j] + j, "b")
-            axes[2, 0].plot(t, meta["polarity"][i, 0, :, j] + j, "--C0")
-            axes[2, 0].plot(t, meta["polarity_mask"][i, 0, :, j] + j, ":", color="gray")
+            axes[2, 0].plot(t, polarity[i, 0, j, :] + j, "b")
+            axes[2, 0].plot(t, meta["polarity"][i, 0, j, :] + j, "--C0")
+            axes[2, 0].plot(t, meta["polarity_mask"][i, 0, j, :] + j, ":", color="gray")
         axes[2, 0].set_xlim(t[0], t[-1])
-        axes[2, 0].set_xticklabels([])
+        # axes[2, 0].set_xticklabels([])
         axes[2, 0].grid("on")
 
         t = torch.arange(nt_event) * dt_event
         for j in range(ns):
-            axes[1, 1].plot(t, event_center[i, 0, :, j] + j, "b")
-            axes[1, 1].plot(t, meta["event_center"][i, 0, :, j] + j, "--C0")
-            axes[1, 1].plot(t, meta["event_mask"][i, 0, :, j] + j, ":", color="gray")
+            axes[1, 1].plot(t, event_center[i, 0, j, :] + j, "b")
+            axes[1, 1].plot(t, meta["event_center"][i, 0, j, :] + j, "--C0")
+            axes[1, 1].plot(t, meta["event_mask"][i, 0, j, :] + j, ":", color="gray")
         axes[1, 1].set_xlim(t[0], t[-1])
         axes[1, 1].grid("on")
 

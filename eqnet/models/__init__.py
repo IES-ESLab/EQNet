@@ -4,4 +4,5 @@ from .phasenet import *
 from .phasenet_das import *
 from .phasenet_plus import *
 from .phasenet_tf import *
+from .phasenet_tf_plus import *
 from .phasenet_prompt import *
