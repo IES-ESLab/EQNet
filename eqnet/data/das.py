@@ -784,7 +784,12 @@ class DASIterableDataset(IterableDataset):
                         data_, targets_ = masking_edge(data_, targets_)
 
                     # data_ = normalize(data_)
-                    # data_ = data_ - torch.median(data_, dim=2, keepdims=True)[0]
+                    if np.random.rand() < 0.5:
+                        data_ = data_ - torch.median(data_, dim=-2, keepdims=True)[0]
+
+                    ## FIXME: shift (nt, nx) to (nx, nt)
+                    data_ = data_.permute(0, 2, 1)
+                    targets_ = targets_.permute(0, 2, 1)
 
                     yield {
                         "data": torch.nan_to_num(data_),
@@ -897,6 +902,10 @@ class DASIterableDataset(IterableDataset):
             if not self.cut_patch:
                 nt, nx = data.shape[1:]
                 data = padding(data, self.min_nt, self.min_nx)
+
+                ## FIXME: (nt, nx) -> (nx, nt)
+                data = data.permute(0, 2, 1)
+
                 yield {
                     "data": data,
                     "nt": nt,
@@ -930,13 +939,16 @@ class DASIterableDataset(IterableDataset):
                         data_patch = data[:, i : i + self.nt, j : j + self.nx]
                         _, nt_, nx_ = data_patch.shape
                         data_patch = padding(data_patch, self.min_nt, self.min_nx)
+
+                        ## FIXME: (nt, nx) -> (nx, nt)
+                        data_patch = data_patch.permute(0, 2, 1)
                         yield {
                             "data": data_patch,
                             "nt": nt_,
                             "nx": nx_,
                             # "file_name": os.path.splitext(file.split("/")[-1])[0] + f"_{i:04d}_{j:04d}",
                             "file_name": os.path.splitext(file)[0] + f"_{i:04d}_{j:04d}",
-                            "begin_time": (sample["begin_time"] + timedelta(seconds=i * sample["dt_s"])).isoformat(
+                            "begin_time": (sample["begin_time"] + timedelta(seconds=i * float(sample["dt_s"]))).isoformat(
                                 timespec="milliseconds"
                             ),
                             "begin_time_index": i,

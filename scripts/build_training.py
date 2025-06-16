@@ -13,8 +13,10 @@ np.random.seed(42)
 random.seed(42)
 
 # %%
-protocol = "gs://"
-bucket = "quakeflow_das"
+# protocol = "gs://"
+# bucket = "quakeflow_das"
+protocol = "file://"
+bucket = "/global/scratch/users/zhuwq0/quakeflow_das"
 
 # %%
 figure_path = Path("debug_figures")
@@ -109,8 +111,6 @@ for folder in folders:
             # print(f'{label_path / f"{folder}" / "labels" / (get_eventid(file) + ".csv")}')
             picks.to_csv(label_path / f"{folder}" / "labels" / (get_eventid(file) + ".csv"), index=False)
 
-        if i > 16:
-            break
 
 # %%
 labels = []

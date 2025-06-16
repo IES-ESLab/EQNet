@@ -93,13 +93,14 @@ def plot_das_train(meta, preds, epoch, figure_dir="figures", dt=0.01, dx=10, pre
             (raw_data[i] - np.mean(raw_data[i])),
             vmin=raw_vmin,
             vmax=raw_vmax,
-            extent=(0, raw_data[i].shape[1] * dx / 1e3, raw_data[i].shape[0] * dt, 0),
+            # extent=(0, raw_data[i].shape[1] * dx / 1e3, raw_data[i].shape[0] * dt, 0),
+            extent=(0, raw_data[i].shape[0] * dt, raw_data[i].shape[1] * dx / 1e3, 0),
             interpolation="none",
             cmap="seismic",
             aspect="auto",
         )
-        ax[0].set_xlabel("Distance (km)")
-        ax[0].set_ylabel("Time (s)")
+        ax[0].set_ylabel("Distance (km)")
+        ax[0].set_xlabel("Time (s)")
         ax[0].set_title("DAS Data")
         # ax[1, 0].imshow((data[i]-np.mean(data[i])), vmin=vmin, vmax=vmax, interpolation='none', cmap="seismic", aspect='auto')
 
@@ -111,13 +112,14 @@ def plot_das_train(meta, preds, epoch, figure_dir="figures", dt=0.01, dx=10, pre
             targets[i],
             vmin=0,
             vmax=1,
-            extent=(0, targets[i].shape[1] * dx / 1e3, targets[i].shape[0] * dt, 0),
+            # extent=(0, targets[i].shape[1] * dx / 1e3, targets[i].shape[0] * dt, 0),
+            extent=(0, targets[i].shape[0] * dt, targets[i].shape[1] * dx / 1e3, 0),
             interpolation="none",
             aspect="auto",
         )
-        ax[1].set_xlabel("Distance (km)")
+        ax[1].set_ylabel("Distance (km)")
         ax[1].set_title("Noisy Label")
-        ax[1].set_ylabel("Time (s)")
+        ax[1].set_xlabel("Time (s)")
         # ax[0, 1].imshow(y[i], interpolation='none', aspect='auto')
 
         # y[i][:, :, 0] = 0
@@ -129,12 +131,13 @@ def plot_das_train(meta, preds, epoch, figure_dir="figures", dt=0.01, dx=10, pre
             y[i],
             vmin=0,
             vmax=1,
-            extent=(0, y[i].shape[1] * dx / 1e3, y[i].shape[0] * dt, 0),
+            # extent=(0, y[i].shape[1] * dx / 1e3, y[i].shape[0] * dt, 0),
+            extent=(0, y[i].shape[0] * dt, y[i].shape[1] * dx / 1e3, 0),
             interpolation="none",
             aspect="auto",
         )
-        ax[2].set_xlabel("Distance (km)")
-        ax[2].set_ylabel("Time (s)")
+        ax[2].set_ylabel("Distance (km)")
+        ax[2].set_xlabel("Time (s)")
         ax[2].set_title("Prediction")
 
         fig.tight_layout()

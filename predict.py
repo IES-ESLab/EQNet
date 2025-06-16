@@ -439,8 +439,11 @@ def main(args):
         model_without_ddp = model.module
     model_without_ddp.load_state_dict(checkpoint["model"], strict=True)
 
-    pred_phasenet(args, model, data_loader, pick_path, event_path, figure_path)
-
+    if args.model == "phasenet_das":
+        pred_phasenet_das(args, model, data_loader, pick_path, figure_path)
+    else:
+        pred_phasenet(args, model, data_loader, pick_path, event_path, figure_path)
+        
 
 def get_args_parser(add_help=True):
     import argparse
