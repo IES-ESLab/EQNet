@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def normalize(x):
@@ -61,84 +62,64 @@ def plot_autoencoder_das_train(meta, preds, epoch, figure_dir="figures"):
         plt.close(fig)
 
 
-def plot_das_train(meta, preds, epoch, figure_dir="figures", dt=0.01, dx=10, prefix=""):
-    meta_data = meta["data"].cpu()
-    raw_data = meta_data.clone().permute(0, 2, 3, 1).numpy()
-    # data = normalize_local(meta_data.clone()).permute(0, 2, 3, 1).numpy()
-    targets = meta["phase_pick"].permute(0, 2, 3, 1).numpy()
-    y = preds.permute(0, 2, 3, 1).numpy()
+def plot_phasenet_das_train(meta, phase_pick, epoch, figure_dir="figures", dt=0.01, dx=10, prefix=""):
 
-    if targets.shape[-1] < 3:
-        targets_ = np.zeros((targets.shape[0], targets.shape[1], targets.shape[2], 3))
-        targets_[:, :, :, : targets.shape[-1]] = targets
-        targets = targets_
-    if y.shape[-1] < 3:
-        y_ = np.zeros((y.shape[0], y.shape[1], y.shape[2], 3))
-        y_[:, :, :, : y.shape[-1]] = y
-        y = y_
-    if targets.shape[-1] == 4:
-        targets = targets[:, :, :, 1:]
-    if y.shape[-1] == 4:
-        y = y[:, :, :, 1:]
+    data = meta["data"].cpu().numpy().squeeze(1) # nb, nc, nx, nt
+    nb, nx, nt = data.shape
 
-    for i in range(len(raw_data)):
-        raw_vmax = np.std(raw_data[i]) * 2
-        raw_vmin = -raw_vmax
+    if phase_pick is not None:
+        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)
 
-        vmax = np.std(raw_data[i]) * 2
-        vmin = -vmax
+    if "phase_pick" in meta:
+        y_phase_pick = meta["phase_pick"].cpu().numpy()
+        y_phase_pick = y_phase_pick.transpose(0, 2, 3, 1)
+    if "phase_mask" in meta:
+        y_phase_mask = meta["phase_mask"].cpu().numpy()
+        y_phase_mask = y_phase_mask.transpose(0, 2, 3, 1)
+    
+    for i in range(nb):
 
-        fig, ax = plt.subplots(1, 3, figsize=(3 * 3, 3), sharex=False, sharey=False)
-        ax[0].imshow(
-            (raw_data[i] - np.mean(raw_data[i])),
-            vmin=raw_vmin,
-            vmax=raw_vmax,
-            # extent=(0, raw_data[i].shape[1] * dx / 1e3, raw_data[i].shape[0] * dt, 0),
-            extent=(0, raw_data[i].shape[0] * dt, raw_data[i].shape[1] * dx / 1e3, 0),
+        dx = meta["dx_m"][i]
+        dt = meta["dt_s"][i]
+
+        fig, ax = plt.subplots(1, 3, figsize=(10, 4), squeeze=False, sharex=True, sharey=True)
+
+        ax[0, 0].imshow(
+            data[i] - np.mean(data[i], axis=-1, keepdims=True) / np.std(data[i], axis=-1, keepdims=True),
+            vmin=-6,
+            vmax=6,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
             interpolation="none",
             cmap="seismic",
             aspect="auto",
         )
-        ax[0].set_ylabel("Distance (km)")
-        ax[0].set_xlabel("Time (s)")
-        ax[0].set_title("DAS Data")
-        # ax[1, 0].imshow((data[i]-np.mean(data[i])), vmin=vmin, vmax=vmax, interpolation='none', cmap="seismic", aspect='auto')
+        ax[0, 0].set_xlabel("Time (s)")
+        ax[0, 0].set_ylabel("Distance (km)")
+        ax[0, 0].set_title("DAS Data")
 
-        # targets[i][:, :, 1] = 1 - targets[i][:, :, 1]
-        # targets[i][:, :, 2] = 1 - targets[i][:, :, 2]
-        # targets[i][:, (targets[i][:, :, 0] == 0).all(axis=0), :] = 0
-        ax[1].imshow(
-            # targets[i][:, :, [1, 0, 2]],
-            targets[i],
+        ax[0, 1].imshow(
+            y_phase_pick[i][...,[1, 2, 0]],
             vmin=0,
             vmax=1,
-            # extent=(0, targets[i].shape[1] * dx / 1e3, targets[i].shape[0] * dt, 0),
-            extent=(0, targets[i].shape[0] * dt, targets[i].shape[1] * dx / 1e3, 0),
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
             interpolation="none",
             aspect="auto",
         )
-        ax[1].set_ylabel("Distance (km)")
-        ax[1].set_title("Noisy Label")
-        ax[1].set_xlabel("Time (s)")
-        # ax[0, 1].imshow(y[i], interpolation='none', aspect='auto')
+        ax[0, 1].set_xlabel("Time (s)")
+        # ax[0, 1].set_ylabel("Distance (km)")
+        ax[0, 1].set_title("Noisy Label")
 
-        # y[i][:, :, 0] = 0
-        # y[i][:, :, 1] = 1 - y[i][:, :, 1]
-        # y[i][:, :, 2] = 1 - y[i][:, :, 2]
-        # y[i][:, (y[i][:, :, 0] == 0).all(axis=0), :] = 0
-        ax[2].imshow(
-            # y[i][:, :, [1, 0, 2]],
-            y[i],
+        ax[0, 2].imshow(
+            phase_pick[i][...,[1, 2, 0]],
             vmin=0,
             vmax=1,
-            # extent=(0, y[i].shape[1] * dx / 1e3, y[i].shape[0] * dt, 0),
-            extent=(0, y[i].shape[0] * dt, y[i].shape[1] * dx / 1e3, 0),
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
             interpolation="none",
             aspect="auto",
         )
-        ax[2].set_ylabel("Distance (km)")
-        ax[2].set_xlabel("Time (s)")
-        ax[2].set_title("Prediction")
+        ax[0, 2].set_xlabel("Time (s)")
+        # ax[0, 2].set_ylabel("Distance (km)")
+        ax[0, 2].set_title("Prediction")
 
         fig.tight_layout()
 
@@ -149,6 +130,142 @@ def plot_das_train(meta, preds, epoch, figure_dir="figures", dt=0.01, dx=10, pre
             fig.savefig(f"{figure_dir}/{epoch:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
 
         plt.close(fig)
+
+def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event_time, epoch, figure_dir="figures", prefix=""):
+    
+    data = meta["data"].cpu().numpy().squeeze(1) # nb, nc, nx, nt
+    nb, nx, nt = data.shape
+
+    if phase_pick is not None:
+        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)
+    if polarity is not None:
+        polarity = polarity.cpu().numpy().transpose(0, 2, 3, 1)
+    if event_center is not None:
+        nx_, nt_ = event_center.shape[-2:]
+        if nx_ != nx:
+            event_center = F.interpolate(event_center, size=(nx, nt_), mode="bilinear", align_corners=False)
+        event_center = event_center.cpu().numpy().transpose(0, 2, 3, 1)
+    if event_time is not None:
+        nx_, nt_ = event_time.shape[-2:]
+        if nx_ != nx:
+            event_time = F.interpolate(event_time, size=(nx, nt_), mode="bilinear", align_corners=False)
+        event_time = event_time.cpu().numpy().transpose(0, 2, 3, 1)
+
+    if "phase_pick" in meta:
+        y_phase_pick = meta["phase_pick"].cpu().numpy()
+        y_phase_pick = y_phase_pick.transpose(0, 2, 3, 1)
+    if "phase_mask" in meta:
+        y_phase_mask = meta["phase_mask"].cpu().numpy()
+        y_phase_mask = y_phase_mask.transpose(0, 2, 3, 1)
+    if "event_center" in meta:
+        y_event_center = meta["event_center"].cpu().numpy()
+        y_event_center = y_event_center.transpose(0, 2, 3, 1)
+    if "event_time" in meta:
+        y_event_time = meta["event_time"].cpu().numpy()
+        y_event_time = y_event_time.transpose(0, 2, 3, 1)
+    if "event_mask" in meta:
+        y_event_mask = meta["event_mask"].cpu().numpy()
+        y_event_mask = y_event_mask.transpose(0, 2, 3, 1)
+    if "polarity" in meta:
+        y_polarity = meta["polarity"].cpu().numpy()
+        y_polarity = y_polarity.transpose(0, 2, 3, 1)
+
+    for i in range(nb):
+
+        dx = meta["dx_m"][i]
+        dt = meta["dt_s"][i]
+
+        fig, ax = plt.subplots(2, 3, figsize=(10, 7), sharex=True, sharey=True)
+
+        ax[0, 0].imshow(
+            data[i] - np.mean(data[i], axis=-1, keepdims=True) / np.std(data[i], axis=-1, keepdims=True),
+            vmin=-6,
+            vmax=6,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
+            interpolation="none",
+            cmap="seismic",
+            aspect="auto",
+        )
+        # ax[0, 0].set_xlabel("Time (s)")
+        ax[0, 0].set_ylabel("Distance (km)")
+        ax[0, 0].set_title("DAS Data")
+
+        ax[0, 1].imshow(
+            y_phase_pick[i][...,[1, 2, 0]],
+            vmin=0,
+            vmax=1,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
+            interpolation="none",
+            aspect="auto",
+        )
+        # ax[0, 1].set_xlabel("Time (s)")
+        # ax[0, 1].set_ylabel("Distance (km)")
+        ax[0, 1].set_title("Noisy Label")
+
+        ax[0, 2].imshow(
+            phase_pick[i][...,[1, 2, 0]],
+            vmin=0,
+            vmax=1,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
+            interpolation="none",
+            aspect="auto",
+        )
+        # ax[0, 2].set_xlabel("Time (s)")
+        # ax[0, 2].set_ylabel("Distance (km)")
+        ax[0, 2].set_title("Prediction")
+
+        vmax = np.max(np.abs((event_time[i] - y_event_time[i]) * y_event_mask[i]))
+        vmin = -vmax
+        ax[1, 0].imshow(
+            (event_time[i] - y_event_time[i]) * y_event_mask[i],
+            vmin=vmin,
+            vmax=vmax,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
+            interpolation="none",
+            aspect="auto",
+            cmap="seismic",
+        )
+        # ax[1, 0].legend(f"Time Error: {vmax:.2f} s")
+        ax[1, 0].text(0.02, 0.98, f"Time Error: {vmax/100:.2f} s", ha="left", va="top", transform=ax[1, 0].transAxes)
+        ax[1, 0].set_xlabel("Time (s)")
+        ax[1, 0].set_ylabel("Distance (km)")
+        # ax[1, 0].set_title("Time Error") 
+
+        ax[1, 1].imshow(
+            y_event_center[i],
+            vmin=0,
+            vmax=1,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
+            interpolation="none",
+            aspect="auto",
+        )
+        ax[1, 1].set_xlabel("Time (s)")
+        # ax[1, 1].set_ylabel("Distance (km)")
+        # ax[1, 1].set_title("Noisy Label")
+
+        ax[1, 2].imshow(
+            event_center[i],
+            vmin=0,
+            vmax=1,
+            extent=(0, nx * dx / 1e3, 0, nt * dt),
+            interpolation="none",
+            aspect="auto",
+        )
+        ax[1, 2].set_xlabel("Time (s)")
+        # ax[1, 2].set_ylabel("Distance (km)")
+        # ax[1, 2].set_title("Prediction")
+
+
+        fig.tight_layout()
+
+        if "RANK" in os.environ:
+            rank = int(os.environ["RANK"])
+            fig.savefig(f"{figure_dir}/{epoch:02d}_{rank:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
+        else:
+            fig.savefig(f"{figure_dir}/{epoch:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
+
+        plt.close(fig)
+
 
 
 def plot_phasenet_train(meta, phase, epoch=0, figure_dir="figures", prefix=""):

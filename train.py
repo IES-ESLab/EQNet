@@ -169,9 +169,9 @@ def train_one_epoch(
         processed_samples += batch_size
 
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-        if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+        if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das", "phasenet_das_plus"]:
             metric_logger.update(loss_phase=output["loss_phase"].item())
-        if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+        if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das_plus"]:
             metric_logger.update(loss_event_center=output["loss_event_center"].item())
             metric_logger.update(loss_event_time=output["loss_event_time"].item())
         if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
@@ -185,9 +185,9 @@ def train_one_epoch(
                 "train/epoch": epoch,
                 "train/batch": i,
             }
-            if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+            if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das", "phasenet_das_plus"]:
                 log["train/loss_phase"] = output["loss_phase"].item()
-            if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+            if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das_plus"]:
                 log["train/loss_event_center"] = output["loss_event_center"].item()
                 log["train/loss_event_time"] = output["loss_event_time"].item()
             if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
@@ -198,6 +198,9 @@ def train_one_epoch(
 
         if processed_samples >= total_samples:
             break
+
+        if (i + 1) % 1000 == 0:
+            utils.save_on_master(model.state_dict(), os.path.join(args.output_dir, f"model_tmp.pth"))
 
     plot_results(meta, model, output, args, epoch, "train")
     del meta, output, loss
@@ -294,10 +297,29 @@ def plot_results(meta, model, output, args, epoch, prefix=""):
 
         elif args.model == "phasenet_das":
             phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            meta["data"] = moving_normalize(meta["data"], filter=2048, stride=256)
+            meta["data"] = moving_normalize(meta["data"])
             print("Plotting...")
-            eqnet.utils.plot_das_train(meta, phase, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix)
+            eqnet.utils.plot_phasenet_das_train(meta, phase, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix)
             del phase
+
+        elif args.model == "phasenet_das_plus":
+            phase = torch.softmax(output["phase"], dim=1).cpu().float()
+            event_center = torch.sigmoid(output["event_center"]).cpu().float() if "event_center" in output else None
+            event_time = output["event_time"].cpu().float() if "event_time" in output else None
+            polarity = torch.sigmoid(output["polarity"]).cpu().float() if "polarity" in output else None
+            meta["data"] = moving_normalize(meta["data"])
+            print("Plotting...")
+            eqnet.utils.plot_phasenet_das_plus_train(
+                meta,
+                phase,
+                polarity=polarity,
+                event_center=event_center,
+                event_time=event_time,
+                epoch=epoch,
+                figure_dir=args.figure_dir,
+                prefix=prefix,
+            )
+            del phase, event_center, polarity
 
         elif args.model == "autoencoder":
             preds = model(meta)
@@ -382,7 +404,7 @@ def main(args):
         else:
             dataset_test = None
         test_sampler = None
-    elif args.model == "phasenet_das":
+    elif args.model in ["phasenet_das", "phasenet_das_plus"]:
         dataset = DASIterableDataset(
             data_path=args.data_path,
             data_list=args.data_list,
@@ -403,25 +425,28 @@ def main(args):
             world_size=world_size,
         )
         train_sampler = None
-        dataset_test = DASIterableDataset(
-            data_path=args.test_data_path,
-            data_list=args.test_data_list,
-            label_path=args.test_label_path,
-            label_list=args.test_label_list,
-            noise_list=args.test_noise_list,
-            phases=args.phases,
-            nt=args.nt,
-            nx=args.nx,
-            format="h5",
-            training=True,
-            stack_noise=False,
-            stack_event=False,
-            resample_space=False,
-            resample_time=False,
-            masking=False,
-            rank=rank,
-            world_size=world_size,
-        )
+        if args.test_data_path is not None:
+            dataset_test = DASIterableDataset(
+                data_path=args.test_data_path,
+                data_list=args.test_data_list,
+                label_path=args.test_label_path,
+                label_list=args.test_label_list,
+                noise_list=args.test_noise_list,
+                phases=args.phases,
+                nt=args.nt,
+                nx=args.nx,
+                format="h5",
+                training=True,
+                stack_noise=False,
+                stack_event=False,
+                resample_space=False,
+                resample_time=False,
+                masking=False,
+                rank=rank,
+                world_size=world_size,
+            )
+        else:
+            dataset_test = None
         test_sampler = None
     elif args.model == "autoencoder":
         dataset = AutoEncoderIterableDataset(
@@ -542,7 +567,7 @@ def main(args):
 
     if args.resume_wandb:
         if utils.is_main_process():
-            if args.model == "phasenet_das":
+            if args.model in ["phasenet_das", "phasenet_das_plus"]:
                 model_url = "ai4eps/model-registry/PhaseNet-DAS:latest"
                 artifact = wandb.use_artifact(model_url, type="model")
                 artifact_dir = artifact.download()
@@ -685,7 +710,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--hdf5-file", default=None, type=str, help="hdf5 file for training")
     parser.add_argument("--hf-dataset", default=None, type=str, help="huggingface dataset")
     parser.add_argument("--format", default="h5", type=str, help="data format (h5, hf)")
-    parser.add_argument("--test-data-path", default="./", type=str, help="test dataset path")
+    parser.add_argument("--test-data-path", default=None, type=str, help="test dataset path")
     parser.add_argument("--test-data-list", default="+", type=None, help="test dataset list")
     parser.add_argument("--test-label-path", default="+", type=None, help="test label path")
     parser.add_argument("--test-label-list", default="+", type=None, help="test label path")

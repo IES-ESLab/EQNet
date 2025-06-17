@@ -8,6 +8,7 @@ from sklearn import linear_model
 import numpy as np
 from tqdm.auto import tqdm
 import random
+from glob import glob
 
 np.random.seed(42)
 random.seed(42)
@@ -31,7 +32,7 @@ if label_path.exists():
 else:
     label_path.mkdir(parents=True)
 fs = fsspec.filesystem(protocol.replace("://", ""))
-folders = ["mammoth_north", "mammoth_south", "ridgecrest_north", "ridgecrest_south"]
+folders = ["mammoth_north", "mammoth_south", "ridgecrest_north", "ridgecrest_south", "mammoth_north_100km", "mammoth_south_100km"]
 picker = "phasenet"
 # picker = "phasenet_das"
 # picker = "phasenet_das_v1"
@@ -54,8 +55,10 @@ for folder in folders:
     if not (label_path / folder / "labels").exists():
         (label_path / folder / "labels").mkdir(parents=True)
 
-    data_list = list(fs.glob(f"{bucket}/{folder}/data/*.h5"))
-    gamma_events = list(fs.glob(f"{bucket}/{folder}/gamma/{picker}/picks/*.csv"))
+    # data_list = list(fs.glob(f"{bucket}/{folder}/data/*.h5"))
+    # gamma_events = list(fs.glob(f"{bucket}/{folder}/gamma/{picker}/picks/*.csv"))
+    data_list = list(glob(f"{bucket}/{folder}/data/*.h5"))
+    gamma_events = list(glob(f"results/gamma/{picker}/{folder}/picks/*.csv"))
     print(f"{folder}: data {len(data_list)}, label {len(gamma_events)}")
 
     ## data list
@@ -72,6 +75,14 @@ for folder in folders:
     ## label list
     for i, file in tqdm(enumerate(gamma_events)):
         picks = pd.read_csv(protocol + file, parse_dates=["phase_time"])
+
+        # events = pd.read_csv(file.replace("picks", "events"))
+        # events.rename(columns={"time": "event_time"}, inplace=True)
+        # picks = picks.merge(events, on="event_index", how="left")
+        # picks["phase_time"] = pd.to_datetime(picks["phase_time"], utc=True)
+        # picks["event_time"] = pd.to_datetime(picks["event_time"], utc=True)
+        # picks["travel_time"] = (picks["phase_time"] - picks["event_time"]).dt.total_seconds()
+
         idx = picks["event_index"] != -1
         idx_p = idx & (picks["phase_type"] == "P")
         idx_s = idx & (picks["phase_type"] == "S")

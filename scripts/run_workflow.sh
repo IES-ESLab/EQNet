@@ -3,7 +3,7 @@
 #### Training PhasetNet-DAS v0 #####
 python run_phasenet.py > log_run_phasenet.txt 2>&1
 
-python run_gamma.py --folder=mammoth_north --picker=phasenet && python run_gamma.py --folder=mammoth_south --picker=phasenet && python run_gamma.py --folder=ridgecrest_north --picker=phasenet && python run_gamma.py --folder=ridgecrest_south --picker=phasenet
+python run_gamma.py --folder=mammoth_north --picker=phasenet && python run_gamma.py --folder=mammoth_south --picker=phasenet && python run_gamma.py --folder=ridgecrest_north --picker=phasenet && python run_gamma.py --folder=ridgecrest_south --picker=phasenet && python run_gamma.py --folder=mammoth_north_100km --picker=phasenet && python run_gamma.py --folder=mammoth_south_100km --picker=phasenet
 
 # edit hardcoding in build_training.py
 python build_training.py

@@ -86,8 +86,8 @@ def set_config(args):
     config["covariance_prior"] = [1000, 1000]  # Used for PhaseNet-DAS
     config["method"] = "BGMM"
     if config["method"] == "BGMM":
-        # config["oversample_factor"] = 4 # Used for PhaseNet
-        config["oversample_factor"] = 2  # Used for PhaseNet-DAS
+        config["oversample_factor"] = 4 # Used for PhaseNet
+        # config["oversample_factor"] = 2  # Used for PhaseNet-DAS
     if config["method"] == "GMM":
         config["oversample_factor"] = 1
     config["bfgs_bounds"] = (
@@ -102,8 +102,8 @@ def set_config(args):
     config["min_picks_per_eq"] = 500  # len(stations) // 10
     # config["min_s_picks_per_eq"] = 10
     # config["min_p_picks_per_eq"] = 10
-    # config["max_sigma11"] = 1.0 # Used for PhaseNet
-    config["max_sigma11"] = 0.5  # Used for PhaseNet-DAS
+    config["max_sigma11"] = 1.0 # Used for PhaseNet
+    # config["max_sigma11"] = 0.5  # Used for PhaseNet-DAS
 
     # cpu
     config["ncpu"] = 1
@@ -160,6 +160,7 @@ def run(files, config, stations, result_path):
         # picks = picks[picks["phase_score"] > 0.5]  # used for PhaseNet
         picks = picks[picks["phase_score"] > 0.8]  # used for PhaseNet-DAS
         if len(picks) < config["min_picks_per_eq"]:
+            # print(f"Not enough picks: {len(picks)}")
             continue
 
         if ("station_id" not in picks.columns) and ("channel_index" in picks.columns):
@@ -263,10 +264,14 @@ if __name__ == "__main__":
     # print(args)
 
     # %%
+    # pick_path = Path(
+    #     f"results/{args.picker}/{args.folder}/picks_{args.picker.replace('_v0', '').replace('_v1', '').replace('_v2', '')}"
+    # )
     pick_path = Path(
-        f"results/{args.picker}/{args.folder}/picks_{args.picker.replace('_v0', '').replace('_v1', '').replace('_v2', '')}"
+        f"results/{args.picker}/{args.folder}/picks"
     )
     files = sorted(list(pick_path.rglob("*.csv")), key=lambda x: -os.path.getsize(x))
+    print(f"{len(files) = }")
 
     # files = [Path("nc73511800.csv")]
 
@@ -283,7 +288,7 @@ if __name__ == "__main__":
 
     config, stations, catalog, proj = set_config(args)
 
-    # # %%
+    # %%
     # print(len(files))
     # t0 = time.time()
     # run(files, config, stations, result_path)
@@ -324,6 +329,6 @@ if __name__ == "__main__":
     cmd += f" && gsutil cp -r {result_path}/gamma_events.csv {args.bucket}/{args.folder}/gamma/{args.picker}/gamma_events.csv"
     cmd += f" && gsutil cp {result_path}/station_catalog.png {args.bucket}/{args.folder}/gamma/{args.picker}/station_catalog.png"
     print(cmd)
-    os.system(cmd)
+    # os.system(cmd)
 
 # %%

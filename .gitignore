@@ -56,3 +56,6 @@ wandb
 tests/phasenet_plus/figures_*
 *.png
 *.pdf
+*.tfevents.*
+*.err
+*.out

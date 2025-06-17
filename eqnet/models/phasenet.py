@@ -39,10 +39,18 @@ class UNetHead(nn.Module):
         inputs = inputs.float()
         log_targets = torch.nan_to_num(torch.log(targets))
 
+        nx_in, nt_in = inputs.shape[-2:]
+        nx_ta, nt_ta = targets.shape[-2:]
+        assert nt_ta == nt_in
+        if nx_ta != nx_in:
+            inputs = F.interpolate(inputs, size=(nx_ta, nt_ta), mode="bilinear", align_corners=False)
+
         if mask is None:
             if self.out_channels == 1:
-                min_loss = -torch.mean(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
-                loss = F.binary_cross_entropy_with_logits(inputs, targets) - min_loss
+                min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
+                loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
+                loss = loss.mean()
+                
 
                 # inputs = torch.sigmoid(inputs)
                 # loss = F.kl_div(inputs.log(), targets, reduction="none") + F.kl_div(
@@ -52,8 +60,9 @@ class UNetHead(nn.Module):
                 # loss = loss.mean()
 
             else:
-                min_loss = -(targets * log_targets).sum(dim=1).mean()  # cross_entropy sum over dim=1
-                loss = F.cross_entropy(inputs, targets) - min_loss
+                min_loss = -(targets * log_targets).sum(dim=1) # cross_entropy sum over dim=1
+                loss = F.cross_entropy(inputs, targets, reduction="none") - min_loss
+                loss = loss.mean()
 
                 # inputs = torch.log_softmax(inputs, dim=1)
                 # loss = F.kl_div(inputs, targets, reduction="none").sum(dim=1).mean()
@@ -68,6 +77,8 @@ class UNetHead(nn.Module):
             mask_sum = mask.sum()
             if mask_sum == 0.0:
                 mask_sum = 1.0
+
+            
             if self.out_channels == 1:
                 min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
                 loss = (
@@ -83,7 +94,7 @@ class UNetHead(nn.Module):
                 # loss = torch.sum(kl_div * mask) / mask_sum
 
             else:
-                min_loss = -targets * log_targets
+                min_loss = -(targets * log_targets).sum(dim=1)
                 loss = (
                     torch.sum((F.cross_entropy(inputs, targets, reduction="none") - min_loss) * mask.squeeze(1))
                     / mask_sum
@@ -142,6 +153,12 @@ class EventHead(nn.Module):
 
     def losses(self, inputs, targets, mask=None):
         inputs = inputs.float()
+
+        nx_in, nt_in = inputs.shape[-2:]
+        nx_ta, nt_ta = targets.shape[-2:]
+        assert nt_ta == nt_in
+        if nx_ta != nx_in:
+            inputs = F.interpolate(inputs, size=(nx_ta, nt_ta), mode="bilinear", align_corners=False)
 
         if mask is None:
             loss = F.mse_loss(inputs, targets) / self.scaling
@@ -358,13 +375,18 @@ class PhaseNet(nn.Module):
         data = batched_inputs["data"].to(self.device)
 
         phase_pick = batched_inputs["phase_pick"].to(self.device) if "phase_pick" in batched_inputs else None
+        phase_mask = batched_inputs["phase_mask"].to(self.device) if "phase_mask" in batched_inputs else None
         event_center = batched_inputs["event_center"].to(self.device) if "event_center" in batched_inputs else None
         event_time = batched_inputs["event_time"].to(self.device) if "event_time" in batched_inputs else None
-        event_mask = batched_inputs["event_mask"].to(self.device) if "event_mask" in batched_inputs else None
+        event_center_mask = batched_inputs["event_mask"].to(self.device) if "event_mask" in batched_inputs else None
+        event_time_mask = event_center_mask.clone()
         polarity = batched_inputs["polarity"].to(self.device) if "polarity" in batched_inputs else None
         polarity_mask = batched_inputs["polarity_mask"].to(self.device) if "polarity_mask" in batched_inputs else None
         prompt_center = batched_inputs["prompt_center"].float() if "prompt_center" in batched_inputs else None
-
+        if self.__class__.__name__ not in ["PhaseNetDAS"]:
+            phase_mask = None
+            event_center_mask = None
+            
         if self.backbone_name == "swin2":
             station_location = batched_inputs["station_location"].to(self.device)
             features = self.backbone(data, station_location)
@@ -372,7 +394,7 @@ class PhaseNet(nn.Module):
             features = self.backbone(data)
 
         output = {"loss": 0.0}
-        output_phase, loss_phase = self.phase_picker(features, phase_pick)
+        output_phase, loss_phase = self.phase_picker(features, phase_pick, mask=phase_mask)
         output["phase"] = output_phase
         if loss_phase is not None:
             output["loss_phase"] = loss_phase
@@ -390,12 +412,12 @@ class PhaseNet(nn.Module):
             output["spectrogram"] = features["spectrogram"]
 
         if self.add_event:
-            output_event_center, loss_event_center = self.event_detector(features, event_center)
+            output_event_center, loss_event_center = self.event_detector(features, event_center, mask=event_center_mask)
             output["event_center"] = output_event_center
             if loss_event_center is not None:
                 output["loss_event_center"] = loss_event_center * self.event_center_loss_weight
                 output["loss"] += loss_event_center * self.event_center_loss_weight
-            output_event_time, loss_event_time = self.event_timer(features, event_time, mask=event_mask)
+            output_event_time, loss_event_time = self.event_timer(features, event_time, mask=event_time_mask)
             output["event_time"] = output_event_time
             if loss_event_time is not None:
                 output["loss_event_time"] = loss_event_time * self.event_time_loss_weight
