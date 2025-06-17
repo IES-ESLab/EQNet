@@ -841,7 +841,7 @@ class DASIterableDataset(IterableDataset):
             # label_file = file_list[np.random.randint(0, len(file_list))]
             file_list = np.random.permutation(file_list)
             for label_file in file_list:
-                picks = pd.read_csv(label_file)
+                picks = pd.read_csv(self.label_path + "/" + label_file)
                 if "channel_index" not in picks.columns:
                     picks = picks.rename(columns={"station_id": "channel_index"})
 

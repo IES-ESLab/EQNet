@@ -61,28 +61,39 @@ torchrun --master_port 29519  --nproc_per_node 4 train.py --model phasenet_promp
     --output-dir phasenet_prompt_unet \
     --wandb --wandb-project phasenet --wandb-name phasenet_prompt_unet
 
-torchrun --master_port 29520 --nproc_per_node=4 ../train.py --model phasenet_das --backbone unet \
-    --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
-    # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \
-    --output=phasenet_das_unet \
-    --data-path /global/scratch/users/zhuwq0/quakeflow_das \
-    --data-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/data.txt \
-    --label-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/labels_train.txt \
-    --noise-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/noise_train.txt \
-    --test-data-path /global/scratch/users/zhuwq0/quakeflow_das \
-    --test-data-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/data.txt \
-    --test-label-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/labels_test.txt \
-    --test-noise-list results/training_v0/noise_test.txt
+DATA_PATH=/global/scratch/users/zhuwq0/quakeflow_das
+LABEL_PATH=/global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0
 
-torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone unet \
+DATA_PATH=/nfs2/quakeflow_das
+LABEL_PATH=/nfs2/zhuwq/EQNet/scripts/results/training_v0
+
+torchrun --master_port 29520 --nproc_per_node=2 train.py --model phasenet_das --backbone unet \
     --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
+    --output=phasenet_das_unet \
+    --data-path "$DATA_PATH" \
+    --data-list "$LIST_PATH/data.txt" \
+    --label-path "$LABEL_PATH" \
+    --label-list "$LABEL_PATH/labels_train.txt" \
+    --noise-list "$LABEL_PATH/noise_train.txt" \
+    --test-data-path "$DATA_PATH" \
+    --test-data-list "$LABEL_PATH/data.txt" \
+    --test-label-list "$LABEL_PATH/labels_test.txt" \
+    --test-label-path "$LABEL_PATH" \
+    --test-noise-list "$LABEL_PATH/noise_test.txt"
     # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \
+
+
+torchrun --master_port 29521 --nproc_per_node=2 train.py --model phasenet_das_plus --backbone unet \
+    --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
     --output=phasenet_das_plus_unet \
-    --data-path /global/scratch/users/zhuwq0/quakeflow_das \
-    --data-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/data.txt \
-    --label-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/labels_train.txt \
-    --noise-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/noise_train.txt \
-    --test-data-path /global/scratch/users/zhuwq0/quakeflow_das \
-    --test-data-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/data.txt \
-    --test-label-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/labels_test.txt \
-    --test-noise-list /global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0/noise_test.txt
+    --data-path "${DATA_PATH}" \
+    --data-list "${LABEL_PATH}/data.txt" \
+    --label-path "${LABEL_PATH}" \
+    --label-list "${LABEL_PATH}/labels_train.txt" \
+    --noise-list "${LABEL_PATH}/noise_train.txt" \
+    --test-data-path "${DATA_PATH}" \
+    --test-data-list "${LABEL_PATH}/data.txt" \
+    --test-label-path "${LABEL_PATH}" \
+    --test-label-list "${LABEL_PATH}/labels_test.txt" \
+    --test-noise-list "${LABEL_PATH}/noise_test.txt"
+    # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \

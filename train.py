@@ -704,7 +704,7 @@ def get_args_parser(add_help=True):
 
     parser.add_argument("--data-path", default="./", type=str, help="dataset path")
     parser.add_argument("--data-list", nargs="+", default=None, type=str, help="dataset list")
-    parser.add_argument("--label-path", nargs="+", default=None, type=str, help="label path")
+    parser.add_argument("--label-path", default="./", type=str, help="label path")
     parser.add_argument("--label-list", nargs="+", default=None, type=str, help="label path")
     parser.add_argument("--noise-list", nargs="+", default=None, type=str, help="noise list")
     parser.add_argument("--hdf5-file", default=None, type=str, help="hdf5 file for training")
@@ -712,7 +712,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--format", default="h5", type=str, help="data format (h5, hf)")
     parser.add_argument("--test-data-path", default=None, type=str, help="test dataset path")
     parser.add_argument("--test-data-list", default="+", type=None, help="test dataset list")
-    parser.add_argument("--test-label-path", default="+", type=None, help="test label path")
+    parser.add_argument("--test-label-path", default="./", type=None, help="test label path")
     parser.add_argument("--test-label-list", default="+", type=None, help="test label path")
     parser.add_argument("--test-noise-list", default="+", type=None, help="test noise list")
     parser.add_argument("--test-hdf5-file", default=None, type=str, help="hdf5 file for testing")

@@ -17,7 +17,8 @@ random.seed(42)
 # protocol = "gs://"
 # bucket = "quakeflow_das"
 protocol = "file://"
-bucket = "/global/scratch/users/zhuwq0/quakeflow_das"
+# bucket = "/global/scratch/users/zhuwq0/quakeflow_das"
+bucket = "/nfs2/quakeflow_das"
 
 # %%
 figure_path = Path("debug_figures")
@@ -57,19 +58,22 @@ for folder in folders:
 
     # data_list = list(fs.glob(f"{bucket}/{folder}/data/*.h5"))
     # gamma_events = list(fs.glob(f"{bucket}/{folder}/gamma/{picker}/picks/*.csv"))
+    gamma_events = list(glob(f"{bucket}/{folder}/gamma/{picker}/picks/*.csv"))
     data_list = list(glob(f"{bucket}/{folder}/data/*.h5"))
-    gamma_events = list(glob(f"results/gamma/{picker}/{folder}/picks/*.csv"))
+    # gamma_events = list(glob(f"results/gamma/{picker}/{folder}/picks/*.csv"))
     print(f"{folder}: data {len(data_list)}, label {len(gamma_events)}")
 
     ## data list
     with open(label_path / f"{folder}" / "data.txt", "w") as f:
         tmp = [protocol + file for file in data_list]
+        tmp = [str(file).replace("file://", "").replace(str(bucket)+"/", "") for file in tmp]
         f.write("\n".join(tmp))
 
     ## noise list
     noise_list = filter_noise(data_list, gamma_events)
     with open(label_path / f"{folder}" / "noise.txt", "w") as f:
         noise_list = [f"{protocol}{bucket}/{folder}/data/{file}.h5" for file in noise_list]
+        noise_list = [str(file).replace("file://", "").replace(str(bucket)+"/", "") for file in noise_list]
         f.write("\n".join(noise_list))
 
     ## label list
@@ -133,6 +137,10 @@ for folder in folders:
         data += f.read().splitlines()
     with open(label_path / f"{folder}" / "noise.txt", "r") as f:
         noise += f.read().splitlines()
+
+labels = [str(label).replace("file://", "").replace(str(label_path)+"/", "") for label in labels]
+data = [str(data).replace("file://", "").replace(str(bucket)+"/", "") for data in data]
+noise = [str(noise).replace("file://", "").replace(str(bucket)+"/", "") for noise in noise]
 
 labels_train = sorted(random.sample(labels, int(len(labels) * 0.8)))
 labels_test = sorted(list(set(labels) - set(labels_train)))
