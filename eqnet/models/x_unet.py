@@ -855,8 +855,8 @@ class XUnet(nn.Module):
         x = self.init_conv(x)
 
         if self.add_polarity:
-            # x_polarity = self.polarity_init(x_origin[:, -1:, :, :, :])
-            x_polarity = self.polarity_init(torch.clamp(x_origin[:, -1:, :, :, :], -1.0, 1.0))
+            x_polarity = self.polarity_init(x_origin[:, -1:, :, :, :])
+            # x_polarity = self.polarity_init(torch.clamp(x_origin[:, -1:, :, :, :], -1.0, 1.0))
 
         # residual
 
