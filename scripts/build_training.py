@@ -17,8 +17,8 @@ random.seed(42)
 # protocol = "gs://"
 # bucket = "quakeflow_das"
 protocol = "file://"
-# bucket = "/global/scratch/users/zhuwq0/quakeflow_das"
-bucket = "/nfs2/quakeflow_das"
+bucket = "/global/scratch/users/zhuwq0/quakeflow_das"
+# bucket = "/nfs2/quakeflow_das"
 
 # %%
 figure_path = Path("debug_figures")

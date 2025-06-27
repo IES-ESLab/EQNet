@@ -496,7 +496,7 @@ class XUnet(nn.Module):
         init_dim=None,
         out_dim=None,
         kernel_size=(1, 1, 7),
-        dim_mults: MaybeTuple(int) = (1, 2, 4, 8),
+        dim_mults: MaybeTuple(int) = (1, 2, 4, 4),
         num_blocks_per_stage: MaybeTuple(int) = (2, 2, 2, 2),
         num_self_attn_per_stage: MaybeTuple(int) = (0, 0, 0, 1),
         nested_unet_depths: MaybeTuple(int) = (0, 0, 0, 0),

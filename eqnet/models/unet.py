@@ -322,7 +322,7 @@ class UNet(nn.Module):
         dim,
         init_dim=None,
         out_dim=None,
-        dim_mults=(1, 2, 4, 8),
+        dim_mults=(1, 2, 4, 4),
         channels=3,
         attn_dim_head=32,
         attn_heads=4,

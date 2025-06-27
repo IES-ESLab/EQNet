@@ -58,8 +58,8 @@ class PhaseNetDAS(PhaseNet):
             # )
             self.backbone = UNet(
                 channels=1,
-                dim=8,
-                out_dim=16,
+                dim=16,
+                out_dim=32,
                 kernel_size=(7, 7),
                 log_scale=log_scale,
                 add_stft=add_stft,
@@ -70,8 +70,8 @@ class PhaseNetDAS(PhaseNet):
         elif backbone == "xunet":
             self.backbone = XUnet(
                 channels=1,
-                dim=8,
-                out_dim=16,
+                dim=16,
+                out_dim=32,
                 kernel_size=(1, 7, 7),
                 log_scale=log_scale,
                 add_stft=add_stft,
@@ -83,20 +83,20 @@ class PhaseNetDAS(PhaseNet):
             raise ValueError(f"Invalid backbone: {backbone}")
 
         if backbone == "unet":
-            self.phase_picker = UNetHead(16, 3, feature_name="phase")
+            self.phase_picker = UNetHead(32, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
+                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(16, 1, feature_name="event")
-                self.event_timer = EventHead(16, 1, feature_name="event")
+                self.event_detector = UNetHead(32, 1, feature_name="event")
+                self.event_timer = EventHead(32, 1, feature_name="event")
 
         elif backbone == "xunet":
-            self.phase_picker = UNetHead(16, 3, feature_name="phase")
+            self.phase_picker = UNetHead(32, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
+                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(16, 1, feature_name="event")
-                self.event_timer = EventHead(16, 1, feature_name="event")
+                self.event_detector = UNetHead(32, 1, feature_name="event")
+                self.event_timer = EventHead(32, 1, feature_name="event")
         else:
             raise ValueError("backbone only supports unet or xunet")
 
