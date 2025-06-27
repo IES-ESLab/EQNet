@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 
-from torchinfo import summary
+#from torchinfo import summary
 import datasets
 import eqnet
 import utils
@@ -194,7 +194,7 @@ def train_one_epoch(
                 log["train/loss_polarity"] = output["loss_polarity"].item()
             if args.model == "phasenet_prompt":
                 log["train/loss_prompt"] = output["loss_prompt"].item()
-            wandb.log(log, step=epoch * (total_samples // batch_size) + i)
+            wandb.log(log)
 
         if processed_samples >= total_samples:
             break

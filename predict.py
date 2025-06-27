@@ -117,6 +117,7 @@ def pred_phasenet(args, model, data_loader, pick_path, event_path, figure_path):
                     dt=dt,
                     vmin=args.min_prob,
                     event_time=event_time,
+                    waveform=meta["data"],
                 )
 
             for i in range(len(meta["file_name"])):
