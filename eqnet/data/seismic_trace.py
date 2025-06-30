@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from glob import glob
+from pathlib import Path
 
 import fsspec
 import h5py
@@ -295,6 +296,53 @@ def drop_channel(meta):
 
     return meta
 
+def replacer(tmp):
+    tmp = tmp.split('.D.')[0]
+    sta_azi_loc = tmp.split('/')[-1].split('TW.')[1]
+    sta, loc, azi = sta_azi_loc.split('.')
+    return f'{sta}_{azi}_{loc}_'
+
+def _find_pz(pz_parent_dir: Path, keyword: str):
+    result = list(pz_parent_dir.glob(f'*{keyword}*'))
+    if not result:
+        logging.info(f"No PZ file found for {keyword}")
+        return
+    elif len(result) == 1:
+        return result[0]
+    else:
+        #use a higher level logging
+        logging.warning(f'More than 1 pz file founded in {keyword}, using latest one with the year close to current...')
+        year_dict = {}
+        for i, pz in enumerate(result):
+            fit_year = (pz.stem).split(keyword)[1].split('.')[0]
+            year_dict[i] = int(fit_year)
+
+        if not year_dict:
+            raise ValueError(f"No valid year found in filename for {keyword}.")
+        
+        latest_pz_key = max(year_dict, key=year_dict.get)
+
+        logging.warning(f"Using {result[latest_pz_key].stem}")
+        
+        return result[latest_pz_key]
+
+def get_sensitivity(pz_file):
+    sensitivity = 0.0
+    with open(pz_file,'r') as r:
+        lines = r.readlines()
+        for line in lines:
+            if line[:13] == '* SENSITIVITY':
+                sensitivity = float(line.strip().split()[3])
+    if sensitivity == 0.0:
+        raise ValueError(f"No sensitivity found in {pz_file}, check it.")
+    return sensitivity
+
+def remove_sens_manually(meta, tmp, pz_dir):
+    keyword = replacer(tmp)
+    pz_file = _find_pz(pz_dir, keyword)
+    sensitivity = get_sensitivity(pz_file)
+    meta[0].data = meta[0].data / sensitivity
+    return meta
 
 class SeismicTraceIterableDataset(IterableDataset):
     degree2km = 111.32
@@ -325,6 +373,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         resample_time=False,
         ## for prediction
         sampling_rate=100,
+        pz_dir=None,
         response_path=None,
         response_xml=None,
         highpass_filter=0.0,
@@ -370,13 +419,14 @@ class SeismicTraceIterableDataset(IterableDataset):
             self.data_list = None
 
         if self.data_list is not None:
-            self.data_list = self.data_list[rank::world_size]
+            self.data_list = self.data_list[rank::world_size] # same as [rank:], which is [0:]
 
         self.data_path = data_path
         self.hdf5_file = hdf5_file
         if (hdf5_file is not None) and (not training):
             self.hdf5_fp = h5py.File(hdf5_file, "r", libver="latest", swmr=True)
         self.phases = phases
+        self.pz_dir = pz_dir
         self.response_path = response_path
         self.response_xml = response_xml
         self.sampling_rate = sampling_rate
@@ -724,7 +774,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             tr.taper(max_percentage=0.05, type="cosine")
         return stream
 
-    def read_mseed(self, fname, response_path=None, response_xml=None, highpass_filter=False, sampling_rate=100):
+    def read_mseed(self, fname, pz_dir=None, response_path=None, response_xml=None, highpass_filter=False, sampling_rate=100):
         try:
             stream = obspy.Stream()
             fname_list = glob(fname)
@@ -734,6 +784,9 @@ class SeismicTraceIterableDataset(IterableDataset):
                 if response_path is not None:
                     inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
                     meta = meta.remove_sensitivity(inv)
+                if pz_dir is not None:
+                    print('....remove sensitivity manually')
+                    meta = remove_sens_manually(meta, tmp, pz_dir)
                 stream += meta
                 # stream += obspy.read(tmp)
             stream = stream.merge(fill_value="latest")
@@ -929,6 +982,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             if self.format == "mseed" or self.format == 'SAC': # TODO: check
                 meta = self.read_mseed(
                     fname,
+                    pz_dir=self.pz_dir,
                     response_path=self.response_path,
                     response_xml=self.response_xml,
                     highpass_filter=self.highpass_filter,
