@@ -45,8 +45,6 @@ def generate_phase_label(
     label_width: list = [150],
     mask_width: list = None,
     label_shape: str = "gaussian",
-    space_mask: bool = None,
-    return_time_mask: bool = True,
 ):
     """generate gaussian-shape label for phase picks
 
@@ -62,16 +60,18 @@ def generate_phase_label(
         phase label: [nch, nt, nx]
     """
     nch, nt, nx = data.shape
+
+    if mask_width is None:
+        mask_width = [label_width] * len(phase_list)
+
     target = np.zeros([len(phase_list) + 1, nt, nx], dtype=np.float32)
     ## mask for window near the phase arrival
-    time_mask = np.zeros([1, nt, nx], dtype=np.float32)
+    time_mask = np.zeros([nt, nx], dtype=np.float32)
 
     if len(label_width) == 1:
         label_width = label_width * len(phase_list)
 
-    if space_mask is None:
-        space_mask = np.zeros((len(phase_list), nx), dtype=bool)
-
+    space_mask = np.zeros((len(phase_list), nx), dtype=bool)
     for i, (picks, w) in enumerate(zip(phase_list, label_width)):
         for trace, phase_time in picks:
             trace = int(trace)
@@ -80,13 +80,10 @@ def generate_phase_label(
             gaussian[gaussian < 0.1] = 0.0
             target[i + 1, :, trace] += gaussian
             space_mask[i, trace] = True
-            time_mask[0, int(phase_time) - w : int(phase_time) + w, trace] = 1
+            # time_mask[int(phase_time) - w : int(phase_time) + w, trace] = 1
+            time_mask[:, trace] = 1
 
     space_mask = np.all(space_mask, axis=0)  ## traces with all picks
-    # space_mask = np.ones(nx, dtype=np.bool) ## ignore space_mask
-
-    # target[0:1, :, :] = np.maximum(0, 1 - np.sum(target[1:, :, :], axis=0, keepdims=True))
-
     target[0:1, :, space_mask] = np.maximum(0, 1 - np.sum(target[1:, :, space_mask], axis=0, keepdims=True))
     target[:, :, ~space_mask] = 0
 
@@ -106,11 +103,9 @@ def generate_phase_label(
     # plt.imshow(time_mask[0,:,:], aspect="auto")
     # plt.savefig("test_label.png")
     # raise
+    time_mask = time_mask[np.newaxis, :, :]
 
-    if return_time_mask:
-        return target, time_mask
-    else:
-        return target
+    return target, time_mask
 
 def generate_event_label(
     data,
@@ -118,19 +113,16 @@ def generate_event_label(
     duration,
     label_width=150,
     mask_width=None,
-    space_mask=None,
-    return_time_mask=True,
 ):
 
     nch, nt, nx = data.shape
     target_center = np.zeros([nt, nx], dtype=np.float32)
     target_time = np.zeros([nt, nx], dtype=np.float32)
-    mask = np.zeros([nt, nx], dtype=np.float32)
+    center_mask = np.zeros([nt, nx], dtype=np.float32)
+    time_mask = np.zeros([nt, nx], dtype=np.float32)
 
     if mask_width is None:
         mask_width = int(label_width * 1.5)
-    else:
-        mask_width = min(int(label_width * 1.5), label_width)
 
     for c0, d0 in zip(center, duration):
         ich = c0[0]
@@ -141,14 +133,15 @@ def generate_event_label(
         gaussian = np.exp(-(t**2) / (2 * (label_width / 6) ** 2))
         gaussian[gaussian < 0.05] = 0.0
         target_center[:, ich] += gaussian
-        # t = np.arange(nt) - c0
         target_time[:, ich] = t + d0
-        mask[int(c0) - mask_width : int(c0) + mask_width, ich] = 1.0
+        time_mask[int(c0) - mask_width : int(c0) + mask_width, ich] = 1.0
+        center_mask[:, ich] = 1.0
 
     target_center = target_center[np.newaxis, :, :]
     target_time = target_time[np.newaxis, :, :]
-    mask = mask[np.newaxis, :, :]
-    return target_center, target_time, mask
+    center_mask = center_mask[np.newaxis, :, :]
+    time_mask = time_mask[np.newaxis, :, :]
+    return target_center, target_time, center_mask, time_mask
 
 def stack_event(
     data1,
@@ -170,32 +163,47 @@ def stack_event(
     while tries < max_tries:
         # shift = random.randint(-nt, nt)
         shift = random.randint(-max_shift, max_shift)
-        if masks2 is not None:
-            masks2_ = [torch.clone(x) for x in masks2]
-            masks2_ = [torch.roll(x, shift, dims=-2) for x in masks2_]
-            if any(torch.max(x1 + x2) >= 2 for x1, x2 in zip(masks1, masks2_)):
-                tries += 1
-                continue
+        # if masks2 is not None:
+        #     masks2_ = {k: torch.clone(v) for k, v in masks2.items()}
+        #     masks2_ = {k: torch.roll(v, shift, dims=-2) for k, v in masks2_.items()}
+        #     if any(torch.max(masks1[k] + masks2_[k]) >= 2 for k in ["event_time_mask"]):
+        #         tries += 1
+        #         continue
 
         data2_ = torch.clone(data2)
         data2_ = torch.roll(data2_, shift, dims=-2)
-        targets2_ = [torch.clone(x) for x in targets2]
-        targets2_ = [torch.roll(x, shift, dims=-2) for x in targets2_]
+        masks2_ = {k: torch.clone(v) for k, v in masks2.items()}
+        targets2_ = {k: torch.clone(v) for k, v in targets2.items()}
+        for k, v in masks2_.items():
+            masks2_[k] = torch.roll(v, shift, dims=-2)
+        for k, v in targets2_.items():
+            targets2_[k] = torch.roll(v, shift, dims=-2)
 
         ## approximately after normalization, noise=1, signal=snr, so signal ~ noise * snr
         # data = data1 + data2_ * (1 + max(0, snr1 - 1.0) * torch.rand(1) * 0.5)
         data = data1 * (1 + torch.rand(1) * 2) + data2_ * (1 + torch.rand(1) * 2)
-        targets = [torch.zeros_like(x) for x in targets1]
-        targets[0][1:, :, :] = targets1[0][1:, :, :] + targets2_[0][1:, :, :]
-        tmp = torch.sum(targets[0][1:, :, :], axis=0)
-        targets[0][0, :, :] = torch.maximum(torch.tensor(0.0), 1.0 - tmp)
-        for i in range(1, len(targets)):
-            targets[i][:, :, :] = targets1[i][:, :, :] + targets2_[i][:, :, :]
-            tmp = torch.sum(targets[i][:, :, :], axis=0)
-        masks = [torch.zeros_like(x) for x in masks1]
-        for i in range(len(masks)):
-            masks[i][:, :, :] = masks1[i][:, :, :] + masks2_[i][:, :, :]
-            masks[i][masks[i] >= 1] = 1.0
+
+        targets = {k: torch.zeros_like(v) for k, v in targets1.items()}
+        for k, v in targets.items():
+            if k in ["phase_pick", "event_center"]:
+                targets[k][1:, :, :] = targets1[k][1:, :, :] + targets2_[k][1:, :, :]
+                targets[k][0, :, :] = torch.maximum(torch.tensor(0.0), 1.0 - torch.sum(targets[k][1:, :, :], axis=0))
+            else:
+                targets[k][:, :, :] = torch.maximum(targets1[k][:, :, :], targets2_[k][:, :, :])
+
+        masks = {k: torch.zeros_like(v) for k, v in masks1.items()}
+        for k, v in masks.items():
+            masks[k][:, :, :] = masks1[k][:, :, :] + masks2_[k][:, :, :]
+            if k in ["phase_mask", "event_center_mask"]:
+                masks[k][masks[k] < 2.0] = 0.0
+                masks[k][masks[k] >= 2.0] = 1.0
+            else:
+                masks[k][masks[k] >= 1.0] = 1.0
+
+        targets["phase_pick"][:, :, (masks["phase_mask"] == 0).all(dim=(0, 1))] = 0
+        targets["event_center"][:, :, (masks["event_center_mask"] == 0).all(dim=(0, 1))] = 0
+        targets["event_time"][:, :, (masks["event_time_mask"] == 0).all(dim=(0, 1))] = 0
+
         success = True
         break
 
@@ -214,83 +222,24 @@ def pad_data(data, targets, masks, nt=1024 * 4, nx=1024 * 6):
     if h < nx:
         with torch.no_grad():
             data_ = data.unsqueeze(0)
-            targets_ = [x.unsqueeze(0) for x in targets]
-            masks_ = [x.unsqueeze(0) for x in masks]
+            targets_ = {k: v.unsqueeze(0) for k, v in targets.items()}
+            masks_ = {k: v.unsqueeze(0) for k, v in masks.items()}
             if (nx // h - 1) > 0:
                 for i in range(nx // h - 1):
                     data_ = F.pad(data_, (0, h - 1, 0, 0), mode="reflect")
-                    targets_ = [F.pad(x, (0, h - 1, 0, 0), mode="reflect") for x in targets_]
-                    masks_ = [F.pad(x, (0, h - 1, 0, 0), mode="reflect") for x in masks_]
+                    targets_ = {k: F.pad(v, (0, h - 1, 0, 0), mode="reflect") for k, v in targets_.items()}
+                    masks_ = {k: F.pad(v, (0, h - 1, 0, 0), mode="reflect") for k, v in masks_.items()}
                 data_ = F.pad(data_, (0, nx // h - 1, 0, 0), mode="reflect")
-                targets_ = [F.pad(x, (0, nx // h - 1, 0, 0), mode="reflect") for x in targets_]
-                masks_ = [F.pad(x, (0, nx // h - 1, 0, 0), mode="reflect") for x in masks_]
+                targets_ = {k: F.pad(v, (0, nx // h - 1, 0, 0), mode="reflect") for k, v in targets_.items()}
+                masks_ = {k: F.pad(v, (0, nx // h - 1, 0, 0), mode="reflect") for k, v in masks_.items()}
             data_ = F.pad(data_, (0, nx % h, 0, 0), mode="reflect").squeeze(0)
-            targets_ = [F.pad(x, (0, nx % h, 0, 0), mode="reflect").squeeze(0) for x in targets_]
-            masks_ = [F.pad(x, (0, nx % h, 0, 0), mode="reflect").squeeze(0) for x in masks_]
+            targets_ = {k: F.pad(v, (0, nx % h, 0, 0), mode="reflect").squeeze(0) for k, v in targets_.items()}
+            masks_ = {k: F.pad(v, (0, nx % h, 0, 0), mode="reflect").squeeze(0) for k, v in masks_.items()}
     else:
         data_ = data
         targets_ = targets
         masks_ = masks
     return data_, targets_, masks_
-
-
-# def cut_data(
-#     data: torch.Tensor,
-#     phase_pick: torch.Tensor = None,
-#     phase_mask: torch.Tensor = None,
-#     event_center: torch.Tensor = None,
-#     event_time: torch.Tensor = None,
-#     event_mask: torch.Tensor = None,
-#     nt: int = 1024 * 3,
-#     nx: int = 1024 * 5,
-# ):
-#     """cut data window for training"""
-
-#     nch, w, h = data.shape  # w: time, h: station
-#     w0 = np.random.randint(0, max(1, w - nt))
-#     h0 = np.random.randint(0, max(1, h - nx))
-#     w1 = np.random.randint(0, max(1, nt - w))
-#     h1 = np.random.randint(0, max(1, nx - h))
-#     if phase_pick is not None:
-#         label_width = 150
-#         max_tries = 100
-#         max_w0 = 0
-#         max_h0 = 0
-#         max_sum = 0
-#         tmp_sum = 0
-#         tries = 0
-#         while tmp_sum < label_width / 2 * nx * 0.1:  ## assuming 10% of traces have picks
-#             w0 = np.random.randint(0, max(1, w - nt))
-#             h0 = np.random.randint(0, max(1, h - nx))
-#             tmp_sum = torch.sum(phase_pick[1:, w0 : w0 + nt, h0 : h0 + nx])  # nch, nt, nx
-#             if tmp_sum > max_sum:
-#                 max_sum = tmp_sum
-#                 max_w0 = w0
-#                 max_h0 = h0
-#             tries += 1
-#             if tries >= max_tries:
-#                 w0 = max_w0
-#                 h0 = max_h0
-#                 break
-#         if tries >= max_tries:
-#             # print(f"cut data failed, tries={tries}")
-#             # return None, None
-#             pass
-
-#     data_ = torch.zeros((nch, nt, nx), dtype=data.dtype, device=data.device)
-#     tmp = data[:, w0 : w0 + nt, h0 : h0 + nx]
-#     data_[:, w1 : w1 + tmp.shape[-2], h1 : h1 + tmp.shape[-1]] = tmp[:, :, :]
-
-#     if phase_pick is not None:
-#         phase_pick_ = torch.zeros((phase_pick.shape[0], nt, nx), dtype=phase_pick.dtype, device=phase_pick.device)
-#         tmp = phase_pick[..., w0 : w0 + nt, h0 : h0 + nx]
-#         phase_pick_[:, w1 : w1 + tmp.shape[-2], h1 : h1 + tmp.shape[-1]] = tmp[:, :, :]
-#         mask = torch.sum(phase_pick_[1:, :, :], axis=(0, 1))  ## no P/S channels
-#         phase_pick_[0, :, mask == 0] = 0
-#         return data_, phase_pick_
-#     else:
-#         return data_
-
 
 def cut_data(
     data: torch.Tensor,
@@ -313,7 +262,7 @@ def cut_data(
         w0 = np.random.randint(0, max(1, w - nt))
         h0 = np.random.randint(0, max(1, h - nx))
         if len(targets) > 0:
-            tmp_sum = torch.sum(targets[0][1:, w0 : w0 + nt, h0 : h0 + nx])  # nch, nt, nx
+            tmp_sum = torch.sum(targets["phase_pick"][1:, w0 : w0 + nt, h0 : h0 + nx])  # nch, nt, nx
         else:
             tmp_sum = nx * nt
         if tmp_sum > max_sum:
@@ -327,8 +276,8 @@ def cut_data(
     h0 = max_h0
 
     data_ = data[:, w0 : w0 + nt, h0 : h0 + nx].clone()
-    targets_ = [x[..., w0 : w0 + nt, h0 : h0 + nx].clone() for x in targets]
-    masks_ = [x[..., w0 : w0 + nt, h0 : h0 + nx].clone() for x in masks]
+    targets_ = {k: v[..., w0 : w0 + nt, h0 : h0 + nx].clone() for k, v in targets.items()}
+    masks_ = {k: v[..., w0 : w0 + nt, h0 : h0 + nx].clone() for k, v in masks.items()}
     return data_, targets_, masks_
 
 
@@ -382,103 +331,27 @@ def stack_noise(data, noise, snr):
     ## approximately after normalization, noise=1, signal=snr, so signal ~ noise * snr
     return data + noise * max(0, snr - 2) * torch.rand(1)
 
-
-# def flip_lr(data, phase_pick=None):
-#     data = data.flip(-1)
-#     if phase_pick is not None:
-#         phase_pick = phase_pick.flip(-1)
-#         return data, phase_pick
-#     else:
-#         return data
-
 def flip_lr(data, targets=[], masks=[]):
     data = data.flip(-1)
-    targets = [x.flip(-1) for x in targets]
-    masks = [x.flip(-1) for x in masks]
+    targets = {k: v.flip(-1) for k, v in targets.items()}
+    masks = {k: v.flip(-1) for k, v in masks.items()}
     return data, targets, masks
-
-
-# def masking(data, target, nt=256, nx=256):
-#     nc0, nt0, nx0 = data.shape
-#     nt_ = random.randint(32, nt)
-#     nt0_ = random.randint(0, nt0 - nt_)
-#     # data_ = torch.clone(data)
-#     # target_ = torch.clone(target)
-#     data_ = data
-#     target_ = target
-
-#     max_tries = 10
-#     tries = 0
-#     while (torch.sum(target_[1:, nt0_ : nt0_ + nt_, :]).item() > 100.0) and (tries < max_tries):
-#         tries += 1
-#         nt0_ = random.randint(0, nt0 - nt_)
-
-#     data_[:, nt0_ : nt0_ + nt_, :] = 0.0
-#     target_[0, nt0_ : nt0_ + nt_, :] = 1.0
-#     target_[1:, nt0_ : nt0_ + nt_, :] = 0.0
-
-#     # if random.random() > 0.5:
-#     #     nx_ = random.randint(32, nx)
-#     #     nx0_ = random.randint(0, nx0 - nx_)
-#     #     data_[:, :, nx0_ : nx0_ + nx_] = 0.0
-#     #     target_[0, :, nx0_ : nx0_ + nx_] = 1.0
-#     #     target_[1:, :, nx0_ : nx0_ + nx_] = 0.0
-
-#     return data_, target_
-
 def masking(data, targets, masks,nt=256, nx=256):
     nc0, nt0, nx0 = data.shape
     nt_ = random.randint(32, nt)
     nt0_ = random.randint(0, nt0 - nt_)
-    # data_ = torch.clone(data)
-    # target_ = torch.clone(target)
     data_ = data.clone()
-    targets_ = [x.clone() for x in targets]
-    masks_ = [x.clone() for x in masks]
-
-    max_tries = 10
-    tries = 0
-    while (torch.sum(targets_[0][1:, nt0_ : nt0_ + nt_, :]).item() > 100.0) and (tries < max_tries):
-        tries += 1
-        nt0_ = random.randint(0, nt0 - nt_)
+    targets_ = {k: v.clone() for k, v in targets.items()}
+    masks_ = {k: v.clone() for k, v in masks.items()}
 
     data_[:, nt0_ : nt0_ + nt_, :] = 0.0
-    targets_[0][0, nt0_ : nt0_ + nt_, :] = 1.0
-    targets_[0][1:, nt0_ : nt0_ + nt_, :] = 0.0
-    for i in range(1, len(targets)):
-        targets_[i][:, nt0_ : nt0_ + nt_, :] = 0.0
-    for i in range(len(masks)):
-        masks_[i][:, nt0_ : nt0_ + nt_, :] = 0.0 ## FIXME: 1 for phase and event center, 0 for event_time
-
-    # if random.random() > 0.5:
-    #     nx_ = random.randint(32, nx)
-    #     nx0_ = random.randint(0, nx0 - nx_)
-    #     data_[:, :, nx0_ : nx0_ + nx_] = 0.0
-    #     targets_[0, :, nx0_ : nx0_ + nx_] = 1.0
-    #     targets_[1:, :, nx0_ : nx0_ + nx_] = 0.0
+    for k, v in targets_.items():
+        if k == "phase_pick":
+            targets_[k][0, nt0_ : nt0_ + nt_, :] = 1.0
+            targets_[k][1:, nt0_ : nt0_ + nt_, :] = 0.0
 
     return data_, targets_, masks_
 
-
-# def masking_edge(data, target, nt=1024, nx=1024):
-#     """masking edges to prevent edge effects"""
-
-#     crop_nt = random.randint(1, nt)
-#     crop_nx = random.randint(1, nx)
-
-#     # data_ = torch.clone(data)
-#     # target_ = torch.clone(target)
-#     data_ = data
-#     target_ = target
-
-#     data_[:, -crop_nt:, :] = 0.0
-#     target_[0, -crop_nt:, :] = 1.0
-#     target_[1:, -crop_nt:, :] = 0.0
-#     data_[:, :, -crop_nx:] = 0.0
-#     target_[0, :, -crop_nx:] = 1.0
-#     target_[1:, :, -crop_nx:] = 0.0
-
-#     return data_, target_
 
 def masking_edge(data, targets, masks, nt=1024, nx=1024):
     """masking edges to prevent edge effects"""
@@ -486,27 +359,19 @@ def masking_edge(data, targets, masks, nt=1024, nx=1024):
     crop_nt = random.randint(1, nt)
     crop_nx = random.randint(1, nx)
 
-    # data_ = torch.clone(data)
-    # target_ = torch.clone(target)
     data_ = data.clone()
-    targets_ = [x.clone() for x in targets]
-    masks_ = [x.clone() for x in masks]
+    targets_ = {k: v.clone() for k, v in targets.items()}
+    masks_ = {k: v.clone() for k, v in masks.items()}
 
     data_[:, -crop_nt:, :] = 0.0
-    targets_[0][0, -crop_nt:, :] = 1.0
-    targets_[0][1:, -crop_nt:, :] = 0.0
-    for i in range(1, len(targets)):
-        targets_[i][:, -crop_nt:, :] = 0.0
-    for i in range(len(masks)):
-        masks_[i][:, -crop_nt:, :] = 0.0 ## FIXME: 1 for phase and event center, 0 for event_time
 
-    data_[:, :, -crop_nx:] = 0.0
-    targets_[0][0, :, -crop_nx:] = 1.0
-    targets_[0][1:, :, -crop_nx:] = 0.0
-    for i in range(1, len(targets)):
-        targets_[i][:, :, -crop_nx:] = 0.0
-    for i in range(len(masks)):
-        masks_[i][:, :, -crop_nx:] = 0.0 ## FIXME: 1 for phase and event center, 0 for event_time
+    for k, v in targets_.items():
+        if k in ["phase_pick", "event_center"]:
+            targets_[k][0, -crop_nt:, :] = 1.0
+            targets_[k][1:, -crop_nt:, :] = 0.0
+    for k, v in masks_.items():
+        if k in ["event_time_mask"]:
+            masks_[k][:,-crop_nt:, :] = 0.0
 
     return data_, targets_, masks_
 
@@ -517,8 +382,8 @@ def resample_space(data, targets, masks, noise=None, factor=1):
     scale_factor = random.uniform(min(1, factor), max(1, factor))
     with torch.no_grad():
         data_ = F.interpolate(data, scale_factor=scale_factor, mode="nearest")
-        targets_ = [F.interpolate(x, scale_factor=scale_factor, mode="nearest") for x in targets]
-        masks_ = [F.interpolate(x, scale_factor=scale_factor, mode="nearest") for x in masks]
+        targets_ = {k: F.interpolate(v, scale_factor=scale_factor, mode="nearest") for k, v in targets.items()}
+        masks_ = {k: F.interpolate(v, scale_factor=scale_factor, mode="nearest") for k, v in masks.items()}
         if noise is not None:
             noise_ = F.interpolate(noise, scale_factor=scale_factor, mode="nearest")
         else:
@@ -549,7 +414,7 @@ def resample_time(data, picks, noise=None, factor=1):
     return data_, picks_, noise_
 
 
-def filt_channels(picks):
+def filter_channels(picks):
     """filter channels with all pick types"""
 
     commmon_channel_index = []
@@ -564,18 +429,6 @@ def filt_channels(picks):
     picks = picks[picks["channel_index"].isin(commmon_channel_index)]
     return picks
 
-
-######################## not used anymore ########################
-
-
-def filter_labels(label_list):
-    label_selected = []
-    print(f"{len(label_list) = }")
-    for label in label_list:
-        if os.path.getsize(label) > 50e3:  # bytes
-            label_selected.append(label)
-    print(f"{len(label_selected) = }")
-    return label_selected
 
 
 def read_PASSCAL_segy(fid, nTraces=1250, nSample=900000, TraceOff=0, strain_rate=True):
@@ -624,27 +477,6 @@ def roll_by_gather(data, dim, shifts: torch.LongTensor):
         raise ValueError("dim must be 0 or 1")
 
 
-def add_moveout(data, targets=[], masks=[], vmin=2.0, vmax=6.0, dt=0.01, dx=0.01, shift_range=1000):
-    nch, h, w = data.shape
-    iw = torch.randint(low=0, high=w, size=(1,))
-    shift = ((torch.arange(w) - iw).abs() * dx / (vmin + torch.rand(1) * (vmax - vmin)) / dt).int()
-    # shift = ((torch.arange(w) - iw).abs() /w * shift_range * torch.rand((1,))).int()
-    data = roll_by_gather(data, dim=0, shifts=shift)
-    targets_ = [roll_by_gather(x, dim=0, shifts=shift) for x in targets]
-    masks_ = [roll_by_gather(x, dim=0, shifts=shift) for x in masks]
-    
-    return data, targets_, masks_
-
-
-def padding(data, min_nt=1024, min_nx=1):
-    nch, nt, nx = data.shape
-    pad_nt = (min_nt - nt % min_nt) % min_nt
-    pad_nx = (min_nx - nx % min_nx) % min_nx
-    with torch.no_grad():
-        data = F.pad(data, (0, pad_nx, 0, pad_nt), mode="constant")
-    return data
-
-
 class DASIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -661,6 +493,7 @@ class DASIterableDataset(IterableDataset):
         training=False,
         phases=["P", "S"],
         label_path="./",
+        subdir=3,
         label_list=None,
         noise_list=None,
         stack_noise=False,
@@ -693,6 +526,7 @@ class DASIterableDataset(IterableDataset):
         self.format = format
         self.prefix = prefix
         self.suffix = suffix
+        self.subdir = subdir
 
         self.data_path = data_path
         if data_list is not None:
@@ -740,11 +574,6 @@ class DASIterableDataset(IterableDataset):
                 self.label_list = self.label_list[: len(self.label_list) // world_size * world_size]
             self.label_list = self.label_list[rank::world_size]
         else:
-            # if type(label_path) is list:
-            #     self.label_list = []
-            #     for label_path_ in label_path:
-            #         self.label_list += glob(label_path_ + f"/*.csv")
-            # else:
             self.label_list = glob(self.label_path + f"/*.csv")
         self.min_picks = kwargs["min_picks"] if "min_picks" in kwargs else 500
         if noise_list is not None:
@@ -827,18 +656,13 @@ class DASIterableDataset(IterableDataset):
             worker_id = worker_info.id
 
         if self.training:
-            return iter(self.sample_training(self.label_list[worker_id::num_workers], num_workers))
+            return iter(self.sample_training(self.label_list[worker_id::num_workers]))
         else:
             return iter(self.sample(self.data_list[worker_id::num_workers]))
 
-    def sample_training(self, file_list, num_workers=1):
-        # cache = {}
-        # cache_size = 512//num_workers # server disk is really slow & DAS data is large :<
-        # cache_keys = [] 
-
+    def sample_training(self, file_list):
         while True:
             ## load picks
-            # label_file = file_list[np.random.randint(0, len(file_list))]
             file_list = np.random.permutation(file_list)
             for label_file in file_list:
                 picks = pd.read_csv(self.label_path + "/" + label_file)
@@ -853,16 +677,10 @@ class DASIterableDataset(IterableDataset):
 
                 ## load waveform data
                 data_file = "/".join(
-                    label_file.replace("labels", "data").replace(".csv", ".h5").split("/")[-3:]
+                    label_file.replace("labels", "data").replace(".csv", ".h5").split("/")[-self.subdir:]
                 )  # folder/data/event_id
 
                 try:
-                    # if data_file in cache:
-                    #     data = cache[data_file]
-                    #     # Update LRU order
-                    #     cache_keys.remove(data_file)
-                    #     cache_keys.append(data_file)
-                    # else:
                     with fsspec.open(self.data_path + "/" + data_file, "rb") as f:
                         with h5py.File(f, "r") as fp:
                             data = fp["data"][:, :].T
@@ -871,12 +689,7 @@ class DASIterableDataset(IterableDataset):
                         data = data[np.newaxis, :, :]  # nchn, nt, nx
                         data = data / np.std(data)
                         data = torch.from_numpy(data.astype(np.float32))
-                            
-                            # if len(cache) >= cache_size:
-                            #     oldest_key = cache_keys.pop(0)
-                            #     del cache[oldest_key]
-                            # cache[data_file] = data
-                            # cache_keys.append(data_file)
+
                 except:
                     print(f"Error reading {data_file}")
                     continue
@@ -889,7 +702,7 @@ class DASIterableDataset(IterableDataset):
                 if self.stack_noise and (self.noise_list is not None):
                     tmp = self.noise_list[np.random.randint(0, len(self.noise_list))]
                     try:
-                        with fsspec.open(tmp, "rb") as f:
+                        with fsspec.open(os.path.join(self.data_path, tmp), "rb") as f:
                             with h5py.File(f, "r") as fp:
                                 noise = fp["data"][:, :].T
                             ## The first 30s are noise in the training data
@@ -909,6 +722,7 @@ class DASIterableDataset(IterableDataset):
                 else:
                     snr, S, N = 0, 0, 0
 
+
                 ## generate training labels
                 picks = [meta[x] for x in self.phases]
 
@@ -921,24 +735,30 @@ class DASIterableDataset(IterableDataset):
                         data, picks, noise = resample_time(data, picks, noise, 0.5)
 
                 ## generate training labels
-                phase_pick, phase_mask = generate_phase_label(data, picks, return_time_mask=True)
+                phase_pick, phase_mask = generate_phase_label(data, picks)
                 phase_pick = torch.from_numpy(phase_pick)
                 phase_mask = torch.from_numpy(phase_mask)
 
                 c0 = [[x1[0], (x1[1] + x2[1]) / 2] for x1, x2 in zip(picks[0], picks[1])]
                 t0 = [[x1[0], x2[1] - x1[1]] for x1, x2 in zip(picks[0], picks[1])]
 
-                event_center, event_time, event_mask = generate_event_label(data, c0, t0)
+                event_center, event_time, event_center_mask, event_time_mask = generate_event_label(data, c0, t0)
                 event_center = torch.from_numpy(event_center)
                 event_time = torch.from_numpy(event_time)
-                event_mask = torch.from_numpy(event_mask)
+                event_center_mask = torch.from_numpy(event_center_mask)
+                event_time_mask = torch.from_numpy(event_time_mask)
 
-                # print(f"data.shape: {data.shape}")
-                # print(f"phase_pick.shape: {phase_pick.shape}, phase_mask.shape: {phase_mask.shape}")
-                # print(f"event_center.shape: {event_center.shape}, event_time.shape: {event_time.shape}, event_mask.shape: {event_mask.shape}")
 
-                targets = [phase_pick, event_center, event_time]
-                masks = [phase_mask, event_mask]
+                targets = {
+                    "phase_pick": phase_pick,
+                    "event_center": event_center,
+                    "event_time": event_time,
+                }
+                masks = {
+                    "phase_mask": phase_mask,
+                    "event_center_mask": event_center_mask,
+                    "event_time_mask": event_time_mask,
+                }
 
                 ## augmentation
                 status_stack_event = False
@@ -949,7 +769,6 @@ class DASIterableDataset(IterableDataset):
 
                 ## augmentation
                 if self.resample_space:
-                    # tmp = np.random.rand()
                     if rand_i < 0.2:
                         data, targets, masks, noise = resample_space(data, targets, masks, noise, 5)
                     elif (rand_i < 0.4) and (data.shape[-1] > 2000):
@@ -961,13 +780,7 @@ class DASIterableDataset(IterableDataset):
                     noise = pad_noise(noise, self.nt, self.nx + self.nx // 2)
 
                 for ii in range(self.num_patch):
-                    # data_, phase_pick_ = cut_data(data, phase_pick, self.nt, self.nx)
-                    # labels = [phase_pick, phase_mask, event_center, event_time, event_mask]
                     data_, targets_, masks_ = cut_data(data, targets, masks, nt=self.nt, nx=self.nx)
-
-                    ## augmentation
-                    # if (np.random.rand() < 0.5) and self.add_moveout:
-                    #     data_, targets_, masks_ = add_moveout(data_, targets_, masks_)
 
                     ## augmentation
                     if self.stack_noise and (not status_stack_event) and (np.random.rand() < 0.5):
@@ -982,17 +795,18 @@ class DASIterableDataset(IterableDataset):
                     if self.masking and (np.random.rand() < 0.2):
                         data_, targets_, masks_ = masking(data_, targets_, masks_)
 
-                    ## prevent edge effect on the right and bottom
-                    if np.random.rand() < 0.05:
-                        data_, targets_, masks_ = masking_edge(data_, targets_, masks_)
+
+                    # ## prevent edge effect on the right and bottom
+                    # if np.random.rand() < 0.05:
+                    #     data_, targets_, masks_ = masking_edge(data_, targets_, masks_)
+
 
                     # data_ = normalize(data_)
                     if np.random.rand() < 0.5:
                         data_ = data_ - torch.median(data_, dim=-2, keepdims=True)[0]
 
-
-                    phase_pick_, event_center_, event_time_ = targets_
-                    phase_mask_, event_mask_ = masks_
+                    phase_pick_, event_center_, event_time_ = targets_["phase_pick"], targets_["event_center"], targets_["event_time"]
+                    phase_mask_, event_center_mask_, event_time_mask_ = masks_["phase_mask"], masks_["event_center_mask"], masks_["event_time_mask"]
 
                     ## FIXME: shift (nt, nx) to (nx, nt)
                     data_ = data_.permute(0, 2, 1)
@@ -1000,14 +814,13 @@ class DASIterableDataset(IterableDataset):
                     phase_mask_ = phase_mask_.permute(0, 2, 1)
                     event_center_ = event_center_.permute(0, 2, 1)
                     event_time_ = event_time_.permute(0, 2, 1)
-                    event_mask_ = event_mask_.permute(0, 2, 1)
-                    # event_center_ = event_center_.unsqueeze(0)
-                    # event_time_ = event_time_.unsqueeze(0)
-                    # event_mask_ = event_mask_.unsqueeze(0)
+                    event_center_mask_ = event_center_mask_.permute(0, 2, 1)
+                    event_time_mask_ = event_time_mask_.permute(0, 2, 1)
                     event_feature_scale = 16
                     event_center_ = event_center_[:, ::, ::event_feature_scale]
                     event_time_ = event_time_[:, ::, ::event_feature_scale]
-                    event_mask_ = event_mask_[:, ::, ::event_feature_scale]
+                    event_center_mask_ = event_center_mask_[:, ::, ::event_feature_scale]
+                    event_time_mask_ = event_time_mask_[:, ::, ::event_feature_scale]
 
                     yield {
                         "data": torch.nan_to_num(data_),
@@ -1015,7 +828,8 @@ class DASIterableDataset(IterableDataset):
                         "phase_mask": phase_mask_,
                         "event_center": event_center_,
                         "event_time": event_time_,
-                        "event_mask": event_mask_,
+                        "event_time_mask": event_time_mask_,
+                        "event_center_mask": event_center_mask_,
                         "file_name": os.path.splitext(label_file.split("/")[-1])[0] + f"_{ii:02d}",
                         "height": data_.shape[-2],
                         "width": data_.shape[-1],

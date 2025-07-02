@@ -59,3 +59,4 @@ tests/phasenet_plus/figures_*
 *.tfevents.*
 *.err
 *.out
+test/hf_cache

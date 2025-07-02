@@ -83,6 +83,7 @@ def plot_phasenet_das_train(meta, phase_pick, epoch, figure_dir="figures", dt=0.
         dt = meta["dt_s"][i]
 
         fig, ax = plt.subplots(1, 3, figsize=(10, 4), squeeze=False, sharex=True, sharey=True)
+        # fig, ax = plt.subplots(2, 3, figsize=(10, 7), squeeze=False, sharex=True, sharey=True)
 
         ax[0, 0].imshow(
             data[i] - np.mean(data[i], axis=-1, keepdims=True) / np.std(data[i], axis=-1, keepdims=True),
@@ -95,7 +96,7 @@ def plot_phasenet_das_train(meta, phase_pick, epoch, figure_dir="figures", dt=0.
         )
         ax[0, 0].set_xlabel("Time (s)")
         ax[0, 0].set_ylabel("Distance (km)")
-        ax[0, 0].set_title("DAS Data")
+        ax[0, 0].set_title(f"Data ({meta['file_name'][i]})")
 
         ax[0, 1].imshow(
             y_phase_pick[i][...,[1, 2, 0]],
@@ -120,6 +121,28 @@ def plot_phasenet_das_train(meta, phase_pick, epoch, figure_dir="figures", dt=0.
         ax[0, 2].set_xlabel("Time (s)")
         # ax[0, 2].set_ylabel("Distance (km)")
         ax[0, 2].set_title("Prediction")
+
+        # ## debuging
+        # ax[1, 0].imshow(
+        #     meta["phase_mask"][i][0, :, :],
+        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
+        #     aspect="auto",
+        #     interpolation="none",
+        # )
+
+        # ax[1, 1].imshow(
+        #     meta["event_center_mask"][i][0, :, :],
+        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
+        #     aspect="auto",
+        #     interpolation="none",
+        # )
+
+        # ax[1, 2].imshow(
+        #     meta["event_time_mask"][i][0, :, :],
+        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
+        #     aspect="auto",
+        #     interpolation="none",
+        # )
 
         fig.tight_layout()
 
@@ -163,9 +186,15 @@ def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event
     if "event_time" in meta:
         y_event_time = meta["event_time"].cpu().numpy()
         y_event_time = y_event_time.transpose(0, 2, 3, 1)
-    if "event_mask" in meta:
-        y_event_mask = meta["event_mask"].cpu().numpy()
-        y_event_mask = y_event_mask.transpose(0, 2, 3, 1)
+    # if "event_mask" in meta:
+    #     y_event_mask = meta["event_mask"].cpu().numpy()
+    #     y_event_mask = y_event_mask.transpose(0, 2, 3, 1)
+    # if "event_center_mask" in meta:
+    #     y_event_center_mask = meta["event_center_mask"].cpu().numpy()
+    #     y_event_center_mask = y_event_center_mask.transpose(0, 2, 3, 1)
+    if "event_time_mask" in meta:
+        y_event_time_mask = meta["event_time_mask"].cpu().numpy()
+        y_event_time_mask = y_event_time_mask.transpose(0, 2, 3, 1)
     if "polarity" in meta:
         y_polarity = meta["polarity"].cpu().numpy()
         y_polarity = y_polarity.transpose(0, 2, 3, 1)
@@ -175,7 +204,8 @@ def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event
         dx = meta["dx_m"][i]
         dt = meta["dt_s"][i]
 
-        fig, ax = plt.subplots(2, 3, figsize=(10, 7), sharex=True, sharey=True)
+        fig, ax = plt.subplots(2, 3, figsize=(10, 6), sharex=True, sharey=True)
+        # fig, ax = plt.subplots(3, 3, figsize=(10, 10), sharex=True, sharey=True)
 
         ax[0, 0].imshow(
             data[i] - np.mean(data[i], axis=-1, keepdims=True) / np.std(data[i], axis=-1, keepdims=True),
@@ -188,7 +218,7 @@ def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event
         )
         # ax[0, 0].set_xlabel("Time (s)")
         ax[0, 0].set_ylabel("Distance (km)")
-        ax[0, 0].set_title("DAS Data")
+        ax[0, 0].set_title(f"Data ({meta['file_name'][i]})")
 
         ax[0, 1].imshow(
             y_phase_pick[i][...,[1, 2, 0]],
@@ -214,10 +244,10 @@ def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event
         # ax[0, 2].set_ylabel("Distance (km)")
         ax[0, 2].set_title("Prediction")
 
-        vmax = np.max(np.abs((event_time[i] - y_event_time[i]) * y_event_mask[i]))
+        vmax = np.max(np.abs((event_time[i] - y_event_time[i]) * y_event_time_mask[i]))
         vmin = -vmax
         ax[1, 0].imshow(
-            (event_time[i] - y_event_time[i]) * y_event_mask[i],
+            (event_time[i] - y_event_time[i]) * y_event_time_mask[i],
             vmin=vmin,
             vmax=vmax,
             extent=(0, nx * dx / 1e3, 0, nt * dt),
@@ -255,6 +285,25 @@ def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event
         # ax[1, 2].set_ylabel("Distance (km)")
         # ax[1, 2].set_title("Prediction")
 
+        # ## debuging
+        # ax[2, 0].imshow(
+        #     meta["phase_mask"][i][0, :, :],
+        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
+        #     aspect="auto",
+        #     interpolation="none",
+        # )
+        # ax[2, 1].imshow(
+        #     meta["event_center_mask"][i][0, :, :],
+        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
+        #     aspect="auto",
+        #     interpolation="none",
+        # )
+        # ax[2, 2].imshow(
+        #     meta["event_time_mask"][i][0, :, :],
+        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
+        #     aspect="auto",
+        #     interpolation="none",
+        # )
 
         fig.tight_layout()
 

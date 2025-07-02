@@ -67,9 +67,9 @@ LABEL_PATH=/global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0
 # DATA_PATH=/nfs2/quakeflow_das
 # LABEL_PATH=/nfs2/zhuwq/EQNet/scripts/results/training_v0
 
-torchrun --master_port 29520 --nproc_per_node=2 train.py --model phasenet_das --backbone unet \
-    --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
-    --output=phasenet_das_unet \
+torchrun --master_port 29520 --nproc_per_node=4 train.py --model phasenet_das --backbone unet \
+    --epochs=10 --batch-size=1 --workers=4 --sync-bn --lr 0.001 \
+    --output=phasenet_das_unet_debug \
     --data-path "$DATA_PATH" \
     --data-list "$LABEL_PATH/data.txt" \
     --label-path "$LABEL_PATH" \
@@ -79,12 +79,12 @@ torchrun --master_port 29520 --nproc_per_node=2 train.py --model phasenet_das --
     --test-data-list "$LABEL_PATH/data.txt" \
     --test-label-list "$LABEL_PATH/labels_test.txt" \
     --test-label-path "$LABEL_PATH" \
-    --test-noise-list "$LABEL_PATH/noise_test.txt"
-    # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \
+    --test-noise-list "$LABEL_PATH/noise_test.txt" \
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
 
 
-torchrun --master_port 29521 --nproc_per_node=2 train.py --model phasenet_das_plus --backbone unet \
-    --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
+torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone unet \
+    --epochs=10 --batch-size=1 --workers=1 --sync-bn --lr 0.001 \
     --output=phasenet_das_plus_unet \
     --data-path "${DATA_PATH}" \
     --data-list "${LABEL_PATH}/data.txt" \
@@ -95,11 +95,12 @@ torchrun --master_port 29521 --nproc_per_node=2 train.py --model phasenet_das_pl
     --test-data-list "${LABEL_PATH}/data.txt" \
     --test-label-path "${LABEL_PATH}" \
     --test-label-list "${LABEL_PATH}/labels_test.txt" \
-    --test-noise-list "${LABEL_PATH}/noise_test.txt"
-    # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \
+    --test-noise-list "$LABEL_PATH/noise_test.txt" \
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
 
-torchrun --master_port 29522 --nproc_per_node=2 train.py --model phasenet_das --backbone xunet \
-    --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
+
+torchrun --master_port 29522 --nproc_per_node=4 train.py --model phasenet_das --backbone xunet \
+    --epochs=10 --batch-size=1 --workers=4 --sync-bn --lr 0.001 \
     --nx 2048 --nt 2048 \
     --output=phasenet_das_xunet \
     --data-path "$DATA_PATH" \
@@ -111,12 +112,12 @@ torchrun --master_port 29522 --nproc_per_node=2 train.py --model phasenet_das --
     --test-data-list "$LABEL_PATH/data.txt" \
     --test-label-list "$LABEL_PATH/labels_test.txt" \
     --test-label-path "$LABEL_PATH" \
-    --test-noise-list "$LABEL_PATH/noise_test.txt"
-    # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \
+    --test-noise-list "$LABEL_PATH/noise_test.txt" \
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
 
 
-torchrun --master_port 29521 --nproc_per_node=2 train.py --model phasenet_das_plus --backbone xunet \
-    --epochs=10 --batch-size=1 --workers=16 --sync-bn --lr 0.001 \
+torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone xunet \
+    --epochs=10 --batch-size=1 --workers=4 --sync-bn --lr 0.001 \
     --nx 2048 --nt 2048 \
     --output=phasenet_das_plus_xunet \
     --data-path "${DATA_PATH}" \
@@ -128,5 +129,5 @@ torchrun --master_port 29521 --nproc_per_node=2 train.py --model phasenet_das_pl
     --test-data-list "${LABEL_PATH}/data.txt" \
     --test-label-path "${LABEL_PATH}" \
     --test-label-list "${LABEL_PATH}/labels_test.txt" \
-    --test-noise-list "${LABEL_PATH}/noise_test.txt"
-    # --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking --random-crop \
+    --test-noise-list "${LABEL_PATH}/noise_test.txt" \
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking

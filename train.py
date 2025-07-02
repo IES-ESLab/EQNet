@@ -202,6 +202,9 @@ def train_one_epoch(
         if (i + 1) % 1000 == 0:
             utils.save_on_master(model.state_dict(), os.path.join(args.output_dir, f"model_tmp.pth"))
 
+        # if i > 500:
+        #     break
+
     plot_results(meta, model, output, args, epoch, "train")
     del meta, output, loss
 
@@ -866,9 +869,6 @@ def get_args_parser(add_help=True):
     parser.add_argument("--resample-space", action="store_true", help="Resample space resolution")
     parser.add_argument("--resample-time", action="store_true", help="Resample time  resolution")
     parser.add_argument("--masking", action="store_true", help="Masking of the input data")
-    parser.add_argument("--random-crop", action="store_true", help="Random size")
-    parser.add_argument("--crop-nt", default=1024, type=int, help="Crop time samples")
-    parser.add_argument("--crop-nx", default=1024, type=int, help="Crop space samples")
 
     # wandb
     parser.add_argument("--wandb", action="store_true", help="use wandb")
