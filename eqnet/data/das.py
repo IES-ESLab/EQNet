@@ -185,7 +185,7 @@ def stack_event(
 
         targets = {k: torch.zeros_like(v) for k, v in targets1.items()}
         for k, v in targets.items():
-            if k in ["phase_pick", "event_center"]:
+            if k in ["phase_pick"]:
                 targets[k][1:, :, :] = targets1[k][1:, :, :] + targets2_[k][1:, :, :]
                 targets[k][0, :, :] = torch.maximum(torch.tensor(0.0), 1.0 - torch.sum(targets[k][1:, :, :], axis=0))
             else:
@@ -336,6 +336,7 @@ def flip_lr(data, targets=[], masks=[]):
     targets = {k: v.flip(-1) for k, v in targets.items()}
     masks = {k: v.flip(-1) for k, v in masks.items()}
     return data, targets, masks
+
 def masking(data, targets, masks,nt=256, nx=256):
     nc0, nt0, nx0 = data.shape
     nt_ = random.randint(32, nt)
@@ -349,6 +350,8 @@ def masking(data, targets, masks,nt=256, nx=256):
         if k == "phase_pick":
             targets_[k][0, nt0_ : nt0_ + nt_, :] = 1.0
             targets_[k][1:, nt0_ : nt0_ + nt_, :] = 0.0
+        # else:
+        #     targets_[k][:, nt0_ : nt0_ + nt_, :] = 0.0 # event center could still be predicted 
 
     return data_, targets_, masks_
 
@@ -366,9 +369,12 @@ def masking_edge(data, targets, masks, nt=1024, nx=1024):
     data_[:, -crop_nt:, :] = 0.0
 
     for k, v in targets_.items():
-        if k in ["phase_pick", "event_center"]:
+        if k in ["phase_pick"]:
             targets_[k][0, -crop_nt:, :] = 1.0
             targets_[k][1:, -crop_nt:, :] = 0.0
+        # if k in ["event_center"]:
+        else:
+            targets_[k][:, -crop_nt:, :] = 0.0
     for k, v in masks_.items():
         if k in ["event_time_mask"]:
             masks_[k][:,-crop_nt:, :] = 0.0
