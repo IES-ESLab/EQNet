@@ -101,5 +101,5 @@ class PhaseNetDAS(PhaseNet):
             raise ValueError("backbone only supports unet or xunet")
 
 
-def build_model(backbone="unet", log_scale=False, *args, **kwargs) -> PhaseNetDAS:
+def build_model(backbone="unet", log_scale=True, *args, **kwargs) -> PhaseNetDAS:
     return PhaseNetDAS(backbone, log_scale, *args, **kwargs)

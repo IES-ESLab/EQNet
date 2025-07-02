@@ -442,7 +442,7 @@ class PhaseNet(nn.Module):
 
 def build_model(
     backbone="unet",
-    log_scale=False,
+    log_scale=True,
     *args,
     **kwargs,
 ) -> PhaseNet:

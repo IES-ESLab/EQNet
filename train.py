@@ -37,12 +37,12 @@ logger = logging.getLogger("EQNet")
 def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+    if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
         metric_logger.add_meter("loss_phase", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+    if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus"]:
         metric_logger.add_meter("loss_event_center", utils.SmoothedValue(window_size=1, fmt="{value}"))
         metric_logger.add_meter("loss_event_time", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
+    if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
         metric_logger.add_meter("loss_polarity", utils.SmoothedValue(window_size=1, fmt="{value}"))
     if args.model == "phasenet_prompt":
         metric_logger.add_meter("loss_prompt", utils.SmoothedValue(window_size=1, fmt="{value}"))
@@ -55,12 +55,12 @@ def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
             batch_size = meta["data"].shape[0]
 
             metric_logger.meters["loss"].update(output["loss"].item(), n=batch_size)
-            if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+            if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
                 metric_logger.meters["loss_phase"].update(output["loss_phase"].item(), n=batch_size)
-            if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+            if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus"]:
                 metric_logger.meters["loss_event_center"].update(output["loss_event_center"].item(), n=batch_size)
                 metric_logger.meters["loss_event_time"].update(output["loss_event_time"].item(), n=batch_size)
-            if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
+            if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
                 metric_logger.meters["loss_polarity"].update(output["loss_polarity"].item(), n=batch_size)
             if args.model == "phasenet_prompt":
                 metric_logger.meters["loss_prompt"].update(output["loss_prompt"].item(), n=batch_size)
@@ -76,12 +76,12 @@ def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
             "test/test_loss": metric_logger.loss.global_avg,
             "test/epoch": epoch,
         }
-        if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+        if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
             log["test/loss_phase"] = metric_logger.loss_phase.global_avg
-        if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+        if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
             log["test/loss_event_center"] = metric_logger.loss_event_center.global_avg
             log["test/loss_event_time"] = metric_logger.loss_event_time.global_avg
-        if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
+        if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
             log["test/loss_polarity"] = metric_logger.loss_polarity.global_avg
         if args.model == "phasenet_prompt":
             log["test/loss_prompt"] = metric_logger.loss_prompt.global_avg
@@ -121,12 +121,12 @@ def train_one_epoch(
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+    if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
         metric_logger.add_meter("loss_phase", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt"]:
+    if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
         metric_logger.add_meter("loss_event_center", utils.SmoothedValue(window_size=1, fmt="{value}"))
         metric_logger.add_meter("loss_event_time", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
+    if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
         metric_logger.add_meter("loss_polarity", utils.SmoothedValue(window_size=1, fmt="{value}"))
     if args.model == "phasenet_prompt":
         metric_logger.add_meter("loss_prompt", utils.SmoothedValue(window_size=1, fmt="{value}"))
@@ -169,12 +169,12 @@ def train_one_epoch(
         processed_samples += batch_size
 
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-        if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das", "phasenet_das_plus"]:
+        if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
             metric_logger.update(loss_phase=output["loss_phase"].item())
-        if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das_plus"]:
+        if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
             metric_logger.update(loss_event_center=output["loss_event_center"].item())
             metric_logger.update(loss_event_time=output["loss_event_time"].item())
-        if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
+        if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
             metric_logger.update(loss_polarity=output["loss_polarity"].item())
         if args.model == "phasenet_prompt":
             metric_logger.update(loss_prompt=output["loss_prompt"].item())
@@ -185,12 +185,12 @@ def train_one_epoch(
                 "train/epoch": epoch,
                 "train/batch": i,
             }
-            if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das", "phasenet_das_plus"]:
+            if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
                 log["train/loss_phase"] = output["loss_phase"].item()
-            if args.model in ["phasenet_plus", "phasenet_tf", "phasenet_tf_plus", "phasenet_prompt", "phasenet_das_plus"]:
+            if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
                 log["train/loss_event_center"] = output["loss_event_center"].item()
                 log["train/loss_event_time"] = output["loss_event_time"].item()
-            if args.model in ["phasenet_plus", "phasenet_tf_plus", "phasenet_prompt"]:
+            if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
                 log["train/loss_polarity"] = output["loss_polarity"].item()
             if args.model == "phasenet_prompt":
                 log["train/loss_prompt"] = output["loss_prompt"].item()

@@ -69,7 +69,7 @@ LABEL_PATH=/global/home/users/zhuwq0/scratch/EQNet/scripts/results/training_v0
 
 torchrun --master_port 29520 --nproc_per_node=4 train.py --model phasenet_das --backbone unet \
     --epochs=10 --batch-size=1 --workers=4 --sync-bn --lr 0.001 \
-    --output=phasenet_das_unet_debug \
+    --output=phasenet_das_unet \
     --data-path "$DATA_PATH" \
     --data-list "$LABEL_PATH/data.txt" \
     --label-path "$LABEL_PATH" \
@@ -80,11 +80,12 @@ torchrun --master_port 29520 --nproc_per_node=4 train.py --model phasenet_das --
     --test-label-list "$LABEL_PATH/labels_test.txt" \
     --test-label-path "$LABEL_PATH" \
     --test-noise-list "$LABEL_PATH/noise_test.txt" \
-    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking \
+    --wandb --wandb-project phasenet-das --wandb-name phasenet_das_unet
 
 
 torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone unet \
-    --epochs=10 --batch-size=1 --workers=1 --sync-bn --lr 0.001 \
+    --epochs=10 --batch-size=1 --workers=4 --sync-bn --lr 0.001 \
     --output=phasenet_das_plus_unet \
     --data-path "${DATA_PATH}" \
     --data-list "${LABEL_PATH}/data.txt" \
@@ -96,7 +97,8 @@ torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_pl
     --test-label-path "${LABEL_PATH}" \
     --test-label-list "${LABEL_PATH}/labels_test.txt" \
     --test-noise-list "$LABEL_PATH/noise_test.txt" \
-    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking \
+    --wandb --wandb-project phasenet-das --wandb-name phasenet_das_plus_unet
 
 
 torchrun --master_port 29522 --nproc_per_node=4 train.py --model phasenet_das --backbone xunet \
@@ -113,7 +115,8 @@ torchrun --master_port 29522 --nproc_per_node=4 train.py --model phasenet_das --
     --test-label-list "$LABEL_PATH/labels_test.txt" \
     --test-label-path "$LABEL_PATH" \
     --test-noise-list "$LABEL_PATH/noise_test.txt" \
-    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking \
+    --wandb --wandb-project phasenet-das --wandb-name phasenet_das_xunet
 
 
 torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone xunet \
@@ -130,4 +133,5 @@ torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_pl
     --test-label-path "${LABEL_PATH}" \
     --test-label-list "${LABEL_PATH}/labels_test.txt" \
     --test-noise-list "${LABEL_PATH}/noise_test.txt" \
-    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking
+    --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking \
+    --wandb --wandb-project phasenet-das --wandb-name phasenet_das_plus_xunet
