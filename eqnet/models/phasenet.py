@@ -41,8 +41,9 @@ class UNetHead(nn.Module):
 
         nx_in, nt_in = inputs.shape[-2:]
         nx_ta, nt_ta = targets.shape[-2:]
-        assert nt_ta == nt_in
-        if nx_ta != nx_in:
+        # assert nt_ta == nt_in
+        # if nx_ta != nx_in:
+        if nx_ta != nx_in or nt_ta != nt_in:
             inputs = F.interpolate(inputs, size=(nx_ta, nt_ta), mode="bilinear", align_corners=False)
 
         if mask is None:
@@ -399,6 +400,10 @@ class PhaseNet(nn.Module):
             features = self.backbone(data)
 
         output = {"loss": 0.0}
+        if self.__class__.__name__ == "PhaseNetDAS":
+            nx, nt = features["phase"].shape[-2:]
+            features["phase"] = F.interpolate(features["phase"], size=(nx//16, nt//4), mode="bilinear", align_corners=False)
+
         output_phase, loss_phase = self.phase_picker(features, phase_pick, mask=phase_mask)
         output["phase"] = output_phase
         if loss_phase is not None:

@@ -39,21 +39,6 @@ class PhaseNetDAS(PhaseNet):
         self.polarity_loss_weight = polarity_loss_weight
 
         if backbone == "unet":
-            # self.backbone = UNet(
-            #     in_channels=1,
-            #     init_features=8,
-            #     # init_stride=(4, 4),
-            #     kernel_size=(7, 7),
-            #     stride=(4, 4),
-            #     padding=(3, 3),
-            #     # moving_norm=(2048, 256),
-            #     upsample="conv_transpose",
-            #     log_scale=log_scale,
-            #     add_stft=add_stft,
-            #     add_polarity=add_polarity,
-            #     add_event=add_event,
-            #     add_prompt=add_prompt,
-            # )
             self.backbone = UNet(
                 channels=1,
                 dim=16,

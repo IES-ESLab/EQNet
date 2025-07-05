@@ -9,6 +9,7 @@ from beartype.typing import Optional, Tuple, Union
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from torch import einsum, nn
+from .unet import moving_normalize, log_transform, STFT
 
 # helper functions
 
@@ -39,44 +40,6 @@ def cast_tuple(val, length=None):
         assert len(output) == length
 
     return output
-
-
-def log_transform(x):
-    x = torch.sign(x) * torch.log(1.0 + torch.abs(x))
-    return x
-
-
-def moving_normalize(data, filter=1024, stride=128):
-    nb, nch, nx, nf, nt = data.shape
-    data = data.view(nb, nch, nx * nf, nt)
-
-    if nt % stride == 0:
-        pad = max(filter - stride, 0)
-    else:
-        pad = max(filter - (nt % stride), 0)
-    pad1 = pad // 2
-    pad2 = pad - pad1
-    # padding = filter // 2
-
-    with torch.no_grad():
-        data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
-        # data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
-        mean = F.avg_pool2d(data_, kernel_size=(1, filter), stride=(1, stride), count_include_pad=False)
-        mean = F.interpolate(mean, scale_factor=(1, stride), mode="bilinear", align_corners=False)[:, :, :nx, :nt]
-        data -= mean
-
-        data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
-        # data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
-        # std = (F.lp_pool2d(data_, norm_type=2, kernel_size=(filter, 1), stride=(stride, 1)) / ((filter) ** 0.5))
-        std = F.avg_pool2d(torch.abs(data_), kernel_size=(1, filter), stride=(1, stride), count_include_pad=False)
-        std = torch.mean(std, dim=(1,), keepdim=True)  ## keep relative amplitude between channels
-        std = F.interpolate(std, scale_factor=(1, stride), mode="bilinear", align_corners=False)[:, :, :nx, :nt]
-        std[std == 0.0] = 1.0
-        data = data / std
-
-        data = data.view(nb, nch, nx, nf, nt)
-
-    return data
 
 
 # helper classes
@@ -135,65 +98,6 @@ class MergeBranch(nn.Module):
 
     def forward(self, x1, x2):
         return self.conv(torch.cat((x1, x2), dim=1))
-
-
-class STFT(nn.Module):
-    def __init__(
-        self,
-        n_fft=64 + 1,
-        hop_length=4,
-        window_fn=torch.hann_window,
-        magnitude=True,
-        normalize_freq=False,
-        discard_zero_freq=True,
-        **kwargs,
-    ):
-        super(STFT, self).__init__()
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.window_fn = window_fn
-        self.magnitude = magnitude
-        self.normalize_freq = normalize_freq
-        self.discard_zero_freq = discard_zero_freq
-        self.register_buffer("window", window_fn(n_fft))
-        self.window_fn = window_fn
-
-    def forward(self, x):
-        """
-        x: bt, ch, nt
-        """
-        nb, nc, ns, nf, nt = x.shape
-        x = x.view(-1, nt)  # nb, ..., nt
-        stft = torch.stft(
-            x,
-            n_fft=self.n_fft,
-            window=self.window,
-            hop_length=self.hop_length,
-            center=True,
-            return_complex=True,
-        )
-        stft = torch.view_as_real(stft)
-        # stft = stft[..., : x.shape[-1] // self.hop_length, :]  # ..., nf, nt, 2
-        # stft = stft[..., :-1, :]
-        if self.discard_zero_freq:
-            stft = stft.narrow(dim=-3, start=1, length=stft.shape[-3] - 1)
-        nf, nt, _ = stft.shape[-3:]
-        if self.magnitude:
-            stft = torch.norm(stft, dim=-1, keepdim=False)  # nb, ...., nf, nt
-            stft = stft.view(nb, nc, ns, nf, nt)  # nb, nc, ns, nf, nt
-        else:
-            stft = stft.view(nb, nc, ns, nf, nt, 2)  # nb, nc, ns, nf, nt, 2
-            stft = stft.permute(0, 1, 5, 2, 3, 4).contiguous().view(nb, nc * 2, ns, nf, nt)  # nb, nc * 2, nt, nf
-
-        if self.normalize_freq:
-            vmax = torch.max(torch.abs(stft), dim=-2, keepdim=True)[0]
-            vmax[vmax == 0.0] = 1.0
-            stft = stft / vmax
-
-        return stft
-
-
-# normalization
 
 
 class Residual(nn.Module):
@@ -508,7 +412,7 @@ class XUnet(nn.Module):
         weight_standardize=False,
         attn_heads: MaybeTuple(int) = 8,
         attn_dim_head: MaybeTuple(int) = 32,
-        moving_norm=(1024, 128),
+        moving_norm=(1024, 256),
         log_scale=False,
         add_stft=False,
         add_polarity=False,
@@ -880,7 +784,10 @@ class XUnet(nn.Module):
             x = downsample(x)
 
         if self.add_stft:
-            x_stft = self.stft(x_origin)
+            nb, nc, nx, nf, nt = x_origin.shape
+            x_stft = rearrange(x_origin, "b c x f t -> (b x f) c t")  # (b x f), c, t
+            x_stft = self.stft(x_stft)  # (b x f), c, nf, t
+            x_stft = rearrange(x_stft, "(b x f) c nf t -> b c x (f nf) t", b=nb, x=nx, f=nf)  # b, x, (f*nf), c, t
             # if self.training:
             if True:
                 sgram = x_stft.clone()

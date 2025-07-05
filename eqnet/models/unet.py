@@ -35,34 +35,43 @@ def log_transform(x):
     return x
 
 
-def moving_normalize(data, filter=1024, stride=128):
-    nb, nch, nx, nt = data.shape
+def moving_normalize(data, filter=1024, stride=256):
+    if len(data.shape) == 5:
+        freq_dim = True
+        nb, nch, nx, nf, nt = data.shape
+        data = data.view(nb, nch, nx * nf, nt)
+    else:
+        freq_dim = False
+        nb, nch, nx, nt = data.shape
 
-    # if nt % stride == 0:
-    #     pad = max(filter - stride, 0)
-    # else:
-    #     pad = max(filter - (nt % stride), 0)
-    # pad1 = pad // 2
-    # pad2 = pad - pad1
-    padding = filter // 2
+    if nt % stride == 0:
+        pad = max(filter - stride, 0)
+    else:
+        pad = max(filter - (nt % stride), 0)
+    pad1 = pad // 2
+    pad2 = pad - pad1
+    # padding = filter // 2
 
     with torch.no_grad():
-        # data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
-        data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
-        mean = F.avg_pool2d(data_, kernel_size=(1, filter), stride=(1, stride))
+        data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
+        # data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
+        mean = F.avg_pool2d(data_, kernel_size=(1, filter), stride=(1, stride), count_include_pad=False)
         mean = F.interpolate(mean, scale_factor=(1, stride), mode="bilinear", align_corners=False)[:, :, :nx, :nt]
         data -= mean
 
-        # data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
-        data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
+        data_ = F.pad(data, (pad1, pad2, 0, 0), mode="reflect")
+        # data_ = F.pad(data, (padding, padding, 0, 0), mode="reflect")
         # std = (F.lp_pool2d(data_, norm_type=2, kernel_size=(filter, 1), stride=(stride, 1)) / ((filter) ** 0.5))
-        std = F.avg_pool2d(torch.abs(data_), kernel_size=(1, filter), stride=(1, stride))
+        std = F.avg_pool2d(torch.abs(data_), kernel_size=(1, filter), stride=(1, stride), count_include_pad=False)
         std = torch.mean(std, dim=(1,), keepdim=True)  ## keep relative amplitude between channels
         std = F.interpolate(std, scale_factor=(1, stride), mode="bilinear", align_corners=False)[:, :, :nx, :nt]
         std[std == 0.0] = 1.0
         data = data / std
 
         # data = log_transform(data)
+
+    if freq_dim:
+        data = data.view(nb, nch, nx, nf, nt)
 
     return data
 
@@ -101,7 +110,7 @@ class MergeBranch(nn.Module):
 class STFT(nn.Module):
     def __init__(
         self,
-        n_fft=128 + 1,
+        n_fft=64 + 1,
         hop_length=4,
         window_fn=torch.hann_window,
         magnitude=True,
@@ -144,7 +153,7 @@ class STFT(nn.Module):
             stft = torch.norm(stft, dim=-1, keepdim=False).view(nb, nc, nf, nt)  # nb, nc, nf, nt
         else:
             stft = stft.view(nb, nc, nf, nt, 2)  # nb, nc, nf, nt, 2
-            stft = stft.permute(0, 1, 4, 2, 3).view(nb, nc * 2, nf, nt)  # nb, nc*2, nf, nt
+            stft = rearrange(stft, "b c nf nt d -> b (c d) nf nt")  # nb, nc*2, nf, nt
 
         if self.normalize_freq:
             vmax = torch.max(torch.abs(stft), dim=-2, keepdim=True)[0]
@@ -328,7 +337,7 @@ class UNet(nn.Module):
         attn_heads=4,
         kernel_size=(1, 7),
         scale_factor=None,
-        moving_norm=(1024, 128),
+        moving_norm=(1024, 256),
         linear_attn=False,
         add_stft=False,
         log_scale=False,

@@ -119,7 +119,7 @@ torchrun --master_port 29522 --nproc_per_node=4 train.py --model phasenet_das --
     --wandb --wandb-project phasenet-das --wandb-name phasenet_das_xunet
 
 
-torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone xunet \
+torchrun --master_port 29523 --nproc_per_node=4 train.py --model phasenet_das_plus --backbone xunet \
     --epochs=10 --batch-size=1 --workers=4 --sync-bn --lr 0.001 \
     --nx 2048 --nt 2048 \
     --output=phasenet_das_plus_xunet \
@@ -135,3 +135,4 @@ torchrun --master_port 29521 --nproc_per_node=4 train.py --model phasenet_das_pl
     --test-noise-list "${LABEL_PATH}/noise_test.txt" \
     --wd=1e-1 --stack-event --stack-noise --resample-space --resample-time --masking \
     --wandb --wandb-project phasenet-das --wandb-name phasenet_das_plus_xunet
+
