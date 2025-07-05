@@ -171,7 +171,7 @@ def train_one_epoch(
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
         if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
             metric_logger.update(loss_phase=output["loss_phase"].item())
-        if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
+        if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus"]:
             metric_logger.update(loss_event_center=output["loss_event_center"].item())
             metric_logger.update(loss_event_time=output["loss_event_time"].item())
         if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
@@ -202,9 +202,6 @@ def train_one_epoch(
         if (i + 1) % 1000 == 0:
             utils.save_on_master(model.state_dict(), os.path.join(args.output_dir, f"model_tmp.pth"))
 
-        # if i > 500:
-        #     break
-
     plot_results(meta, model, output, args, epoch, "train")
     del meta, output, loss
 
@@ -220,20 +217,20 @@ def plot_results(meta, model, output, args, epoch, prefix=""):
 
         if args.model == "phasenet_tf":
             phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            event_center = torch.sigmoid(output["event_center"]).cpu().float()
-            event_time = output["event_time"].cpu().float()
+            #event_center = torch.sigmoid(output["event_center"]).cpu().float()
+            #event_time = output["event_time"].cpu().float()
             meta["spectrogram"] = output["spectrogram"].cpu().float()
             print("Plotting...")
             eqnet.utils.plot_phasenet_tf_train(
                 meta,
                 phase,
-                event_center=event_center,
-                event_time=event_time,
+                event_center=None,#event_center,
+                event_time=None,#event_time,
                 epoch=epoch,
                 figure_dir=args.figure_dir,
                 prefix=prefix,
             )
-            del phase, event_center, event_time
+            del phase#, event_center, event_time
 
         elif args.model == "phasenet_plus":
             phase = torch.softmax(output["phase"], dim=1).cpu().float()
@@ -623,18 +620,18 @@ def main(args):
             checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         elif os.path.isfile(args.output_dir + "/checkpoint.pth"):
             print(f"Loading model and optimizer from checkpoint '{args.output_dir}/checkpoint.pth'")
-            checkpoint = torch.load(args.output_dir + "/checkpoint.pth", map_location="cpu")
+            checkpoint = torch.load(args.output_dir + "/checkpoint.pth", map_location="cpu", weights_only=False)
         else:
             print(f"No checkpoint found")
         if checkpoint is not None:
             model_without_ddp.load_state_dict(checkpoint["model"])
-        #     optimizer.load_state_dict(checkpoint["optimizer"])
-        #     lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-        #     args.start_epoch = checkpoint["epoch"] + 1
-        #     if model_ema:
-        #         model_ema.load_state_dict(checkpoint["model_ema"])
-        #     if scaler:
-        #         scaler.load_state_dict(checkpoint["scaler"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            args.start_epoch = checkpoint["epoch"] + 1
+            if model_ema:
+                model_ema.load_state_dict(checkpoint["model_ema"])
+            if scaler:
+                scaler.load_state_dict(checkpoint["scaler"])
 
     start_time = time.time()
     best_loss = float("inf")

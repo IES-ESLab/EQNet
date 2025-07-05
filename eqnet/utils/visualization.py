@@ -404,17 +404,18 @@ def plot_phasenet_tf_train(meta, phase, event_center, event_time, epoch=0, figur
         axes[idx].grid("on")
 
         idx = 7
-        axes[idx].plot(event_center[i, 0, 0, :], "b")
-        axes[idx].plot(meta["event_center"][i, 0, 0, :], "--C0")
-        axes[idx].plot(meta["event_mask"][i, 0, 0, :], ":", color="gray")
-        axes[idx].set_ylim(-0.05, 1.05)
-        axes[idx].autoscale(enable=True, axis="x", tight=True)
-        axes[idx].set_xticklabels([])
-        axes[idx].grid("on")
+        if event_center is not None:
+            axes[idx].plot(event_center[i, 0, 0, :], "b")
+            axes[idx].plot(meta["event_center"][i, 0, 0, :], "--C0")
+            axes[idx].plot(meta["event_mask"][i, 0, 0, :], ":", color="gray")
+            axes[idx].set_ylim(-0.05, 1.05)
+            axes[idx].autoscale(enable=True, axis="x", tight=True)
+            axes[idx].set_xticklabels([])
+            axes[idx].grid("on")
 
-        axes2 = axes[idx].twinx()
-        axes2.plot(event_time[i, 0, 0, :], "--C1")
-        axes2.plot(meta["event_time"][i, 0, 0, :], ":C3")
+            axes2 = axes[idx].twinx()
+            axes2.plot(event_time[i, 0, 0, :], "--C1")
+            axes2.plot(meta["event_time"][i, 0, 0, :], ":C3")
 
         if "RANK" in os.environ:
             rank = int(os.environ["RANK"])
