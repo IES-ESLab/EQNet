@@ -15,7 +15,6 @@ class PhaseNetDAS(PhaseNet):
         event_center_loss_weight=1.0,
         event_time_loss_weight=1.0,
         polarity_loss_weight=1.0,
-        *args,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -28,7 +27,6 @@ class PhaseNetDAS(PhaseNet):
             event_center_loss_weight=event_center_loss_weight,
             event_time_loss_weight=event_time_loss_weight,
             polarity_loss_weight=polarity_loss_weight,
-            *args,
             **kwargs,
         )
         self.backbone_name = backbone

@@ -298,6 +298,7 @@ class PhaseNet(nn.Module):
         event_time_loss_weight=1.0,
         polarity_loss_weight=1.0,
         prompt_loss_weight=1.0,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.backbone_name = backbone
