@@ -267,18 +267,18 @@ def extract_events(
                             ## calculate PS ratio
                             ps_delta = max(
                                 2,
-                                event_time[i, 0, index.item(), k].item() * 2.0 * (VPVS_RATIO - 1) / (VPVS_RATIO + 1),
+                                event_time[i, 0, k, index.item()].item() * 2.0 * (VPVS_RATIO - 1) / (VPVS_RATIO + 1),
                             )  # 2 is to prevent error of torch.max()
                             itp = max(
                                 0, index.item() * event_scale - int(ps_delta * 0.5)
                             )  # waveform is not downsampled
                             its = max(0, index.item() * event_scale + int(ps_delta * 0.5))
 
-                            # p_amp = torch.max(torch.abs(waveform[i, :, itp : min(itp + p_window, its), k]))
-                            # s_amp = torch.max(torch.abs(waveform[i, :, its : its + s_window, k]))
-                            waveform_cut = waveform[i, :, itp : min(itp + p_window, its), k]
+                            # p_amp = torch.max(torch.abs(waveform[i, :, k, itp : min(itp + p_window, its)]))
+                            # s_amp = torch.max(torch.abs(waveform[i, :, k, its : its + s_window]))
+                            waveform_cut = waveform[i, :, k, itp : min(itp + p_window, its)]
                             p_amp = torch.max(waveform_cut) - torch.min(waveform_cut)
-                            waveform_cut = waveform[i, :, its : its + s_window, k]
+                            waveform_cut = waveform[i, :, k, its : its + s_window]
                             if waveform_cut.numel() == 0:
                                 s_amp = torch.tensor(0.0)
                             else:
@@ -287,7 +287,7 @@ def extract_events(
 
                             ## calculate event amplitude
                             # event_amp = torch.max(torch.abs(waveform[i, :, itp : its + (its - itp), k]))
-                            waveform_cut = waveform[i, :, itp : its + (its - itp), k]
+                            waveform_cut = waveform[i, :, k, itp : its + (its - itp)]
                             event_amp = (torch.max(torch.abs(waveform_cut)) - torch.min(torch.abs(waveform_cut))) / 2.0
                             event_dict["event_amplitude"] = event_amp.item()
 
