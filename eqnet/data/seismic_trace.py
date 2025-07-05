@@ -517,8 +517,6 @@ class SeismicTraceIterableDataset(IterableDataset):
             self.picks_dict = self.picks_dict[['event_id', 'station_id', 'instrument']]
             self.picks_dict['trace_id'] = self.picks_dict.apply(lambda x: f"{x['event_id']}/{x['station_id']}", axis=1)
             
-            self.picks_dict = self.picks_dict[~self.picks_dict['trace_id'].isin(self.ill_traces)]
-            
             if self.stack_strategy == 'same_sensor':
                 self.trace2trace_dict = self.picks_dict.groupby('instrument')['trace_id'].apply(list).to_dict()
             elif self.stack_strategy == 'same_station':
