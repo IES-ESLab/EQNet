@@ -3,7 +3,7 @@ from typing import Tuple
 
 import torch
 from torch import Tensor
-from torchvision.transforms import functional as F
+import torch.nn.functional as F
 
 
 def log_transform(x):
