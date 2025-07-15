@@ -301,7 +301,7 @@ class PhaseNet(nn.Module):
         prompt_loss_weight=1.0,
         **kwargs,
     ) -> None:
-        super().__init__()
+        super().__init__(**kwargs)
         self.backbone_name = backbone
         self.add_stft = add_stft
         self.add_event = add_event
