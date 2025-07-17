@@ -37,6 +37,12 @@ logger = logging.getLogger()
 
 def postprocess(meta, output, polarity_scale=1, event_scale=16, spectrogram_scale=4):
     nt, nx = meta["nt"], meta["nx"]
+    try:
+        assert torch.all(nt==nt[0])
+        assert torch.all(nx==nx[0])
+        nt, nx = nt[0], nx[0]
+    except:
+        pass
     # data = meta["data"][:, :, :nt, :nx]
     data = meta["data"][:, :, :nx, :nt]
     # data = moving_normalize(data)

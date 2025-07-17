@@ -383,9 +383,12 @@ class PhaseNet(nn.Module):
         if "event_center_mask" in batched_inputs:
             event_center_mask = batched_inputs["event_center_mask"].to(self.device)
             event_time_mask = batched_inputs["event_time_mask"].to(self.device)
-        else:
+        elif "event_mask" in batched_inputs:
             event_center_mask = batched_inputs["event_mask"].to(self.device)
             event_time_mask = batched_inputs["event_mask"].to(self.device)
+        else:
+            event_center_mask = None
+            event_time_mask = None
         polarity = batched_inputs["polarity"].to(self.device) if "polarity" in batched_inputs else None
         polarity_mask = batched_inputs["polarity_mask"].to(self.device) if "polarity_mask" in batched_inputs else None
         prompt_center = batched_inputs["prompt_center"].float() if "prompt_center" in batched_inputs else None
