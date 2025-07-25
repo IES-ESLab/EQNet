@@ -4,10 +4,10 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .prompt import MaskDecoder, PromptEncoder, TwoWayTransformer
 from .resnet1d import BasicBlock, Bottleneck, ResNet
 from .unet import UNet
 from .x_unet import XUnet
-from .prompt import MaskDecoder, PromptEncoder, TwoWayTransformer
 
 
 class UNetHead(nn.Module):
@@ -22,7 +22,6 @@ class UNetHead(nn.Module):
         )
 
     def forward(self, features, targets=None, mask=None):
-
         x = features[self.feature_name]
         x = self.layers(x)
 
@@ -51,7 +50,6 @@ class UNetHead(nn.Module):
                 min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
                 loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
                 loss = loss.mean()
-                
 
                 # inputs = torch.sigmoid(inputs)
                 # loss = F.kl_div(inputs.log(), targets, reduction="none") + F.kl_div(
@@ -61,7 +59,7 @@ class UNetHead(nn.Module):
                 # loss = loss.mean()
 
             else:
-                min_loss = -(targets * log_targets).sum(dim=1) # cross_entropy sum over dim=1
+                min_loss = -(targets * log_targets).sum(dim=1)  # cross_entropy sum over dim=1
                 loss = F.cross_entropy(inputs, targets, reduction="none") - min_loss
                 loss = loss.mean()
 
@@ -79,11 +77,12 @@ class UNetHead(nn.Module):
             if mask_sum == 0.0:
                 mask_sum = 1.0
 
-            
             if self.out_channels == 1:
                 min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
                 loss = (
-                    torch.sum((F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss) * mask)
+                    torch.sum(
+                        (F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss) * mask
+                    )
                     / mask_sum
                 )
 
@@ -175,7 +174,9 @@ class EventHead(nn.Module):
 
 
 class PromptHead(nn.Module):
-    def __init__(self, prompt_embed_dim=32 * 4, input_size=[8, 16 * 16], embedding_size=[8, 16], feature_name="prompt"):
+    def __init__(
+        self, prompt_embed_dim=32 * 4, input_size=[8, 16 * 16], embedding_size=[8, 16], feature_name="prompt"
+    ):
         super().__init__()
 
         self.prompt_embed_dim = prompt_embed_dim
@@ -203,7 +204,6 @@ class PromptHead(nn.Module):
         )
 
     def forward(self, features, points, pos, targets=None):
-
         B, S, T, _ = pos.shape
 
         pos = pos.view(B, S * T, 3)
@@ -264,7 +264,6 @@ class PromptHead(nn.Module):
         return low_res_masks, loss
 
     def losses(self, inputs, targets):
-
         inputs = inputs.float()
         prob = inputs.sigmoid()
 
@@ -325,7 +324,7 @@ class PhaseNet(nn.Module):
             self.backbone = UNet(
                 channels=3,
                 dim=16,
-                out_dim=32,
+                out_dim=16,
                 log_scale=log_scale,
                 add_stft=add_stft,
                 add_polarity=add_polarity,
@@ -347,14 +346,14 @@ class PhaseNet(nn.Module):
             raise ValueError("backbone only supports unet or xunet")
 
         if backbone == "unet":
-            self.phase_picker = UNetHead(32, 3, feature_name="phase")
+            self.phase_picker = UNetHead(16, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
+                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(32, 1, feature_name="event")
-                self.event_timer = EventHead(32, 1, feature_name="event")
+                self.event_detector = UNetHead(16, 1, feature_name="event")
+                self.event_timer = EventHead(16, 1, feature_name="event")
             if self.add_prompt:
-                self.prompt_picker = PromptHead(prompt_embed_dim=64, feature_name="prompt")
+                self.prompt_picker = PromptHead(prompt_embed_dim=32, feature_name="prompt")
 
         elif backbone == "xunet":
             self.phase_picker = UNetHead(64, 3, feature_name="phase")
@@ -395,7 +394,7 @@ class PhaseNet(nn.Module):
         if self.__class__.__name__ not in ["PhaseNetDAS"]:
             phase_mask = None
             event_center_mask = None
-            
+
         if self.backbone_name == "swin2":
             station_location = batched_inputs["station_location"].to(self.device)
             features = self.backbone(data, station_location)
@@ -405,7 +404,9 @@ class PhaseNet(nn.Module):
         output = {"loss": 0.0}
         if self.__class__.__name__ == "PhaseNetDAS":
             nx, nt = features["phase"].shape[-2:]
-            features["phase"] = F.interpolate(features["phase"], size=(nx//16, nt//4), mode="bilinear", align_corners=False)
+            features["phase"] = F.interpolate(
+                features["phase"], size=(nx // 16, nt // 4), mode="bilinear", align_corners=False
+            )
 
         output_phase, loss_phase = self.phase_picker(features, phase_pick, mask=phase_mask)
         output["phase"] = output_phase
@@ -425,7 +426,9 @@ class PhaseNet(nn.Module):
             output["spectrogram"] = features["spectrogram"]
 
         if self.add_event:
-            output_event_center, loss_event_center = self.event_detector(features, event_center, mask=event_center_mask)
+            output_event_center, loss_event_center = self.event_detector(
+                features, event_center, mask=event_center_mask
+            )
             output["event_center"] = output_event_center
             if loss_event_center is not None:
                 output["loss_event_center"] = loss_event_center * self.event_center_loss_weight

@@ -1,20 +1,19 @@
 # U-Net implementation adapted from: https://github.com/lucidrains/denoising-diffusion-pytorch/blob/main/denoising_diffusion_pytorch/classifier_free_guidance.py
-import math
 import copy
+import math
+import time
+from collections import namedtuple
+from functools import partial
+from multiprocessing import cpu_count
 from pathlib import Path
 from random import random
-from functools import partial
-from collections import namedtuple
-from multiprocessing import cpu_count
 
 import torch
-from torch import nn, einsum
 import torch.nn.functional as F
-from torch.amp import autocast
-
 from einops import rearrange
 from einops.layers.torch import Rearrange
-
+from torch import einsum, nn
+from torch.amp import autocast
 from tqdm.auto import tqdm
 
 # helpers functions
@@ -186,12 +185,10 @@ class Residual(nn.Module):
 
 
 def Upsample(dim, dim_out, stride=(1, 4)):
-
     return nn.ConvTranspose2d(dim, dim_out, stride, stride)
 
 
 def Downsample(dim, dim_out, stride=(1, 4)):
-
     return nn.Sequential(
         Rearrange("b c (h s1) (w s2) -> b (c s1 s2) h w", s1=stride[0], s2=stride[1]),
         nn.Conv2d(dim * stride[0] * stride[1], dim_out, 1),
@@ -228,43 +225,22 @@ class Block(nn.Module):
         self.norm = RMSNorm(dim_out)
         self.act = nn.SiLU()
 
-    def forward(self, x, scale_shift=None):
+    def forward(self, x):
         x = self.proj(x)
         x = self.norm(x)
-
-        if exists(scale_shift):
-            scale, shift = scale_shift
-            x = x * (scale + 1) + shift
-
         x = self.act(x)
         return x
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, kernel_size=(1, 7), padding=(0, 3), time_emb_dim=None, classes_emb_dim=None):
+    def __init__(self, dim, dim_out, kernel_size=(1, 7), padding=(0, 3)):
         super().__init__()
-        self.mlp = (
-            nn.Sequential(nn.SiLU(), nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2))
-            if exists(time_emb_dim) or exists(classes_emb_dim)
-            else None
-        )
-
         self.block1 = Block(dim, dim_out, kernel_size=kernel_size, padding=padding)
         self.block2 = Block(dim_out, dim_out, kernel_size=kernel_size, padding=padding)
         self.res_conv = nn.Conv2d(dim, dim_out, (1, 1)) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb=None, class_emb=None):
-
-        scale_shift = None
-        if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
-            cond_emb = tuple(filter(exists, (time_emb, class_emb)))
-            cond_emb = torch.cat(cond_emb, dim=-1)
-            cond_emb = self.mlp(cond_emb)
-            cond_emb = rearrange(cond_emb, "b c -> b c 1 1")
-            scale_shift = cond_emb.chunk(2, dim=1)
-
-        h = self.block1(x, scale_shift=scale_shift)
-
+    def forward(self, x):
+        h = self.block1(x)
         h = self.block2(h)
 
         return h + self.res_conv(x)
@@ -638,30 +614,70 @@ class UNet(nn.Module):
 # example
 
 if __name__ == "__main__":
+    import time
 
     from torchinfo import summary
-    from torchviz import make_dot
+    # from torchviz import make_dot
 
     model = UNet(
-        dim=8,
+        dim=16,
         out_dim=16,
-        dim_mults=(1, 2, 4, 8),
+        dim_mults=(1, 2, 4, 4),
         add_polarity=True,
         add_event=True,
-        add_stft=True,
+        add_stft=False,
         linear_attn=False,
     )
 
     # print(model)
-    data = torch.randn(7, 3, 1, 4096)
+    dtype = torch.float32
+    data = torch.randn(1, 3, 1, 3600 * 24 * 64, dtype=dtype)
+    t0 = time.time()
 
-    summary(model, input_size=data.shape, depth=5)
+    # summary(model, input_size=data.shape, depth=5)
 
+    print(f"===================================================")
     model.to("cpu")
+    model.to(dtype)
     out = model(data)
+    print(f"CPU: {time.time() - t0:.2f} s")
+    t0 = time.time()
 
-    dot = make_dot(out["phase"], params=dict(model.named_parameters()))
-    dot.render("unet", format="png")
+    print(f"===================================================")
+    if torch.backends.mps.is_available():
+        model = model.to("mps")
+        data = data.to("mps")
+        out = model(data)
+        print("MPS available")
+        print(f"MPS: {time.time() - t0:.2f} s")
+    elif torch.cuda.is_available():
+        model = model.to("cuda")
+        data = data.to("cuda")
+        out = model(data)
+        print("CUDA available")
+        print(f"CUDA: {time.time() - t0:.2f} s")
+    t0 = time.time()
+
+    # model = torch.compile(model, backend="aot_eager")
+    # out = model(data)
+    # print(f"Compiled: {time.time() - t0:.2f} s")
+    # t0 = time.time()
+
+    # if torch.backends.mps.is_available():
+    #     model = model.to("mps")
+    #     data = data.to("mps")
+    #     out = model(data)
+    #     print("MPS available")
+    #     print(f"MPS: {time.time() - t0:.2f} s")
+    # elif torch.cuda.is_available():
+    #     print("CUDA available")
+    #     model = model.to("cuda")
+    #     data = data.to("cuda")
+    #     out = model(data)
+    #     print(f"CUDA: {time.time() - t0:.2f} s")
+
+    # dot = make_dot(out["phase"], params=dict(model.named_parameters()))
+    # dot.render("unet", format="png")
 
     # for k, v in out.items():
     #     if v is not None:
