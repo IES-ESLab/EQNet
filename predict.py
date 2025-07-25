@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 import eqnet
 import utils
-import wandb
 from eqnet.data import DASIterableDataset, SeismicNetworkIterableDataset, SeismicTraceIterableDataset
 from eqnet.models.unet import moving_normalize
 from eqnet.utils import (
