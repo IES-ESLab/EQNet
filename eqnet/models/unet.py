@@ -312,9 +312,11 @@ class UNet(nn.Module):
         attn_dim_head=32,
         attn_heads=4,
         kernel_size=(1, 7),
-        scale_factor=None,
+        scale_factors=None,
         moving_norm=(1024, 256),
         linear_attn=False,
+        middle_attn=False,
+        dual_block=False,
         add_stft=False,
         log_scale=False,
         add_polarity=False,
@@ -325,16 +327,15 @@ class UNet(nn.Module):
 
         self.kernel_size = kernel_size
         self.padding = tuple(k // 2 for k in kernel_size)
-        self.scale_factor = (
-            [tuple(map(lambda k: k // 2 + 1, kernel_size))] * 4 if scale_factor is None else scale_factor
-        )
         self.moving_norm = moving_norm
         self.log_scale = log_scale
         self.add_stft = add_stft
         self.add_polarity = add_polarity
         self.add_event = add_event
         self.add_prompt = add_prompt
-        self.linear_attn = linear_attn
+        self.add_linear_attn = linear_attn
+        self.add_mid_attn = middle_attn
+        self.add_dual_block = dual_block
 
         # determine dimensions
 
@@ -344,8 +345,13 @@ class UNet(nn.Module):
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, kernel_size=self.kernel_size, padding=self.padding)
 
-        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
-        in_out = list(zip(dims[:-1], dims[1:]))
+        self.num_resolutions = len(dim_mults)
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]  # (16, 16, 32, 64, 64)
+        in_out = list(zip(dims[:-1], dims[1:]))  # (16, 16), (16, 32), (32, 64), (64, 64)
+        scale_factors = (
+            [tuple(map(lambda k: k // 2 + 1, kernel_size))] * len(in_out) if scale_factors is None else scale_factors
+        )
+        self.scale_factors = scale_factors  # (1, 4), (1, 4), (1, 4), (1, 4)
 
         # layers
 
@@ -362,11 +368,11 @@ class UNet(nn.Module):
                         ResnetBlock(dim_in, dim_in, kernel_size=self.kernel_size, padding=self.padding),
                         (
                             ResnetBlock(dim_in, dim_in, kernel_size=self.kernel_size, padding=self.padding)
-                            if self.linear_attn
+                            if self.add_dual_block
                             else nn.Identity()
                         ),
-                        Residual(PreNorm(dim_in, LinearAttention(dim_in))) if self.linear_attn else nn.Identity(),
-                        (Downsample(dim_in, dim_out, self.scale_factor[ind])),
+                        Residual(PreNorm(dim_in, LinearAttention(dim_in))) if self.add_linear_attn else nn.Identity(),
+                        (Downsample(dim_in, dim_out, self.scale_factors[ind])),
                     ]
                 )
             )
@@ -375,30 +381,30 @@ class UNet(nn.Module):
         self.mid_block1 = ResnetBlock(mid_dim, mid_dim, kernel_size=self.kernel_size, padding=self.padding)
         self.mid_attn = (
             Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head=attn_dim_head, heads=attn_heads)))
-            if self.linear_attn
+            if self.add_linear_attn
             else nn.Identity()
         )
         self.mid_block2 = (
             ResnetBlock(mid_dim, mid_dim, kernel_size=self.kernel_size, padding=self.padding)
-            if self.linear_attn
+            if self.add_dual_block
             else nn.Identity()
         )
-        self.mid_upsample = Upsample(mid_dim, dims[-2], stride=self.scale_factor[-1])
+        self.mid_upsample = Upsample(mid_dim, dims[-2], stride=self.scale_factors[-1])
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[:-1])):
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
             self.ups.append(
                 nn.ModuleList(
                     [
-                        ResnetBlock(dim_out * 2, dim_out, kernel_size=self.kernel_size, padding=self.padding),
+                        ResnetBlock(dim_out + dim_in, dim_out, kernel_size=self.kernel_size, padding=self.padding),
                         (
-                            ResnetBlock(dim_out * 2, dim_out, kernel_size=self.kernel_size, padding=self.padding)
-                            if self.linear_attn
+                            ResnetBlock(dim_out + dim_in, dim_out, kernel_size=self.kernel_size, padding=self.padding)
+                            if self.add_dual_block
                             else nn.Identity()
                         ),
-                        Residual(PreNorm(dim_out, LinearAttention(dim_out))) if self.linear_attn else nn.Identity(),
+                        Residual(PreNorm(dim_out, LinearAttention(dim_out))) if self.add_linear_attn else nn.Identity(),
                         (
-                            Upsample(dim_out, dim_in, self.scale_factor[ind])
+                            Upsample(dim_out, dim_in, self.scale_factors[ind])
                             if not is_last
                             else nn.Conv2d(dim_out, dim_in, 1)
                         ),
@@ -416,39 +422,46 @@ class UNet(nn.Module):
 
         ## Polarity
         if self.add_polarity:
+            self.polarity_feature_level = 1
+            dim_in, dim_out = in_out[self.polarity_feature_level]  # (16, 32)
             self.polarity_init = nn.Conv2d(1, init_dim, kernel_size=self.kernel_size, padding=self.padding)
-            dim_in, dim_out = dims[0], dims[1]
             self.polarity_encoder = nn.ModuleList(
                 [
                     nn.ModuleList(
                         [
-                            ResnetBlock(dim_in, dim_in, kernel_size=self.kernel_size, padding=self.padding),
+                            ResnetBlock(init_dim, dim_in, kernel_size=self.kernel_size, padding=self.padding),
                             (
                                 ResnetBlock(dim_in, dim_in, kernel_size=self.kernel_size, padding=self.padding)
-                                if self.linear_attn
+                                if self.add_dual_block
                                 else nn.Identity()
                             ),
-                            Residual(PreNorm(dim_in, LinearAttention(dim_in))) if self.linear_attn else nn.Identity(),
+                            Residual(PreNorm(dim_in, LinearAttention(dim_in)))
+                            if self.add_linear_attn
+                            else nn.Identity(),
                         ]
                     )
                 ]
             )
+            self.polarity_upsample = Upsample(
+                dim_out, dim_in, stride=self.scale_factors[self.polarity_feature_level - 1]
+            )
             self.polarity_final = ResnetBlock(
-                dim_in * 2, self.out_dim, kernel_size=self.kernel_size, padding=self.padding
+                dim_in * 2,
+                self.out_dim,
+                kernel_size=self.kernel_size,
+                padding=self.padding,
             )
 
         ## Event
         if self.add_event:
             self.event_feature_level = 3
-            dim_in, dim_out = dims[self.event_feature_level], dims[self.event_feature_level + 1]
-            self.event_final = nn.Sequential(
-                ResnetBlock(dim_in, dim_in, kernel_size=self.kernel_size, padding=self.padding),
-                Upsample(dim_in, self.out_dim, stride=self.scale_factor[self.event_feature_level]),
-            )
+            dim_in, dim_out = in_out[self.event_feature_level]  # (64, 64)
+            self.event_upsample = Upsample(dim_out, dim_in, stride=self.scale_factors[self.event_feature_level - 1])
+            self.event_final = ResnetBlock(dim_out, out_dim, kernel_size=self.kernel_size, padding=self.padding)
 
         ## STFT
         if self.add_stft:
-            self.stft = STFT(n_fft=64 + 1, hop_length=self.scale_factor[0][-1])
+            self.stft = STFT(n_fft=64 + 1, hop_length=self.scale_factors[0][-1])
             self.kernel_size_stft = [3, self.kernel_size[1]]
             self.padding_stft = [1, self.padding[1]]
             self.spec_init = nn.Sequential(
@@ -471,11 +484,13 @@ class UNet(nn.Module):
                                 ResnetBlock(
                                     dim_in, dim_in, kernel_size=self.kernel_size_stft, padding=self.padding_stft
                                 )
-                                if self.linear_attn
+                                if self.add_dual_block
                                 else nn.Identity()
                             ),
-                            Residual(PreNorm(dim_in, LinearAttention(dim_in))) if self.linear_attn else nn.Identity(),
-                            Downsample(dim_in, dim_out, self.scale_factor[ind]),
+                            Residual(PreNorm(dim_in, LinearAttention(dim_in)))
+                            if self.add_linear_attn
+                            else nn.Identity(),
+                            Downsample(dim_in, dim_out, self.scale_factors[ind]),
                             MergeFrequency(32),
                             MergeBranch(dim_in * 2, dim_in),
                         ]
@@ -505,12 +520,13 @@ class UNet(nn.Module):
         r = x.clone()
 
         h = []
+        features = []
 
         for block1, block2, attn, downsample in self.downs:
             x = block1(x)
             h.append(x)
 
-            if self.linear_attn:
+            if self.add_dual_block:
                 x = block2(x)
                 x = attn(x)
                 h.append(x)
@@ -527,14 +543,14 @@ class UNet(nn.Module):
             else:
                 sgram = None
             x_stft = self.spec_init(x_stft)
-            step = 2 if self.linear_attn else 1
+            step = 2 if self.add_dual_block else 1
             for i, (block1, block2, attn, downsample, merge_freq, merge_branch) in enumerate(self.spec_down):
                 x_stft = block1(x_stft)  # nb*nx, nc, nf, nt
                 x_stft_m = merge_freq(x_stft)  # nb*nx, nc, nt
                 x_stft_m = x_stft_m.view(nb, nx, *x_stft_m.shape[-2:]).permute(0, 2, 1, 3)  # nb, nc, nx, nt
                 h[(i + 1) * step] = merge_branch(h[(i + 1) * step], x_stft_m)
 
-                if self.linear_attn:
+                if self.add_dual_block:
                     x_stft = block2(x_stft)
                     x_stft_m = merge_freq(x_stft)  # nb*nx, nc, nt
                     x_stft_m = x_stft_m.view(nb, nx, *x_stft_m.shape[-2:]).permute(0, 2, 1, 3)  # nb, nc, nx, nt
@@ -557,34 +573,33 @@ class UNet(nn.Module):
         else:
             out_prompt = None
 
+        features.append(x)
         x = self.mid_upsample(x)
 
-        feature_level = 3
-        for block1, block2, attn, upsample in self.ups:
+        for i, (block1, block2, attn, upsample) in enumerate(self.ups):
             x = torch.cat((x, h.pop()), dim=1)
             x = block1(x)
 
-            if self.linear_attn:
+            if self.add_dual_block:
                 x = torch.cat((x, h.pop()), dim=1)
                 x = block2(x)
                 x = attn(x)
 
-            if self.add_event and (feature_level == self.event_feature_level):
-                x_event = x.clone()
-
+            features.insert(0, x)
             x = upsample(x)
 
-            feature_level -= 1
+        ### heavy computing
+        # if self.add_polarity:
+        #     x_polarity_aux = x.clone()
 
-        if self.add_polarity:
-            x_polarity_aux = x.clone()
-
-        x = torch.cat((x, r), dim=1)
-        # x = torch.cat((x, h.pop()), dim=1)
+        # x = torch.cat((x, r), dim=1)
 
         # x = self.final_res_block(x)
         # out_phase = self.final_conv(x)
-        out_phase = self.final_res_block(x)
+        # out_phase = self.final_res_block(x)
+
+        ### simplify
+        out_phase = x
 
         # polarity
         if self.add_polarity:
@@ -593,6 +608,7 @@ class UNet(nn.Module):
                 x_polarity = block2(x_polarity)
                 x_polarity = attn(x_polarity)
 
+            x_polarity_aux = self.polarity_upsample(features[self.polarity_feature_level])
             x_polarity = torch.cat((x_polarity, x_polarity_aux), dim=1)
             out_polarity = self.polarity_final(x_polarity)
         else:
@@ -600,11 +616,13 @@ class UNet(nn.Module):
 
         # event
         if self.add_event:
+            x_event = self.event_upsample(features[self.event_feature_level])
             out_event = self.event_final(x_event)
         else:
             out_event = None
 
         out = {"phase": out_phase, "polarity": out_polarity, "event": out_event, "prompt": out_prompt}
+
         # if self.add_stft and self.training:
         if self.add_stft:
             out["spectrogram"] = sgram.squeeze(2)  ## nb, nc, nx, nf, nt -> nb, nc, nf, nt
@@ -625,38 +643,46 @@ if __name__ == "__main__":
         dim_mults=(1, 2, 4, 4),
         add_polarity=True,
         add_event=True,
-        add_stft=False,
-        linear_attn=False,
+        add_stft=True,
+        add_prompt=True,
     )
 
     # print(model)
     dtype = torch.float32
-    data = torch.randn(1, 3, 1, 3600 * 24 * 64, dtype=dtype)
-    t0 = time.time()
+    data = torch.randn(1, 3, 1, 1024, dtype=dtype)
+    summary(model, input_size=data.shape, depth=5)
 
-    # summary(model, input_size=data.shape, depth=5)
-
-    print(f"===================================================")
-    model.to("cpu")
-    model.to(dtype)
+    model.to
     out = model(data)
-    print(f"CPU: {time.time() - t0:.2f} s")
-    t0 = time.time()
 
-    print(f"===================================================")
-    if torch.backends.mps.is_available():
-        model = model.to("mps")
-        data = data.to("mps")
-        out = model(data)
-        print("MPS available")
-        print(f"MPS: {time.time() - t0:.2f} s")
-    elif torch.cuda.is_available():
-        model = model.to("cuda")
-        data = data.to("cuda")
-        out = model(data)
-        print("CUDA available")
-        print(f"CUDA: {time.time() - t0:.2f} s")
-    t0 = time.time()
+    # # print(model)
+    # dtype = torch.bfloat16
+    # data = torch.randn(1, 3, 1, 3600 * 24 * 100, dtype=dtype)
+    # t0 = time.time()
+
+    # print(f"===================================================")
+    # model.to("cpu")
+    # model.to(dtype)
+    # out = model(data)
+    # print(f"CPU: {time.time() - t0:.2f} s")
+    # t0 = time.time()
+    # del out
+
+    # print(f"===================================================")
+    # if torch.backends.mps.is_available():
+    #     model = model.to("mps")
+    #     data = data.to("mps")
+    #     out = model(data)
+    #     print("MPS available")
+    #     print(f"MPS: {time.time() - t0:.2f} s")
+    # elif torch.cuda.is_available():
+    #     model = model.to("cuda")
+    #     data = data.to("cuda")
+    #     out = model(data)
+    #     print("CUDA available")
+    #     print(f"CUDA: {time.time() - t0:.2f} s")
+    # t0 = time.time()
+    # del out
 
     # model = torch.compile(model, backend="aot_eager")
     # out = model(data)
@@ -707,7 +733,11 @@ if __name__ == "__main__":
     #     dim = 8,
     #     out_dim=16,
     #     dim_mults = (1, 2, 4, 8),
-    #     linear_attn=True,
+    #     add_linear_attn=True,
     # ).cuda()
 
     # summary(model, input_size=(7, 3, 1, 128), depth=5)
+
+    for k, v in out.items():
+        if v is not None:
+            print(f"{k}: {v.shape}")

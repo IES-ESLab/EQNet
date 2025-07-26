@@ -9,7 +9,7 @@ from beartype.typing import Optional, Tuple, Union
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from torch import einsum, nn
-from .unet import moving_normalize, log_transform, STFT
+from unet import STFT, log_transform, moving_normalize
 
 # helper functions
 
@@ -55,7 +55,6 @@ def cast_tuple(val, length=None):
 
 
 def Upsample(dim, dim_out, stride=(1, 1, 4)):
-
     kernel_size = tuple(s * 2 if s > 1 else 1 for s in stride)
     padding = tuple(s // 2 for s in stride)
 
@@ -64,7 +63,6 @@ def Upsample(dim, dim_out, stride=(1, 1, 4)):
 
 
 def Downsample(dim, dim_out, stride=(1, 1, 4)):
-
     return nn.Sequential(
         Rearrange("b c (f s1) (h s2) (w s3) -> b (c s1 s2 s3) f h w", s1=stride[0], s2=stride[1], s3=stride[2]),
         nn.Conv3d(dim * stride[0] * stride[1] * stride[2], dim_out, 1),
@@ -245,7 +243,8 @@ class ConvNextBlock(nn.Module):
         super().__init__()
         kernel_conv_kwargs = partial(kernel_and_same_pad, kernel_size[0])
 
-        init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+        # init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+        init_kernel_size = kernel_size
         self.ds_conv = nn.Conv3d(dim, dim, **kernel_conv_kwargs(init_kernel_size[1], init_kernel_size[2]), groups=dim)
 
         inner_dim = dim_out * mult
@@ -392,7 +391,6 @@ def kernel_and_output_padding(*kernel_size):
 
 
 class XUnet(nn.Module):
-
     @beartype
     def __init__(
         self,
@@ -435,13 +433,14 @@ class XUnet(nn.Module):
         self.channels = channels
 
         init_dim = default(init_dim, dim)
-        init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+        # init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+        init_kernel_size = kernel_size
         self.init_conv = nn.Conv3d(channels, init_dim, **kernel_and_same_pad(*init_kernel_size))
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        self.scale_factor = [tuple(map(lambda k: k // 2 + 1, kernel_size))] * 4
+        self.scale_factors = [tuple(map(lambda k: k // 2 + 1, kernel_size))] * len(in_out)
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
@@ -511,7 +510,10 @@ class XUnet(nn.Module):
                         nn.ModuleList(
                             [
                                 blocks(
-                                    dim_in, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim
+                                    dim_in,
+                                    dim_in,
+                                    nested_unet_depth=nested_unet_depth,
+                                    nested_unet_dim=nested_unet_dim,
                                 )
                                 for _ in range(num_blocks - 1)
                             ]
@@ -525,7 +527,7 @@ class XUnet(nn.Module):
                         Downsample(
                             dim_in,
                             dim_out,
-                            stride=self.scale_factor[ind],
+                            stride=self.scale_factors[ind],
                         ),
                     ]
                 )
@@ -545,7 +547,7 @@ class XUnet(nn.Module):
         self.mid_upsample = Upsample(
             mid_dim,
             dims[-2],
-            stride=self.scale_factor[-1],
+            stride=self.scale_factors[-1],
         )
 
         # ups
@@ -585,7 +587,7 @@ class XUnet(nn.Module):
                             Upsample(
                                 dim_out,
                                 dim_in,
-                                stride=self.scale_factor[ind],
+                                stride=self.scale_factors[ind],
                             )
                             if not is_last
                             else nn.Identity()
@@ -615,65 +617,66 @@ class XUnet(nn.Module):
 
         ## Polarity
         if self.add_polarity:
-            nested_unet_depth = nested_unet_depths[0]
+            self.polarity_feature_level = 1
             num_blocks = num_blocks_per_stage[0]
             self_attn_blocks = num_self_attn_per_stage[0]
             heads = attn_heads[0]
             dim_head = attn_dim_head[0]
-            dim_in = dims[0]
-            init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+            dim_in, dim_out = in_out[0]
+            # init_kernel_size = [k + 4 if k > 1 else 1 for k in kernel_size]
+            init_kernel_size = kernel_size
             self.polarity_init = nn.Conv3d(1, init_dim, **kernel_and_same_pad(*init_kernel_size))
-            self.polarity_encoder = nn.ModuleList([])
-            self.polarity_encoder.append(
-                nn.ModuleList(
-                    [
-                        blocks(dim_in, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim),
-                        nn.ModuleList(
-                            [
-                                blocks(
-                                    dim_in, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim
-                                )
-                                for _ in range(num_blocks - 1)
-                            ]
-                        ),
-                        nn.ModuleList(
-                            [
-                                TransformerBlock(dim_in, depth=self_attn_blocks, heads=heads, dim_head=dim_head)
-                                for _ in range(self_attn_blocks)
-                            ]
-                        ),
-                    ]
-                )
+            self.polarity_encoder = nn.ModuleList(
+                [
+                    nn.ModuleList(
+                        [
+                            blocks(dim_in, dim_in),
+                            nn.ModuleList(
+                                [
+                                    blocks(
+                                        dim_in,
+                                        dim_in,
+                                    )
+                                    for _ in range(num_blocks - 1)
+                                ]
+                            ),
+                            nn.ModuleList(
+                                [
+                                    TransformerBlock(dim_in, depth=self_attn_blocks, heads=heads, dim_head=dim_head)
+                                    for _ in range(self_attn_blocks)
+                                ]
+                            ),
+                        ]
+                    )
+                ]
+            )
+            self.polarity_upsample = Upsample(
+                dim_out,
+                dim_in,
+                stride=self.scale_factors[self.polarity_feature_level - 1],
             )
             self.polarity_final = nn.Sequential(
-                blocks(dim_in * 2, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim),
+                blocks(dim_in * 2, dim_in),
                 nn.Conv3d(dim_in, out_dim, **kernel_and_same_pad(*kernel_size)),
             )
 
         ## Event
         if self.add_event:
             self.event_feature_level = 3
-            level = self.event_feature_level
-            nested_unet_depth = nested_unet_depths[level]
-            num_blocks = num_blocks_per_stage[level]
-            self_attn_blocks = num_self_attn_per_stage[level]
-            heads = attn_heads[level]
-            dim_head = attn_dim_head[level]
-            dim_in = dims[level]
+            dim_in, dim_out = in_out[self.event_feature_level]
+            self.event_upsample = Upsample(
+                dim_out,
+                dim_in,
+                stride=self.scale_factors[self.event_feature_level - 1],
+            )
             self.event_final = nn.Sequential(
-                blocks(dim_in, dim_in, nested_unet_depth=nested_unet_depth, nested_unet_dim=nested_unet_dim),
-                Upsample(
-                    dim_in,
-                    dim_in,
-                    stride=self.scale_factor[-1],
-                    # **kernel_and_output_padding(*kernel_size),
-                ),
+                blocks(dim_in, dim_in),
                 nn.Conv3d(dim_in, out_dim, **kernel_and_same_pad(*kernel_size)),
             )
 
         ## STFT
         if self.add_stft:
-            self.stft = STFT(n_fft=64 + 1, hop_length=self.scale_factor[0][-1])
+            self.stft = STFT(n_fft=64 + 1, hop_length=self.scale_factors[0][-1])
             self.kernel_size_stft = [kernel_size[0], 3, kernel_size[2]]
             self.spec_init = nn.Sequential(
                 nn.Conv3d(
@@ -695,9 +698,14 @@ class XUnet(nn.Module):
                 )
             )
             self.spec_down = nn.ModuleList([])
-            for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks, heads, dim_head) in enumerate(
-                zip(*down_stage_parameters)
-            ):
+            for ind, (
+                (dim_in, dim_out),
+                nested_unet_depth,
+                num_blocks,
+                self_attn_blocks,
+                heads,
+                dim_head,
+            ) in enumerate(zip(*down_stage_parameters)):
                 if ind == 0:
                     continue
                 self.spec_down.append(
@@ -717,7 +725,7 @@ class XUnet(nn.Module):
                                     for _ in range(num_blocks - 1)
                                 ]
                             ),
-                            Downsample(dim_in, dim_out, stride=self.scale_factor[ind]),
+                            Downsample(dim_in, dim_out, stride=self.scale_factors[ind]),
                             MergeFrequency(32),
                             MergeBranch(dim_in),
                         ]
@@ -730,17 +738,16 @@ class XUnet(nn.Module):
             self.mid_merge = MergeBranch(mid_dim)
 
     def forward(self, x):
-
         is_image = x.ndim == 4
 
         # validations
 
-        assert not (
-            is_image and not self.train_as_images
-        ), "you specified a frame kernel size for the convolutions in this unet, but you are passing in images"
-        assert not (
-            not is_image and self.train_as_images
-        ), "you specified no frame kernel size dimension, yet you are passing in a video. fold the frame dimension into the batch"
+        assert not (is_image and not self.train_as_images), (
+            "you specified a frame kernel size for the convolutions in this unet, but you are passing in images"
+        )
+        assert not (not is_image and self.train_as_images), (
+            "you specified no frame kernel size dimension, yet you are passing in a video. fold the frame dimension into the batch"
+        )
 
         # cast images to 1 framed video
 
@@ -810,11 +817,6 @@ class XUnet(nn.Module):
         x = self.mid_attn(x) + x
         x = self.mid_after(x)
 
-        if self.add_prompt:
-            out_prompt = x.clone()
-        else:
-            out_prompt = None
-
         up_hiddens.append(x)
         x = self.mid_upsample(x)
 
@@ -832,20 +834,13 @@ class XUnet(nn.Module):
             up_hiddens.insert(0, x)
             x = upsample(x)
 
-        if self.add_polarity:
-            x_polarity_aux = x.clone()
-
         # consolidate feature maps
-
         x = self.consolidator(x, up_hiddens)
 
         # final residual
-
         x = torch.cat((x, r), dim=1)
-        # x = torch.cat((x, down_hiddens.pop()), dim=1)
 
         # final convolution
-
         out_phase = self.final_conv(x)
 
         # polarity
@@ -857,6 +852,7 @@ class XUnet(nn.Module):
                 for attn_block in attn_blocks:
                     x_polarity = attn_block(x_polarity)
 
+            x_polarity_aux = self.polarity_upsample(up_hiddens[self.polarity_feature_level - 1])
             x_polarity = torch.cat((x_polarity, x_polarity_aux), dim=1)
             out_polarity = self.polarity_final(x_polarity)
         else:
@@ -864,10 +860,16 @@ class XUnet(nn.Module):
 
         # event
         if self.add_event:
-            x_event = up_hiddens[self.event_feature_level - 1].clone()
+            x_event = self.event_upsample(up_hiddens[self.event_feature_level - 1])
             out_event = self.event_final(x_event)
         else:
             out_event = None
+
+        # prompt
+        if self.add_prompt:
+            out_prompt = up_hiddens[-1]
+        else:
+            out_prompt = None
 
         if is_image:
             out_phase = rearrange(out_phase, "b c 1 h w -> b c h w")
@@ -879,6 +881,7 @@ class XUnet(nn.Module):
                 out_prompt = rearrange(out_prompt, "b c 1 h w -> b c h w")
 
         out = {"phase": out_phase, "polarity": out_polarity, "event": out_event, "prompt": out_prompt}
+
         # if self.add_stft and self.training:
         if self.add_stft:
             out["spectrogram"] = sgram.squeeze(2)  ## nb, nc, nx, nf, nt -> nb, nc, nf, nt
@@ -1011,14 +1014,14 @@ class NestedResidualUnet(nn.Module):
         #     assert (
         #         size % (2**self.depth)
         #     ) == 0, f"the unet has too much depth for the image {dim_name} ({size}) being passed in"
-        assert divisible_by(
-            w, 2**layers
-        ), f"width dimension {w} must be divisible by {2 ** layers} ({layers} layers in nested unet)"
+        assert divisible_by(w, 2**layers), (
+            f"width dimension {w} must be divisible by {2**layers} ({layers} layers in nested unet)"
+        )
         assert (w % (2**self.depth)) == 0, f"the unet has too much depth for the image width ({w}) being passed in"
         if h > 1:
-            assert divisible_by(
-                h, 2**layers
-            ), f"height dimension {h} must be divisible by {2 ** layers} ({layers} layers in nested unet)"
+            assert divisible_by(h, 2**layers), (
+                f"height dimension {h} must be divisible by {2**layers} ({layers} layers in nested unet)"
+            )
             assert (h % (2**self.depth)) == 0, f"the unet has too much depth for the image height ({h}) being passed in"
 
         # hiddens
@@ -1049,29 +1052,29 @@ class NestedResidualUnet(nn.Module):
 # example
 
 if __name__ == "__main__":
-
     from torchinfo import summary
-    from torchviz import make_dot
+    # from torchviz import make_dot
 
     model = XUnet(
-        dim=8,
+        dim=16,
         out_dim=16,
-        dim_mults=(1, 2, 4, 8),
+        dim_mults=(1, 2, 4, 4),
         add_polarity=True,
         add_event=True,
         add_stft=True,
+        add_prompt=True,
     )
 
     # print(model)
-    data = torch.randn(7, 3, 1, 4096)
+    data = torch.randn(1, 3, 1, 1024)
 
     summary(model, input_size=data.shape, depth=5)
 
     model.to("cpu")
     out = model(data)
 
-    dot = make_dot(out["phase"], params=dict(model.named_parameters()))
-    dot.render("x_unet", format="png")
+    # dot = make_dot(out["phase"], params=dict(model.named_parameters()))
+    # dot.render("x_unet", format="png")
 
     for k, v in out.items():
         if v is not None:
