@@ -335,7 +335,7 @@ class PhaseNet(nn.Module):
             self.backbone = XUnet(
                 channels=3,
                 dim=32,
-                out_dim=64,
+                out_dim=32,
                 log_scale=log_scale,
                 add_stft=add_stft,
                 add_polarity=add_polarity,
@@ -353,18 +353,17 @@ class PhaseNet(nn.Module):
                 self.event_detector = UNetHead(16, 1, feature_name="event")
                 self.event_timer = EventHead(16, 1, feature_name="event")
             if self.add_prompt:
-                self.prompt_picker = PromptHead(prompt_embed_dim=32, feature_name="prompt")
+                self.prompt_picker = PromptHead(prompt_embed_dim=64, feature_name="prompt")
 
         elif backbone == "xunet":
-            self.phase_picker = UNetHead(64, 3, feature_name="phase")
+            self.phase_picker = UNetHead(32, 3, feature_name="phase")
             if self.add_polarity:
-                self.polarity_picker = UNetHead(64, 1, feature_name="polarity")
+                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
             if self.add_event:
-                self.event_detector = UNetHead(64, 1, feature_name="event")
-                self.event_timer = EventHead(64, 1, feature_name="event")
+                self.event_detector = UNetHead(32, 1, feature_name="event")
+                self.event_timer = EventHead(32, 1, feature_name="event")
             if self.add_prompt:
                 self.prompt_picker = PromptHead(prompt_embed_dim=128, feature_name="prompt")
-
         else:
             raise ValueError("backbone only supports unet or xunet")
 

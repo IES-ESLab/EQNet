@@ -1,8 +1,8 @@
 #! /bin/bash
 set -x
 
-DATA_PATH=/global/scratch/users/haoyuwang/quakeflow_dataset/NC/quakeflow_nc/
-WANDB_DIR=/pscratch/sd/w/whaoyu/tests_eqnet/
+DATA_PATH=/global/scratch/users/haoyuwang/quakeflow_dataset/NC/quakeflow_nc
+DATA_PATH=/global/home/users/zhuwq0/scratch/CEED/quakeflow_nc
 
 torchrun --master_port 29510  --nproc_per_node 4 train.py --model phasenet  --backbone xunet \
     --batch-size 128 --workers 16  --lr 0.0003 \
@@ -10,7 +10,7 @@ torchrun --master_port 29510  --nproc_per_node 4 train.py --model phasenet  --ba
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_xunet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_xunet
+    --wandb --wandb-project phasenet --wandb-name phasenet_xunet
 
 torchrun --master_port 29511  --nproc_per_node 4 train.py --model phasenet  --backbone unet \
     --batch-size 128 --workers 16  --lr 0.001 \
@@ -18,7 +18,7 @@ torchrun --master_port 29511  --nproc_per_node 4 train.py --model phasenet  --ba
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_unet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_unet
+    --wandb --wandb-project phasenet --wandb-name phasenet_unet
 
 torchrun --master_port 29512  --nproc_per_node 4 train.py --model phasenet_tf  --backbone xunet \
     --batch-size 128 --workers 16  --lr 0.0003 \
@@ -26,7 +26,7 @@ torchrun --master_port 29512  --nproc_per_node 4 train.py --model phasenet_tf  -
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_tf_xunet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_tf_xunet
+    --wandb --wandb-project phasenet --wandb-name phasenet_tf_xunet
 
 torchrun --master_port 29513  --nproc_per_node 4 train.py --model phasenet_tf  --backbone unet \
     --batch-size 128 --workers 16  --lr 0.001 \
@@ -34,7 +34,7 @@ torchrun --master_port 29513  --nproc_per_node 4 train.py --model phasenet_tf  -
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_tf_unet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_tf_unet
+    --wandb --wandb-project phasenet --wandb-name phasenet_tf_unet
 
 torchrun --master_port 29514  --nproc_per_node 4 train.py --model phasenet_plus  --backbone xunet \
     --batch-size 128 --workers 16  --lr 0.0003 \
@@ -42,23 +42,15 @@ torchrun --master_port 29514  --nproc_per_node 4 train.py --model phasenet_plus 
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_plus_xunet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_plus_xunet
+    --wandb --wandb-project phasenet --wandb-name phasenet_plus_xunet
 
 torchrun --master_port 29515  --nproc_per_node 4 train.py --model phasenet_plus  --backbone unet \
     --batch-size 128 --workers 16  --lr 0.001 \
-    --hdf5-file $DATA_PATH/waveform_train.h5 \
-    --test-hdf5-file $DATA_PATH/waveform_train.h5 \
+    --hdf5-file $DATA_PATH/waveform_test.h5 \
+    --test-hdf5-file $DATA_PATH/waveform_test.h5 \
     --output-dir phasenet_plus_unet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_plus_unet
-
-torchrun --master_port 29517  --nproc_per_node 4 train.py --model phasenet_tf_plus  --backbone xunet \
-    --batch-size 128 --workers 16  --lr 0.0003 \
-    --hdf5-file $DATA_PATH/waveform_train.h5 \
-    --test-hdf5-file $DATA_PATH/waveform_train.h5 \
-    --output-dir phasenet_tf_plus_xunet \
-    --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_tf_plus_xunet
+    --wandb --wandb-project phasenet --wandb-name phasenet_plus_unet
 
 torchrun --master_port 29516  --nproc_per_node 4 train.py --model phasenet_tf_plus  --backbone unet \
     --batch-size 128 --workers 16  --lr 0.001 \
@@ -66,7 +58,15 @@ torchrun --master_port 29516  --nproc_per_node 4 train.py --model phasenet_tf_pl
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_tf_plus_unet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_tf_plus_unet 
+    --wandb --wandb-project phasenet --wandb-name phasenet_tf_plus_unet 
+
+torchrun --master_port 29517  --nproc_per_node 4 train.py --model phasenet_tf_plus  --backbone xunet \
+    --batch-size 128 --workers 16  --lr 0.0003 \
+    --hdf5-file $DATA_PATH/waveform_train.h5 \
+    --test-hdf5-file $DATA_PATH/waveform_train.h5 \
+    --output-dir phasenet_tf_plus_xunet \
+    --stack-event --stack-noise --flip-polarity --drop-channel \
+    --wandb --wandb-project phasenet --wandb-name phasenet_tf_plus_xunet
 
 torchrun --master_port 29518  --nproc_per_node 4 train.py --model phasenet_prompt  --backbone xunet \
     --workers 16 --batch-size 16 --lr 0.0003 \
@@ -74,7 +74,7 @@ torchrun --master_port 29518  --nproc_per_node 4 train.py --model phasenet_promp
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_prompt_xunet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_prompt_xunet
+    --wandb --wandb-project phasenet --wandb-name phasenet_prompt_xunet
 
 torchrun --master_port 29519  --nproc_per_node 4 train.py --model phasenet_prompt  --backbone unet \
     --workers 16 --batch-size 16 --lr 0.001 \
@@ -82,7 +82,7 @@ torchrun --master_port 29519  --nproc_per_node 4 train.py --model phasenet_promp
     --test-hdf5-file $DATA_PATH/waveform_train.h5 \
     --output-dir phasenet_prompt_unet \
     --stack-event --stack-noise --flip-polarity --drop-channel \
-    --wandb --wandb-group ai4eps  --wandb-dir $WANDB_DIR --wandb-project phasenet --wandb-name phasenet_prompt_unet
+    --wandb --wandb-project phasenet --wandb-name phasenet_prompt_unet
 
 
 ######################################################### DAS ########################################################

@@ -9,7 +9,8 @@ from beartype.typing import Optional, Tuple, Union
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from torch import einsum, nn
-from unet import STFT, log_transform, moving_normalize
+
+from .unet import STFT, log_transform, moving_normalize
 
 # helper functions
 
@@ -1053,6 +1054,7 @@ class NestedResidualUnet(nn.Module):
 
 if __name__ == "__main__":
     from torchinfo import summary
+
     # from torchviz import make_dot
 
     model = XUnet(

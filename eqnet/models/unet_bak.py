@@ -140,7 +140,7 @@ class UNet(nn.Module):
         kernel_size=(1, 7),
         stride=(1, 4),
         padding=(0, 3),
-        moving_norm=(1024, 128),
+        moving_norm=(1024, 256),
         upsample="conv_transpose",
         add_stft=False,
         log_scale=False,
