@@ -398,6 +398,8 @@ class SeismicTraceIterableDataset(IterableDataset):
         min_snr=3.0,
         stack_event=False,
         stack_strategy='same_sensor',
+        picks_dict=None,
+        events_dict=None,
         stack_noise=False,
         flip_polarity=False,
         drop_channel=False,
@@ -503,8 +505,10 @@ class SeismicTraceIterableDataset(IterableDataset):
             elif self.data_path is not None:
                 self.base_dir = data_path
             
-            self.picks_dict = pd.read_csv(os.path.join(self.base_dir, "picks_train.csv"), usecols=['event_id', 'station_id', 'snr', 'phase_status', 'instrument'])
-            self.events_dict = pd.read_csv(os.path.join(self.base_dir, "events_train.csv"), usecols=['event_id', 'magnitude', 'event_time', 'depth_km'])
+            picks_dict = os.path.join(self.base_dir, "picks_train.csv") if (picks_dict is None) else picks_dict
+            events_dict = os.path.join(self.base_dir, "events_train.csv") if (events_dict is None) else events_dict
+            self.picks_dict = pd.read_csv(picks_dict, usecols=['event_id', 'station_id', 'snr', 'phase_status', 'instrument'])
+            self.events_dict = pd.read_csv(events_dict, usecols=['event_id', 'magnitude', 'event_time', 'depth_km'])
             self.events_dict['year'] = self.events_dict['event_time'].apply(lambda x: int(x[:4]))
             self.picks_dict['snr'] = self.picks_dict['snr'].apply(lambda x: np.array([float(number) for number in x.split()[1:-1]]))
             temp = self.picks_dict.groupby('event_id')['snr'].apply(lambda x: np.concatenate(x.values)).reset_index()

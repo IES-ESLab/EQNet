@@ -379,6 +379,8 @@ def main(args):
             format=args.format,  # ["h5", "hf"]
             training=True,
             stack_event=args.stack_event,
+            picks_dict=args.picks_dict,
+            events_dict=args.events_dict,
             stack_noise=args.stack_noise,
             flip_polarity=args.flip_polarity,
             drop_channel=args.drop_channel,
@@ -716,6 +718,8 @@ def get_args_parser(add_help=True):
     parser.add_argument("--test-label-list", default="+", type=None, help="test label path")
     parser.add_argument("--test-noise-list", default="+", type=None, help="test noise list")
     parser.add_argument("--test-hdf5-file", default=None, type=str, help="hdf5 file for testing")
+    parser.add_argument("--picks-dict", default=None, type=str, help="picks dictionary for training augmentation")
+    parser.add_argument("--events-dict", default=None, type=str, help="events dictionary for training augmentation")
     parser.add_argument("--dataset", default="", type=str, help="dataset name")
     parser.add_argument("--model", default="phasenet_das", type=str, help="model name")
     parser.add_argument("--backbone", default="unet", type=str, help="model backbone")
