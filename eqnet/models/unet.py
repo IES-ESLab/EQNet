@@ -416,9 +416,9 @@ class UNet(nn.Module):
 
         # self.final_res_block = ResnetBlock(init_dim * 2, init_dim)
         # self.final_conv = nn.Conv2d(init_dim, self.out_dim, (1, 1))
-        self.final_res_block = ResnetBlock(
-            init_dim * 2, self.out_dim, kernel_size=self.kernel_size, padding=self.padding
-        )
+        # self.final_res_block = ResnetBlock(
+        #     init_dim * 2, self.out_dim, kernel_size=self.kernel_size, padding=self.padding
+        # )
 
         ## Polarity
         if self.add_polarity:
