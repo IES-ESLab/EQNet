@@ -409,7 +409,12 @@ def main(args):
                 model_url = "https://github.com/AI4EPS/models/releases/download/PhaseNet-v1/model_99.pth"
         elif args.model == "phasenet_plus":
             if args.location is None:
-                model_url = "https://github.com/AI4EPS/models/releases/download/PhaseNet-Plus-UNet/model_99.pth"
+                if args.backbone == "unet":
+                    model_url = "https://github.com/AI4EPS/models/releases/download/PhaseNet-Plus-UNet-v1/model_99.pth"
+                elif args.backbone == "xunet":
+                    model_url = "https://github.com/AI4EPS/models/releases/download/PhaseNet-Plus-XUNet-v0/model_99.pth"
+                else:
+                    raise ValueError(f"Backbone '{args.backbone}' not supported for PhaseNet Plus")
         elif args.model == "phasenet_tf":
             if args.location == "LCSN":
                 model_url = "https://github.com/AI4EPS/models/releases/download/PhaseNet-TF-LCSN/model_99.pth"
