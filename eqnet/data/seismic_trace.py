@@ -1,11 +1,17 @@
 import logging
 import os
+#%%
+import sys
+AQ_PATH = os.path.abspath(os.path.join(__file__, "..", "..", ".."))
+sys.path.append(AQ_PATH) # Add the project root to the Python path
+#%%
 import random
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
+from typing import Literal
 
 import fsspec
 import h5py
@@ -18,6 +24,12 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
+from autoquake.DataClient.fetchdata import GDMSClient, IESWSClient
+from autoquake.DataClient.fetchdata.utils import FinalStationConfig, ClientConfig
+CLIENT_MAP = {
+    "gdms": GDMSClient,
+    "iesws": IESWSClient
+}
 # import warnings
 # warnings.filterwarnings("error")
 # import numpy
@@ -341,7 +353,8 @@ def remove_sens_manually(meta, tmp, pz_dir):
     keyword = replacer(tmp)
     pz_file = _find_pz(pz_dir, keyword)
     sensitivity = get_sensitivity(pz_file)
-    meta[0].data = meta[0].data / sensitivity
+    for i in range(len(meta)):
+        meta[i].data = meta[i].data / sensitivity
     return meta
 
 class SeismicTraceIterableDataset(IterableDataset):
@@ -389,6 +402,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         super().__init__()
         self.rank = rank
         self.world_size = world_size
+        self.stream = False
         if hdf5_file is not None:
             tmp_hdf5_keys = f"/tmp/{'_'.join(hdf5_file.split('/'))}.txt"
             if not os.path.exists(tmp_hdf5_keys) and (rank == 0):
@@ -412,6 +426,17 @@ class SeismicTraceIterableDataset(IterableDataset):
                 print(f"Reading {tmp_hdf5_keys}")
                 self.data_list = pd.read_csv(tmp_hdf5_keys, header=None, names=["trace_id"])["trace_id"].values.tolist()
         elif data_list is not None:
+            #TODO: We can more config-driven, without hardcoding.
+            if isinstance(data_list, str) and data_list.endswith(".json"):
+                # json file for fetch mode
+                import json
+                with open(data_list, "r") as f:
+                    data = json.load(f)
+                self.stream = True
+                iesws_config = ClientConfig.model_validate(data["IESWSConfig"])
+                gdms_config = ClientConfig.model_validate(data["GDMSConfig"])
+                self.data_list = [iesws_config, gdms_config]
+            else:
                 self.data_list = data_list
         elif data_path is not None:
             self.data_list = [x for x in sorted(list(glob(os.path.join(data_path, f"{prefix}*.{format}"))))]
@@ -475,8 +500,11 @@ class SeismicTraceIterableDataset(IterableDataset):
         data_list = self.data_list[worker_id::num_workers]
         if self.training:
             return iter(self.sample_train(data_list))
+        elif self.stream:
+            return iter(self.sample_from_fetch(data_list))
         else:
             return iter(self.sample(data_list))
+        
 
     def _count(self):
         if not self.cut_patch:
@@ -784,18 +812,134 @@ class SeismicTraceIterableDataset(IterableDataset):
                 if response_path is not None:
                     inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
                     meta = meta.remove_sensitivity(inv)
-                if pz_dir is not None:
+                elif pz_dir is not None:
                     print('....remove sensitivity manually')
                     meta = remove_sens_manually(meta, tmp, pz_dir)
                 stream += meta
                 # stream += obspy.read(tmp)
             stream = stream.merge(fill_value="latest")
+            #TODO: quite weird here, but keep it for now
             if (response_path is None) and (response_xml is not None):
                 response = obspy.read_inventory(response_xml)
                 stream = stream.remove_sensitivity(response)
         except Exception as e:
             print(f"Error reading {fname}:\n{e}")
             return None
+
+        tmp_stream = obspy.Stream()
+        for trace in stream:
+            if len(trace.data) < 10:
+                continue
+
+            ## interpolate to 100 Hz
+            if trace.stats.sampling_rate != sampling_rate:
+                logging.warning(f"Resampling {trace.id} from {trace.stats.sampling_rate} to {sampling_rate} Hz")
+                try:
+                    trace = trace.interpolate(sampling_rate, method="linear")
+                except Exception as e:
+                    print(f"Error resampling {trace.id}:\n{e}")
+
+            trace = trace.detrend("demean")
+
+            ## detrend
+            # try:
+            #     trace = trace.detrend("spline", order=2, dspline=5 * trace.stats.sampling_rate)
+            # except:
+            #     logging.error(f"Error: spline detrend failed at file {fname}")
+            #     trace = trace.detrend("demean")
+
+            ## highpass filtering > 1Hz
+            if highpass_filter > 0.0:
+                # trace = trace.filter("highpass", freq=1.0)
+                trace = trace.filter("highpass", freq=highpass_filter)
+
+            tmp_stream.append(trace)
+
+        if len(tmp_stream) == 0:
+            return None
+        stream = tmp_stream
+
+        begin_time = min([st.stats.starttime for st in stream])
+        end_time = max([st.stats.endtime for st in stream])
+        stream = stream.trim(begin_time, end_time, pad=True, fill_value=0)
+
+        comp = ["3", "2", "1", "E", "N", "Z"]
+        comp2idx = {"3": 0, "2": 1, "1": 2, "E": 0, "N": 1, "Z": 2}
+
+        station_ids = defaultdict(list)
+        for tr in stream:
+            station_ids[tr.id[:-1]].append(tr.id[-1])
+            if tr.id[-1] not in comp:
+                print(f"Unknown component {tr.id[-1]}")
+
+        station_keys = sorted(list(station_ids.keys()))
+        nx = len(station_ids)
+        nt = len(stream[0].data)
+        data = np.zeros([3, nt, nx], dtype=np.float32)
+        for i, sta in enumerate(station_keys):
+            for c in station_ids[sta]:
+                j = comp2idx[c]
+
+                if len(stream.select(id=sta + c)) == 0:
+                    print(f"Empty trace: {sta+c} {begin_time}")
+                    continue
+
+                trace = stream.select(id=sta + c)[0]
+
+                ## accerleration to velocity
+                if sta[-1] == "N":
+                    trace = trace.integrate().filter("highpass", freq=1.0)
+
+                tmp = trace.data.astype("float32")
+                data[j, : len(tmp), i] = tmp[:nt]
+
+        return {
+            "waveform": torch.from_numpy(data),
+            "station_id": station_keys,
+            "begin_time": begin_time.datetime.isoformat(timespec="milliseconds"),
+            "dt_s": 1 / sampling_rate,
+        }
+
+    def read_mseed_from_fetch(
+        self,
+        payload,
+        station_config: FinalStationConfig,
+        server: Literal["gdms", "iesws"],
+        pz_dir=None,
+        response_path=None,
+        # response_xml=None,
+        highpass_filter=False,
+        sampling_rate=100
+        ):
+        """
+        Read MiniSEED files from a fetch operation.
+        This function fetch the mseed/sac files from GDMS, IESWS server by json request. Since the
+        fetched files is in binary format in memory, we use BytesIO to read it with obspy.
+        -
+        The interface of GDMS and IESWS are the same.
+        """
+        meta = CLIENT_MAP[server](
+            payload=payload,
+            network=station_config.network,
+            station=station_config.station,
+            channel=station_config.channel,
+            location=station_config.location,
+            starttime=station_config.starttime,
+            endtime=station_config.endtime,
+            format=station_config.format,
+            label=station_config.label if station_config.label is not None else station_config.station,
+            output_dir=Path("./"),
+            mode="stream"
+        )
+
+        if response_path is not None:
+            inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
+            meta = meta.remove_sensitivity(inv)
+        elif pz_dir is not None:
+            print('....remove sensitivity manually')
+            meta = remove_sens_manually(meta, tmp, pz_dir)
+            # stream += obspy.read(tmp)
+        stream = meta.merge(fill_value="latest")
 
         tmp_stream = obspy.Stream()
         for trace in stream:
@@ -1038,6 +1182,63 @@ class SeismicTraceIterableDataset(IterableDataset):
                             "nt": nt,
                         }
 
+    def sample_from_fetch(
+            self,
+            data_list: list[ClientConfig],
+            server_list=["iesws", "gdms"]
+            ):
+        for config, server in zip(data_list, server_list):
+            station_configs = config.flat_station_configs
+            payload = config.payload
+            for station_config in station_configs:
+                if self.format == "mseed" or self.format == 'SAC': # TODO: check
+                    meta = self.read_mseed_from_fetch(
+                        payload=payload,
+                        station_config=station_config,
+                        server=server,
+                        pz_dir=self.pz_dir,
+                        response_path=self.response_path,
+                        highpass_filter=self.highpass_filter,
+                        sampling_rate=self.sampling_rate,                    
+                    )
+                    
+                meta["file_name"] = f"{station_config.network}_{station_config.station}_{station_config.location}_{station_config.channel}"
+
+                if not self.cut_patch:
+                    data = meta["waveform"]
+                    _, nt, nx = meta["waveform"].shape
+                    data = padding(data, min_nt=self.min_nt, min_nx=self.min_nx)
+                    yield {
+                        "data": data,
+                        "nx": nx,
+                        "nt": nt,
+                        "station_id": meta["station_id"],
+                        "begin_time": meta["begin_time"],
+                        "begin_time_index": 0,
+                        "dt_s": meta["dt_s"],
+                        "file_name": meta["file_name"],
+                    }
+                else:
+                    _, nt, nx = meta["waveform"].shape
+                    for i in list(range(0, nt, self.nt)):
+                        for j in list(range(0, nx, self.nx)):
+                            data = meta["waveform"][:, i : i + self.nt, j : j + self.nx]
+                            _, nt_, nx_ = data.shape
+                            data = padding(data, min_nt=self.min_nt, min_nx=self.min_nx)
+                            yield {
+                                "data": data,
+                                "nx": nx_,
+                                "nt": nt_,
+                                "station_id": meta["station_id"][j : j + self.nx],
+                                "begin_time": (
+                                    datetime.fromisoformat(meta["begin_time"]) + timedelta(seconds=i * meta["dt_s"])
+                                ).isoformat(timespec="milliseconds"),
+                                "begin_time_index": i,
+                                "dt_s": meta["dt_s"],
+                                "file_name": os.path.splitext(meta["file_name"].split("/")[-1])[0] + f"_{i:04d}_{j:04d}",
+                                "nx": nx,
+                                "nt": nt,
+                            }
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
