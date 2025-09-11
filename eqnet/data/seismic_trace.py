@@ -1,10 +1,10 @@
 import logging
+logger = logging.getLogger(__name__)
 import os
-#%%
+import json
 import sys
 AQ_PATH = os.path.abspath(os.path.join(__file__, "..", "..", ".."))
 sys.path.append(AQ_PATH) # Add the project root to the Python path
-#%%
 import random
 import time
 from collections import defaultdict
@@ -24,12 +24,16 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
-from autoquake.DataClient.fetchdata import GDMSClient, IESWSClient
+from autoquake.DataClient.fetchdata.GDMSClient import get_gdms_data
+from autoquake.DataClient.fetchdata.IESWSClient import get_iesws_data
 from autoquake.DataClient.fetchdata.utils import FinalStationConfig, ClientConfig
+
 CLIENT_MAP = {
-    "gdms": GDMSClient,
-    "iesws": IESWSClient
+    "GDMS": get_gdms_data,
+    "IESWS": get_iesws_data
 }
+
+CONFIG_NAMES = ["IESWSConfig", "GDMSConfig"]
 # import warnings
 # warnings.filterwarnings("error")
 # import numpy
@@ -374,7 +378,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         format="h5",
         dataset="seismic_trace",
         phases=["P", "S"],
-        training=False,
+        training=False,      
         ## for training
         phase_width=[40],
         polarity_width=[20],
@@ -426,18 +430,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                 print(f"Reading {tmp_hdf5_keys}")
                 self.data_list = pd.read_csv(tmp_hdf5_keys, header=None, names=["trace_id"])["trace_id"].values.tolist()
         elif data_list is not None:
-            #TODO: We can more config-driven, without hardcoding.
-            if isinstance(data_list, str) and data_list.endswith(".json"):
-                # json file for fetch mode
-                import json
-                with open(data_list, "r") as f:
-                    data = json.load(f)
-                self.stream = True
-                iesws_config = ClientConfig.model_validate(data["IESWSConfig"])
-                gdms_config = ClientConfig.model_validate(data["GDMSConfig"])
-                self.data_list = [iesws_config, gdms_config]
-            else:
-                self.data_list = data_list
+            self.data_list = self.parse_json_to_list(json_file=data_list)
         elif data_path is not None:
             self.data_list = [x for x in sorted(list(glob(os.path.join(data_path, f"{prefix}*.{format}"))))]
         else:
@@ -904,7 +897,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         self,
         payload,
         station_config: FinalStationConfig,
-        server: Literal["gdms", "iesws"],
+        server: Literal["GDMS", "IESWS"],
         pz_dir=None,
         response_path=None,
         # response_xml=None,
@@ -936,6 +929,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
             meta = meta.remove_sensitivity(inv)
         elif pz_dir is not None:
+            #TODO: fetch_waveform do not fit the function here, but typically we don't use this, ignore now.
             print('....remove sensitivity manually')
             meta = remove_sens_manually(meta, tmp, pz_dir)
             # stream += obspy.read(tmp)
@@ -1184,10 +1178,12 @@ class SeismicTraceIterableDataset(IterableDataset):
 
     def sample_from_fetch(
             self,
-            data_list: list[ClientConfig],
-            server_list=["iesws", "gdms"]
+            data_list: list[tuple[str, ClientConfig]]
             ):
-        for config, server in zip(data_list, server_list):
+        """
+        data_list looks like: [("GDMS", GDMSConfig), ("IESWS", IESWSConfig)]
+        """
+        for server, config in data_list:
             station_configs = config.flat_station_configs
             payload = config.payload
             for station_config in station_configs:
@@ -1239,6 +1235,33 @@ class SeismicTraceIterableDataset(IterableDataset):
                                 "nx": nx,
                                 "nt": nt,
                             }
+
+    def parse_json_to_list(self, json_file: str):
+        """
+        Convert json list to a ClientConfig object.
+        Here we use the parameters from AutoQuake to determine the fetch time window.
+        """
+        if isinstance(json_file, str) and json_file.endswith(".json"):
+            #TODO: I am not sure whether we should set self.stream = True here
+            self.stream = True
+            # json file for fetch mode
+            with open(json_file, "r") as f:
+                data = json.load(f)
+            config_names = [x for x in data.keys() if x in CONFIG_NAMES]
+            data_list = []
+            for config_name in config_names:
+                server_name = config_name[:-6] # before 'config'
+                # ignore these parameters due to it's stream mode
+                data[config_name]["output_dir"] = None
+                data[config_name]["unzip_dir"] = None
+                data[config_name]["unzip"] = None
+                data[config_name]["starttime"] = self.starttime
+                data[config_name]["endtime"] = self.endtime
+                config = ClientConfig.model_validate(data[config_name])
+                data_list.append((server_name, config))       
+            return data_list
+        else:
+            return json_file        
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
