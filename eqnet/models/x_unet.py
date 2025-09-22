@@ -9,6 +9,8 @@ from beartype.typing import Optional, Tuple, Union
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from torch import einsum, nn
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from functools import lru_cache
 
 from .unet import STFT, log_transform, moving_normalize
 
@@ -295,7 +297,7 @@ def FeedForward(dim, mult=4.0):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=64):
+    def __init__(self, dim, heads=4, dim_head=64, **kwargs):
         super().__init__()
         self.scale = dim_head**-0.5
         self.heads = heads
@@ -325,10 +327,86 @@ class Attention(nn.Module):
         return self.to_out(out) + residual
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, *, depth, **kwargs):
+@lru_cache
+def create_block_mask_for_time_window(B, H, q_len, kv_len, f_len, sta_len, time_len, window_size, device):
+    half_window = window_size // 2
+    # create a window with shape (f, sta, time_win)
+    assert window_size % 2 == 0, "window_size must be even"
+    assert q_len == kv_len
+    assert q_len == f_len * sta_len * time_len
+    def time_window_mod(b, h, q_idx, kv_idx):
+        q_time = q_idx % time_len
+        kv_time = kv_idx % time_len
+        prefix_mask = (kv_time < 2*half_window) & (q_time < half_window)
+        suffix_mask = (kv_time >= time_len - 2*half_window) & (q_time >= time_len - half_window)
+        mid_mask = (kv_time >= q_time - half_window) & (kv_time < q_time + half_window)
+
+        return prefix_mask | suffix_mask | mid_mask
+        
+    block_mask = create_block_mask(time_window_mod, B, H, q_len, kv_len, device=device, BLOCK_SIZE=window_size, _compile=False)
+    return block_mask
+
+@lru_cache
+def create_block_mask_for_full(B, H, q_len, kv_len, f_len, sta_len, time_len, window_size, device):
+    half_window = window_size // 2
+    # create a window with shape (f, sta, time_win)
+    assert window_size % 2 == 0, "window_size must be even"
+    assert q_len == kv_len
+    assert q_len == f_len * sta_len * time_len
+    def full_attention_mask(b, h, q_idx, kv_idx):
+        return torch.ones_like(q_idx, dtype=torch.bool)
+
+    block_mask = create_block_mask(full_attention_mask, B, H, q_len, kv_len, device=device, BLOCK_SIZE=window_size, _compile=False)
+    return block_mask
+
+
+class FlexWindowAttention(nn.Module):
+    """
+    Local (sliding window) attention along the flattened 3D grid using PyTorch FlexAttention.
+    """
+    def __init__(self, dim, heads=4, dim_head=64, win_len=64, block_size=128):
         super().__init__()
-        self.attn = Attention(dim, **kwargs)
+        assert win_len > 0 and isinstance(win_len, int)
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.win_len = win_len
+
+        inner_dim = heads * dim_head
+        self.norm = LayerNorm(dim)
+
+        self.to_qkv = nn.Conv3d(dim, inner_dim * 3, 1, bias=False)
+        self.to_out = nn.Conv3d(inner_dim, dim, 1, bias=False)
+
+    def forward(self, x):
+        """
+        x: (B, C=dim, F, H, W)
+        """
+        B, C, Fd, Hd, Wd = x.shape
+        L = Fd * Hd * Wd
+
+        residual = x
+        x = self.norm(x)
+
+        q, k, v = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, "b (h c) ... -> b h (...) c", h=self.heads), (q, k, v))
+
+        block_mask = create_block_mask_for_time_window(None, None, L, L, Fd, Hd, Wd, self.win_len, q.device)
+
+        # FlexAttention computes softmax internally; pass scale explicitly
+        out = flex_attention(
+            query=q, key=k, value=v,
+            block_mask=block_mask,
+            scale=self.scale
+        )  # (B, heads, L, dim_head)
+
+        out = rearrange(out, "b h (f x y) d -> b (h d) f x y", f=Fd, x=Hd, y=Wd)
+        return self.to_out(out) + residual
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, *, depth, attn=Attention, **kwargs):
+        super().__init__()
+        self.attn = attn(dim, **kwargs)
         self.ff = FeedForward(dim)
 
     def forward(self, x):
@@ -417,6 +495,8 @@ class XUnet(nn.Module):
         add_polarity=False,
         add_event=False,
         add_prompt=False,
+        window_attention=False,
+        **kwargs,
     ):
         super().__init__()
 
@@ -427,6 +507,8 @@ class XUnet(nn.Module):
         self.add_polarity = add_polarity
         self.add_event = add_event
         self.add_prompt = add_prompt
+        self.window_attention = window_attention
+        self.train_time_length = 4096
 
         self.train_as_images = kernel_size[0] == 1
 
@@ -521,7 +603,10 @@ class XUnet(nn.Module):
                         ),
                         nn.ModuleList(
                             [
-                                TransformerBlock(dim_in, depth=self_attn_blocks, heads=heads, dim_head=dim_head)
+                                TransformerBlock(dim_in, depth=self_attn_blocks, heads=heads, dim_head=dim_head, 
+                                                 attn=FlexWindowAttention if self.window_attention else Attention,
+                                                 win_len=self.train_time_length // (kernel_size[-1]//2+1)**ind,
+                                                 block_size=self.train_time_length // (kernel_size[-1]//2+1)**ind,)
                                 for _ in range(self_attn_blocks)
                             ]
                         ),
@@ -540,7 +625,12 @@ class XUnet(nn.Module):
         mid_nested_unet_depth = nested_unet_depths[-1]
 
         self.mid = blocks(mid_dim, mid_dim, nested_unet_depth=mid_nested_unet_depth, nested_unet_dim=nested_unet_dim)
-        self.mid_attn = Attention(mid_dim, heads=attn_heads[-1], dim_head=attn_dim_head[-1])
+        if not self.window_attention:
+            self.mid_attn = Attention(mid_dim, heads=attn_heads[-1], dim_head=attn_dim_head[-1])
+        else:
+            self.mid_attn = FlexWindowAttention(mid_dim, heads=attn_heads[-1], dim_head=attn_dim_head[-1],
+                                                 win_len=self.train_time_length // (kernel_size[-1]//2+1)**len(in_out),
+                                                 block_size=self.train_time_length // (kernel_size[-1]//2+1)**len(in_out))
         self.mid_after = blocks(
             mid_dim, mid_dim, nested_unet_depth=mid_nested_unet_depth, nested_unet_dim=nested_unet_dim
         )
@@ -580,7 +670,10 @@ class XUnet(nn.Module):
                         ),
                         nn.ModuleList(
                             [
-                                TransformerBlock(dim_out, depth=self_attn_blocks, heads=heads, dim_head=dim_head)
+                                TransformerBlock(dim_in, depth=self_attn_blocks, heads=heads, dim_head=dim_head, 
+                                                 attn=FlexWindowAttention if self.window_attention else Attention,
+                                                 win_len=self.train_time_length // (kernel_size[-1]//2+1)**(len(in_out)-ind-1),
+                                                 block_size=self.train_time_length // (kernel_size[-1]//2+1)**(len(in_out)-ind-1),)
                                 for _ in range(self_attn_blocks)
                             ]
                         ),

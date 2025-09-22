@@ -391,7 +391,7 @@ def main(args):
         drop_last=False,
     )
 
-    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone)
+    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone, shift_window=args.shift_window,)
     logger.info("Model:\n{}".format(model))
 
     model.to(device)
@@ -494,6 +494,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--result_path", type=str, default="results", help="path to result directory")
     parser.add_argument("--plot_figure", action="store_true", help="If plot figure for test")
     parser.add_argument("--min_prob", default=0.3, type=float, help="minimum probability for picking")
+    parser.add_argument("--shift_window", action="store_true", help="If use shift window for transformer")
 
     ## Seismic
     parser.add_argument("--add_polarity", action="store_true", help="If use polarity information")

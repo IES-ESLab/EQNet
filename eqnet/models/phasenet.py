@@ -341,6 +341,7 @@ class PhaseNet(nn.Module):
                 add_polarity=add_polarity,
                 add_event=add_event,
                 add_prompt=add_prompt,
+                **kwargs,
             )
         else:
             raise ValueError("backbone only supports unet or xunet")
@@ -454,10 +455,12 @@ class PhaseNet(nn.Module):
 def build_model(
     backbone="unet",
     log_scale=True,
+    shift_window=False,
     *args,
     **kwargs,
 ) -> PhaseNet:
     return PhaseNet(
         backbone=backbone,
         log_scale=log_scale,
+        shift_window=shift_window,
     )

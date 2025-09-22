@@ -10,6 +10,7 @@ def build_model(
     event_center_loss_weight=1.0,
     event_time_loss_weight=1.0,
     polarity_loss_weight=1.0,
+    shift_window=False,
     *args,
     **kwargs,
 ) -> PhaseNet:
@@ -22,4 +23,5 @@ def build_model(
         event_center_loss_weight=event_center_loss_weight,
         event_time_loss_weight=event_time_loss_weight,
         polarity_loss_weight=polarity_loss_weight,
+        shift_window=shift_window,
     )
