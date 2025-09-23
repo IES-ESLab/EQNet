@@ -443,12 +443,15 @@ def main(args):
         #     checkpoint = torch.load(glob(os.path.join(artifact_dir, "*.pth"))[0], map_location="cpu")
         #     model.load_state_dict(checkpoint["model"], strict=True)
 
+    model.load_state_dict(checkpoint["model"], strict=True)
+    if args.window_attention:
+        model = torch.compile(model)
     model_without_ddp = model
     if args.distributed:
         torch.distributed.barrier()
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-    model_without_ddp.load_state_dict(checkpoint["model"], strict=True)
+    #model_without_ddp.load_state_dict(checkpoint["model"], strict=True)
 
     if args.model == "phasenet_das":
         pred_phasenet_das(args, model, data_loader, pick_path, figure_path)
@@ -494,7 +497,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--result_path", type=str, default="results", help="path to result directory")
     parser.add_argument("--plot_figure", action="store_true", help="If plot figure for test")
     parser.add_argument("--min_prob", default=0.3, type=float, help="minimum probability for picking")
-    parser.add_argument("--shift_window", action="store_true", help="If use shift window for transformer")
+    parser.add_argument("--window-attention", action="store_true", help="If use shift window for transformer")
 
     ## Seismic
     parser.add_argument("--add_polarity", action="store_true", help="If use polarity information")

@@ -343,7 +343,7 @@ def create_block_mask_for_time_window(B, H, q_len, kv_len, f_len, sta_len, time_
 
         return prefix_mask | suffix_mask | mid_mask
         
-    block_mask = create_block_mask(time_window_mod, B, H, q_len, kv_len, device=device, BLOCK_SIZE=window_size, _compile=False)
+    block_mask = create_block_mask(time_window_mod, B, H, q_len, kv_len, device=device, BLOCK_SIZE=128, _compile=False)
     return block_mask
 
 @lru_cache

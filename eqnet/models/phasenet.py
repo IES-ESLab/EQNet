@@ -298,6 +298,7 @@ class PhaseNet(nn.Module):
         event_time_loss_weight=1.0,
         polarity_loss_weight=1.0,
         prompt_loss_weight=1.0,
+        window_attention=False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -341,6 +342,7 @@ class PhaseNet(nn.Module):
                 add_polarity=add_polarity,
                 add_event=add_event,
                 add_prompt=add_prompt,
+                window_attention=window_attention,
                 **kwargs,
             )
         else:
@@ -455,12 +457,12 @@ class PhaseNet(nn.Module):
 def build_model(
     backbone="unet",
     log_scale=True,
-    shift_window=False,
+    window_attention=False,
     *args,
     **kwargs,
 ) -> PhaseNet:
     return PhaseNet(
         backbone=backbone,
         log_scale=log_scale,
-        shift_window=shift_window,
+        window_attention=window_attention,
     )
