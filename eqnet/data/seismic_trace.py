@@ -378,7 +378,10 @@ class SeismicTraceIterableDataset(IterableDataset):
         format="h5",
         dataset="seismic_trace",
         phases=["P", "S"],
-        training=False,      
+        training=False,
+        ## for streaming
+        starttime: str | None = None,
+        endtime: str | None = None,      
         ## for training
         phase_width=[40],
         polarity_width=[20],
@@ -430,7 +433,11 @@ class SeismicTraceIterableDataset(IterableDataset):
                 print(f"Reading {tmp_hdf5_keys}")
                 self.data_list = pd.read_csv(tmp_hdf5_keys, header=None, names=["trace_id"])["trace_id"].values.tolist()
         elif data_list is not None:
-            self.data_list = self.parse_json_to_list(json_file=data_list)
+            self.data_list = self.parse_json_to_list(
+                json_file=data_list,
+                starttime=starttime,
+                endtime=endtime
+            )
         elif data_path is not None:
             self.data_list = [x for x in sorted(list(glob(os.path.join(data_path, f"{prefix}*.{format}"))))]
         else:
@@ -470,7 +477,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         self.min_nt = min_nt
         self.min_nx = min_nx
         self.system = system
-
+            
         if self.training:
             print(f"Total samples: {self.data_path}: {len(self.data_list)} files")
         else:
@@ -924,7 +931,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             output_dir=Path("./"),
             mode="stream"
         )
-
+        logging.info(f"Fetched {len(meta)} traces of {station_config.station} from {server} server.")
         if response_path is not None:
             inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
             meta = meta.remove_sensitivity(inv)
@@ -1236,7 +1243,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                                 "nt": nt,
                             }
 
-    def parse_json_to_list(self, json_file: str):
+    def parse_json_to_list(self, json_file: str, starttime: str, endtime: str):
         """
         Convert json list to a ClientConfig object.
         Here we use the parameters from AutoQuake to determine the fetch time window.
@@ -1255,8 +1262,8 @@ class SeismicTraceIterableDataset(IterableDataset):
                 data[config_name]["output_dir"] = None
                 data[config_name]["unzip_dir"] = None
                 data[config_name]["unzip"] = None
-                data[config_name]["starttime"] = self.starttime
-                data[config_name]["endtime"] = self.endtime
+                data[config_name]["starttime"] = starttime
+                data[config_name]["endtime"] = endtime
                 config = ClientConfig.model_validate(data[config_name])
                 data_list.append((server_name, config))       
             return data_list
