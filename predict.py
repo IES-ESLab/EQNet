@@ -391,7 +391,7 @@ def main(args):
         drop_last=False,
     )
 
-    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone, shift_window=args.shift_window,)
+    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone, window_attention=args.window_attention,)
     logger.info("Model:\n{}".format(model))
 
     model.to(device)
