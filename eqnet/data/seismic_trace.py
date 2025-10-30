@@ -813,7 +813,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                     inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
                     meta = meta.remove_sensitivity(inv)
                 elif pz_dir is not None:
-                    print('....remove sensitivity manually')
+                    logger.debug('....remove sensitivity manually')
                     meta = remove_sens_manually(meta, tmp, pz_dir)
                 stream += meta
                 # stream += obspy.read(tmp)
@@ -1134,7 +1134,6 @@ class SeismicTraceIterableDataset(IterableDataset):
                     sampling_rate=self.sampling_rate,
                 )
                 fname = fname.split(",")[0]  ##E,N,Z
-                print(fname)
             elif (self.format == "h5") and (self.dataset == "seismic_trace"):
                 meta = self.read_hdf5(fname)
             elif (self.format == "h5") and (self.dataset == "das"):
