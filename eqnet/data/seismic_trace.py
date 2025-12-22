@@ -1,11 +1,16 @@
 import logging
+logger = logging.getLogger(__name__)
 import os
+import sys
+AQ_PATH = os.path.abspath(os.path.join(__file__, "..", "..", ".."))
+sys.path.append(AQ_PATH)
 import random
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
+from typing import Literal
 
 import fsspec
 import h5py
@@ -341,7 +346,8 @@ def remove_sens_manually(meta, tmp, pz_dir):
     keyword = replacer(tmp)
     pz_file = _find_pz(pz_dir, keyword)
     sensitivity = get_sensitivity(pz_file)
-    meta[0].data = meta[0].data / sensitivity
+    for i in range(len(meta)):
+        meta[i].data = meta[i].data / sensitivity
     return meta
 
 class SeismicTraceIterableDataset(IterableDataset):
@@ -784,12 +790,13 @@ class SeismicTraceIterableDataset(IterableDataset):
                 if response_path is not None:
                     inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
                     meta = meta.remove_sensitivity(inv)
-                if pz_dir is not None:
-                    print('....remove sensitivity manually')
+                elif pz_dir is not None:
+                    logger.debug('....remove sensitivity manually')
                     meta = remove_sens_manually(meta, tmp, pz_dir)
                 stream += meta
                 # stream += obspy.read(tmp)
             stream = stream.merge(fill_value="latest")
+            #TODO: quite weird here, but keep it for now            
             if (response_path is None) and (response_xml is not None):
                 response = obspy.read_inventory(response_xml)
                 stream = stream.remove_sensitivity(response)
@@ -989,7 +996,6 @@ class SeismicTraceIterableDataset(IterableDataset):
                     sampling_rate=self.sampling_rate,
                 )
                 fname = fname.split(",")[0]  ##E,N,Z
-                print(fname)
             elif (self.format == "h5") and (self.dataset == "seismic_trace"):
                 meta = self.read_hdf5(fname)
             elif (self.format == "h5") and (self.dataset == "das"):
