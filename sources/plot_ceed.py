@@ -50,15 +50,11 @@ FIGURES_DIR = os.path.join(os.path.dirname(__file__), "figures")
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
 
-def create_synthetic_sample(seed: int = 42) -> Sample:
+def create_synthetic_sample(seed: int = 42, p_idx: int = 3000, s_idx: int = 4500) -> Sample:
     """Create a synthetic sample with realistic waveform pattern."""
     np.random.seed(seed)
     nt = 8192
     t = np.arange(nt)
-
-    # Create waveform with realistic P and S arrivals
-    p_idx = 2000
-    s_idx = 3500
 
     waveform = np.random.randn(3, nt).astype(np.float32) * 0.1  # Background noise
 
@@ -151,8 +147,9 @@ def figure_label_generation():
     print("Generating label_generation.png...")
 
     sample = create_synthetic_sample()
-    # Crop to show detail
-    sample = RandomCrop(4096)(sample)
+    # Use CenterCrop to ensure both P (2000) and S (3500) picks are visible
+    # CenterCrop from position 1000-5096 would include both picks
+    sample = CenterCrop(4096)(sample)
 
     labels = generate_phase_labels(sample)
 
@@ -183,7 +180,7 @@ def figure_label_generation():
     # Polarity
     ax = axes[3]
     ax.plot(labels["polarity"], color="green", linewidth=1.5)
-    ax.fill_between(range(sample.nt), labels["polarity_mask"] * 0.5, alpha=0.3, color="green")
+    ax.fill_between(range(sample.nt), labels["polarity_mask"], alpha=0.3, color="green")
     ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("Polarity")
     ax.set_ylim(0, 1.1)
@@ -192,7 +189,7 @@ def figure_label_generation():
     # Event center
     ax = axes[4]
     ax.plot(labels["event_center"], color="purple", linewidth=1.5)
-    ax.fill_between(range(sample.nt), labels["event_mask"] * 0.5, alpha=0.3, color="purple")
+    ax.fill_between(range(sample.nt), labels["event_mask"], alpha=0.3, color="purple")
     ax.set_ylabel("Event Center")
     ax.set_xlabel("Sample")
     ax.set_title("Event Center Label")
@@ -207,23 +204,9 @@ def figure_stacking_demo():
     """Figure 3: Demonstrate event stacking augmentation."""
     print("Generating stacking_demo.png...")
 
-    # Create multiple samples
-    sample1 = create_synthetic_sample(seed=42)
-    sample2 = create_synthetic_sample(seed=123)
-    sample2.p_indices = [4000]
-    sample2.s_indices = [5500]
-    sample2.event_center = [(4000 + 5500) / 2]
-
-    # Update sample2 waveform to have different arrival
-    t = np.arange(8192)
-    sample2.waveform = np.random.randn(3, 8192).astype(np.float32) * 0.1
-    for ch in range(3):
-        p_signal = np.exp(-((t - 4000) ** 2) / 5000) * np.sin(2 * np.pi * 5 * (t - 4000) / 100)
-        p_signal *= np.exp(-(t - 4000) / 200) * (t >= 4000)
-        sample2.waveform[ch] += p_signal * 0.7
-        s_signal = np.exp(-((t - 5500) ** 2) / 8000) * np.sin(2 * np.pi * 2 * (t - 5500) / 100)
-        s_signal *= np.exp(-(t - 5500) / 400) * (t >= 5500)
-        sample2.waveform[ch] += s_signal * 1.2
+    # Create two samples with different pick locations for stacking demo
+    sample1 = create_synthetic_sample(seed=42, p_idx=2000, s_idx=3500)
+    sample2 = create_synthetic_sample(seed=123, p_idx=5000, s_idx=6500)
 
     # Create buffer with sample2
     buffer = SampleBuffer(10)
