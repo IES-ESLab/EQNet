@@ -106,7 +106,12 @@ class MetricLogger:
         end = time.time()
         iter_time = SmoothedValue(fmt="{avg:.4f}")
         data_time = SmoothedValue(fmt="{avg:.4f}")
-        space_fmt = ":" + str(len(str(len(iterable)))) + "d"
+        try:
+            total = len(iterable)
+            space_fmt = ":" + str(len(str(total))) + "d"
+        except TypeError:
+            total = "?"
+            space_fmt = ""  # No formatting for unknown length
         if torch.cuda.is_available():
             log_msg = self.delimiter.join(
                 [
@@ -138,13 +143,13 @@ class MetricLogger:
             yield obj
             iter_time.update(time.time() - end)
             if i % print_freq == 0:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
+                eta_seconds = iter_time.global_avg * (total - i) if isinstance(total, int) else 0
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 if torch.cuda.is_available():
                     print(
                         log_msg.format(
                             i,
-                            len(iterable),
+                            total,
                             eta=eta_string,
                             meters=str(self),
                             time=str(iter_time),
@@ -157,7 +162,7 @@ class MetricLogger:
                     print(
                         log_msg.format(
                             i,
-                            len(iterable),
+                            total,
                             eta=eta_string,
                             meters=str(self),
                             time=str(iter_time),

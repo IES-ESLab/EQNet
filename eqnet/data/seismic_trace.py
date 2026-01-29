@@ -105,9 +105,25 @@ def generate_event_label(
     nt=8192,
     mask_width=None,
 ):
+    """Generate event labels with separate masks for detection and regression.
+
+    Args:
+        reference_center: List of event center indices
+        event_time: List of event time indices
+        label_width: Gaussian width for each event
+        nt: Number of time samples
+        mask_width: Width of time regression mask (default: 1.5 * label_width)
+
+    Returns:
+        target_center: Gaussian label for event center detection
+        target_time: Time offset for regression
+        center_mask: Mask where center Gaussian > 0 (for detection loss)
+        time_mask: Narrow mask around centers (for time regression loss)
+    """
     target_center = np.zeros(nt, dtype=np.float32)
     target_time = np.zeros(nt, dtype=np.float32)
-    mask = np.zeros(nt, dtype=np.float32)
+    center_mask = np.zeros(nt, dtype=np.float32)
+    time_mask = np.zeros(nt, dtype=np.float32)
 
     if len(label_width) == 1:
         label_width = label_width * len(reference_center)
@@ -121,11 +137,14 @@ def generate_event_label(
         gaussian = np.exp(-(t**2) / (2 * (w / 6) ** 2))
         gaussian[gaussian < 0.05] = 0.0
         target_center += gaussian
-        mask[int(c0) - m : int(c0) + m] = 1.0
+        # center_mask: where Gaussian is non-zero (for detection loss)
+        center_mask[gaussian > 0] = 1.0
+        # time_mask: narrow window for regression loss
+        time_mask[int(c0) - m : int(c0) + m] = 1.0
         t = np.arange(nt) - t0
         target_time[int(c0) - m : int(c0) + m] = t[int(c0) - m : int(c0) + m]
 
-    return target_center, target_time, mask
+    return target_center, target_time, center_mask, time_mask
 
 
 def stack_event(
@@ -143,8 +162,10 @@ def stack_event(
     event_center2 = meta2["event_center"].copy()
     event_time1 = meta1["event_time"].copy()
     event_time2 = meta2["event_time"].copy()
-    event_mask1 = meta1["event_mask"].copy()
-    event_mask2 = meta2["event_mask"].copy()
+    event_center_mask1 = meta1["event_center_mask"].copy()
+    event_center_mask2 = meta2["event_center_mask"].copy()
+    event_time_mask1 = meta1["event_time_mask"].copy()
+    event_time_mask2 = meta2["event_time_mask"].copy()
     polarity1 = meta1["polarity"].copy()
     polarity2 = meta2["polarity"].copy()
     polarity_mask1 = meta1["polarity_mask"].copy()
@@ -193,8 +214,8 @@ def stack_event(
             if np.max(phase_mask1 + tmp_mask2) >= 2.0:
                 tries += 1
                 continue
-            tmp_mask2 = np.roll(event_mask2, shift, axis=-1)
-            if np.max(event_mask1 + tmp_mask2) >= 2.0:
+            tmp_mask2 = np.roll(event_center_mask2, shift, axis=-1)
+            if np.max(event_center_mask1 + tmp_mask2) >= 2.0:
                 tries += 1
                 continue
             tmp_mask2 = np.roll(duration_mask2, shift, axis=-1)
@@ -207,7 +228,8 @@ def stack_event(
             phase_mask2_ = np.roll(phase_mask2, shift, axis=-1)
             event_time2_ = np.roll(event_time2, shift, axis=-1)
             event_center2_ = np.roll(event_center2, shift, axis=-1)
-            event_mask2_ = np.roll(event_mask2, shift, axis=-1)
+            event_center_mask2_ = np.roll(event_center_mask2, shift, axis=-1)
+            event_time_mask2_ = np.roll(event_time_mask2, shift, axis=-1)
             polarity2_ = np.roll(polarity2, shift, axis=-1)
             # polarity2_ = np.roll(polarity2, shift, axis=-1)
             polarity_mask2_ = np.roll(polarity_mask2, shift, axis=-1)
@@ -227,11 +249,12 @@ def stack_event(
 
             phase_mask1 = np.minimum(1.0, phase_mask1 + phase_mask2_)
             tmp_time = np.zeros_like(event_time1)
-            tmp_time[event_mask1 >= 1.0] = event_time1[event_mask1 >= 1.0]
-            tmp_time[event_mask2_ >= 1.0] = event_time2_[event_mask2_ >= 1.0]
+            tmp_time[event_time_mask1 >= 1.0] = event_time1[event_time_mask1 >= 1.0]
+            tmp_time[event_time_mask2_ >= 1.0] = event_time2_[event_time_mask2_ >= 1.0]
             event_time1 = tmp_time
             event_center1 = event_center1 + event_center2_
-            event_mask1 = np.minimum(1.0, event_mask1 + event_mask2_)
+            event_center_mask1 = np.minimum(1.0, event_center_mask1 + event_center_mask2_)
+            event_time_mask1 = np.minimum(1.0, event_time_mask1 + event_time_mask2_)
             polarity1 = ((polarity1 - 0.5) + (polarity2_ - 0.5) * flip) + 0.5
             # polarity = np.zeros_like(polarity1)
             # if flip > 0:
@@ -257,7 +280,8 @@ def stack_event(
         "phase_mask": phase_mask1,
         "event_center": event_center1,
         "event_time": event_time1,
-        "event_mask": event_mask1,
+        "event_center_mask": event_center_mask1,
+        "event_time_mask": event_time_mask1,
         "polarity": polarity1,
         "polarity_mask": polarity_mask1,
         "station_location": meta1["station_location"],
@@ -325,7 +349,8 @@ def cut_data(meta, nt=1024 * 4, min_point=200):
     phase_mask = np.roll(meta["phase_mask"], -it, axis=-1)[:, :nt]
     event_center = np.roll(meta["event_center"], -it, axis=-1)[:, :nt]
     event_time = np.roll(meta["event_time"], -it, axis=-1)[:, :nt]
-    event_mask = np.roll(meta["event_mask"], -it, axis=-1)[:, :nt]
+    event_center_mask = np.roll(meta["event_center_mask"], -it, axis=-1)[:, :nt]
+    event_time_mask = np.roll(meta["event_time_mask"], -it, axis=-1)[:, :nt]
     # polarity = np.roll(meta["polarity"], -it, axis=-1)[:, :, :nt]
     polarity = np.roll(meta["polarity"], -it, axis=-1)[:, :nt]
     polarity_mask = np.roll(meta["polarity_mask"], -it, axis=-1)[:, :nt]
@@ -336,7 +361,8 @@ def cut_data(meta, nt=1024 * 4, min_point=200):
         "phase_mask": phase_mask,
         "event_center": event_center,
         "event_time": event_time,
-        "event_mask": event_mask,
+        "event_center_mask": event_center_mask,
+        "event_time_mask": event_time_mask,
         "polarity": polarity,
         "polarity_mask": polarity_mask,
         "station_location": meta["station_location"],
@@ -765,7 +791,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             t0.append(hdf5_fp[str(e)].attrs["event_time_index"] + shift_t0)
 
         duration = np.array([duration])  # for one station and multiple events
-        event_center, event_time, event_mask = generate_event_label(c0, t0, nt=nt, label_width=self.event_width)
+        event_center, event_time, event_center_mask, event_time_mask = generate_event_label(c0, t0, nt=nt, label_width=self.event_width)
 
         ## station location
         station_location = np.array(
@@ -803,7 +829,8 @@ class SeismicTraceIterableDataset(IterableDataset):
             "event_center": event_center[np.newaxis, :],
             "event_location": event_location[np.newaxis, :, :],
             "event_time": event_time[np.newaxis, :],
-            "event_mask": event_mask[np.newaxis, :],
+            "event_center_mask": event_center_mask[np.newaxis, :],
+            "event_time_mask": event_time_mask[np.newaxis, :],
             "station_location": station_location[np.newaxis, :],
             "polarity": polarity[np.newaxis, :],
             # "polarity": polarity[:, np.newaxis, :],
@@ -867,7 +894,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         duration = np.array([[duration]])  # for one station and multiple events
         c0 = [np.mean(attrs["phase_index"])]
         t0 = [attrs["event_time_index"]]
-        event_center, event_time, event_mask = generate_event_label(c0, t0, nt=nt, label_width=self.event_width)
+        event_center, event_time, event_center_mask, event_time_mask = generate_event_label(c0, t0, nt=nt, label_width=self.event_width)
 
         ## station location
         station_location = attrs["station_location"]#[np.newaxis, :]
@@ -882,7 +909,8 @@ class SeismicTraceIterableDataset(IterableDataset):
             "event_center": event_center[np.newaxis, :],
             "event_location": event_location[:, :, np.newaxis],
             "event_time": event_time[np.newaxis, :],
-            "event_mask": event_mask[np.newaxis, :],
+            "event_center_mask": event_center_mask[np.newaxis, :],
+            "event_time_mask": event_time_mask[np.newaxis, :],
             "station_location": station_location[np.newaxis, :],
             "polarity": polarity[np.newaxis, :],
             # "polarity": polarity[:, np.newaxis, :],
@@ -976,7 +1004,8 @@ class SeismicTraceIterableDataset(IterableDataset):
                 polarity = meta["polarity"][np.newaxis, :, :: self.polarity_feature_scale]
                 polarity_mask = meta["polarity_mask"][np.newaxis, :, :: self.polarity_feature_scale]
                 event_time = meta["event_time"][np.newaxis, :, :: self.event_feature_scale]
-                event_mask = meta["event_mask"][np.newaxis, :, :: self.event_feature_scale]
+                event_center_mask = meta["event_center_mask"][np.newaxis, :, :: self.event_feature_scale]
+                event_time_mask = meta["event_time_mask"][np.newaxis, :, :: self.event_feature_scale]
                 station_location = meta["station_location"]
 
                 waveform = np.nan_to_num(waveform.astype(np.float16))
@@ -989,7 +1018,8 @@ class SeismicTraceIterableDataset(IterableDataset):
                     "phase_mask": torch.from_numpy(phase_mask).float(),
                     "event_center": torch.from_numpy(event_center).float(),
                     "event_time": torch.from_numpy(event_time).float(),
-                    "event_mask": torch.from_numpy(event_mask).float(),
+                    "event_center_mask": torch.from_numpy(event_center_mask).float(),
+                    "event_time_mask": torch.from_numpy(event_time_mask).float(),
                     "station_location": torch.from_numpy(station_location).float(),
                     "polarity": torch.from_numpy(polarity).float(),
                     "polarity_mask": torch.from_numpy(polarity_mask).float(),

@@ -326,27 +326,28 @@ def plot_phasenet_train(meta, phase, epoch=0, figure_dir="figures", prefix=""):
     for i in range(meta["data"].shape[0]):
         plt.close("all")
 
-        chn_name = ["E", "N", "Z"]
+        chn_name = ["E", "N", "Z"] if nc >= 3 else [f"Ch{j}" for j in range(nc)]
+        num_data_plots = min(nc, 3)
 
         if "raw_data" in meta:
-            shift = 3
-            fig, axes = plt.subplots(7, 1, figsize=(10, 6))
-            for j in range(3):
+            shift = num_data_plots
+            fig, axes = plt.subplots(num_data_plots * 2 + 1, 1, figsize=(10, 6))
+            for j in range(num_data_plots):
                 axes[j].plot(t, meta["raw_data"][i, j, 0, :], linewidth=0.5, color="k", label=f"{chn_name[j]}")
                 axes[j].set_xticklabels([])
                 axes[j].set_xlim(t[0], t[-1])
                 axes[j].grid("on")
         else:
-            fig, axes = plt.subplots(4, 1, figsize=(10, 6))
+            fig, axes = plt.subplots(num_data_plots + 1, 1, figsize=(10, 6))
             shift = 0
 
-        for j in range(3):
+        for j in range(num_data_plots):
             axes[j + shift].plot(t, meta["data"][i, j, 0, :], linewidth=0.5, color="k", label=f"{chn_name[j]}")
             axes[j + shift].set_xticklabels([])
             axes[j + shift].set_xlim(t[0], t[-1])
             axes[j + shift].grid("on")
 
-        k = 3 + shift
+        k = num_data_plots + shift
         axes[k].plot(t, phase[i, 1, 0, :], "b")
         axes[k].plot(t, phase[i, 2, 0, :], "r")
         axes[k].plot(t, meta["phase_pick"][i, 1, 0, :], "--C0")
@@ -495,16 +496,17 @@ def plot_phasenet_plus_train(
         axes[k + 1].grid("on")
 
         t = torch.arange(nt_event) * dt_event
+        t_label = torch.arange(meta["event_center"].shape[-1]) * dt
         axes[k + 2].plot(t, event_center[i, 0, 0, :], "b")
-        axes[k + 2].plot(t, meta["event_center"][i, 0, 0, :], "--C0")
-        axes[k + 2].plot(t, meta["event_mask"][i, 0, 0, :], ":", color="gray")
+        axes[k + 2].plot(t_label, meta["event_center"][i, 0, 0, :], "--C0")
+        axes[k + 2].plot(t_label, meta["event_center_mask"][i, 0, 0, :], ":", color="gray")
         axes[k + 2].set_xlim(t[0], t[-1])
         axes[k + 2].set_ylim(-0.05, 1.05)
         axes[k + 2].grid("on")
 
         axes2 = axes[k + 2].twinx()
         axes2.plot(t, event_time[i, 0, 0, :], "--C1")
-        axes2.plot(t, meta["event_time"][i, 0, 0, :], ":C3")
+        axes2.plot(t_label, meta["event_time"][i, 0, 0, :], ":C3")
 
         if "RANK" in os.environ:
             rank = int(os.environ["RANK"])

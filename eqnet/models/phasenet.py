@@ -1,188 +1,174 @@
-from typing import Any, Dict, List, Optional
+"""
+PhaseNet: Deep learning for seismic phase picking.
+
+This module provides the PhaseNet architecture with various heads for:
+- Phase picking (P/S wave detection)
+- Polarity classification
+- Event detection and timing
+- Prompt-based picking (SAM-style)
+
+The architecture follows modern best practices from timm and torchvision.
+"""
+from typing import Dict
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .prompt import MaskDecoder, PromptEncoder, TwoWayTransformer
-from .resnet1d import BasicBlock, Bottleneck, ResNet
-from .unet import UNet
-from .x_unet import XUnet
+from .unet import Unet
 
 
-class UNetHead(nn.Module):
-    def __init__(
-        self, in_channels: int, out_channels: int, kernel_size=(1, 1), padding=(0, 0), feature_name: str = "phase"
-    ) -> None:
-        super().__init__()
-        self.out_channels = out_channels
-        self.feature_name = feature_name
-        self.layers = nn.Conv2d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding
-        )
+# =============================================================================
+# Minimal Seismic UNet Configuration
+# =============================================================================
 
-    def forward(self, features, targets=None, mask=None):
-        x = features[self.feature_name]
-        x = self.layers(x)
+# Default config for seismic data (3, 1, nt) - memory efficient
+SEISMIC_UNET_CONFIG = dict(
+    dim=32,
+    dim_mults=(1, 2, 4, 8),
+    num_resnet_blocks=1,
+    attn_heads=4,
+    attn_dim_head=32,
+    layer_attns=False,  # disable attention for efficiency
+    memory_efficient=True,
+    init_cross_embed=False,  # simpler init conv
+    final_resnet_block=False,  # skip final resnet for efficiency
+    space_stride=1,  # no spatial downsampling (single station)
+    time_stride=4,  # temporal downsampling
+    space_kernel=1,
+    time_kernel=7,
+)
 
-        loss = None
-        if targets is not None:
-            loss = self.losses(x, targets, mask)
 
-        return x, loss
+# =============================================================================
+# Loss Functions
+# =============================================================================
 
-    def losses(self, inputs, targets, mask=None):
-        """
-        targets: (batch, channel, station, time)
-        """
-        inputs = inputs.float()
-        log_targets = torch.nan_to_num(torch.log(targets))
+def kl_divergence_loss(inputs: Tensor, targets: Tensor, mask: Tensor = None, num_classes: int = 3) -> Tensor:
+    """KL divergence loss with optional masking.
 
-        nx_in, nt_in = inputs.shape[-2:]
-        nx_ta, nt_ta = targets.shape[-2:]
-        # assert nt_ta == nt_in
-        # if nx_ta != nx_in:
-        if nx_ta != nx_in or nt_ta != nt_in:
-            inputs = F.interpolate(inputs, size=(nx_ta, nt_ta), mode="bilinear", align_corners=False)
+    Uses cross-entropy minus minimum entropy for numerical stability.
 
-        if mask is None:
-            if self.out_channels == 1:
-                min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
-                loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
-                loss = loss.mean()
+    Args:
+        inputs: Predictions (logits), shape (B, C, ...)
+        targets: Target distributions, shape (B, C, ...)
+        mask: Optional mask, shape (B, 1, ...) or (B, ...)
+        num_classes: Number of output classes (1 for binary, >1 for multiclass)
 
-                # inputs = torch.sigmoid(inputs)
-                # loss = F.kl_div(inputs.log(), targets, reduction="none") + F.kl_div(
-                #     (1 - inputs).log(), 1 - targets, reduction="none"
-                # )
-                # loss = torch.nan_to_num(loss)
-                # loss = loss.mean()
+    Returns:
+        Scalar loss value
+    """
+    inputs = inputs.float()
+    log_targets = torch.nan_to_num(torch.log(targets))
 
-            else:
-                min_loss = -(targets * log_targets).sum(dim=1)  # cross_entropy sum over dim=1
-                loss = F.cross_entropy(inputs, targets, reduction="none") - min_loss
-                loss = loss.mean()
+    # Handle size mismatch
+    if inputs.shape[-2:] != targets.shape[-2:]:
+        inputs = F.interpolate(inputs, size=targets.shape[-2:], mode="bilinear", align_corners=False)
 
-                # inputs = torch.log_softmax(inputs, dim=1)
-                # loss = F.kl_div(inputs, targets, reduction="none").sum(dim=1).mean()
-
-                # focal loss
-                # ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-                # pt = torch.exp(-ce_loss)
-                # focal_loss = (1 - pt) ** 2 * ce_loss
-                # loss = focal_loss.mean()
+    if mask is None:
+        if num_classes == 1:
+            # Binary cross entropy
+            min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
+            loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
         else:
-            mask = mask.type_as(inputs)
-            mask_sum = mask.sum()
-            if mask_sum == 0.0:
-                mask_sum = 1.0
+            # Multiclass cross entropy
+            min_loss = -(targets * log_targets).sum(dim=1)
+            loss = F.cross_entropy(inputs, targets, reduction="none") - min_loss
+        return loss.mean()
 
-            if self.out_channels == 1:
-                min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
-                loss = (
-                    torch.sum(
-                        (F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss) * mask
-                    )
-                    / mask_sum
-                )
+    # Masked loss
+    mask = mask.float()
+    mask_sum = mask.sum().clamp(min=1.0)
 
-                # inputs = torch.sigmoid(inputs)
-                # kl_div = F.kl_div(inputs.log(), targets, reduction="none") + F.kl_div(
-                #     (1 - inputs).log(), 1 - targets, reduction="none"
-                # )
-                # kl_div = torch.nan_to_num(kl_div)
-                # loss = torch.sum(kl_div * mask) / mask_sum
+    if num_classes == 1:
+        min_loss = -(targets * log_targets + (1 - targets) * torch.nan_to_num(torch.log(1 - targets)))
+        loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
+        return (loss * mask).sum() / mask_sum
+    else:
+        min_loss = -(targets * log_targets).sum(dim=1)
+        loss = F.cross_entropy(inputs, targets, reduction="none") - min_loss
+        if mask.dim() > loss.dim():
+            mask = mask.squeeze(1)
+        return (loss * mask).sum() / mask_sum
 
-            else:
-                min_loss = -(targets * log_targets).sum(dim=1)
-                loss = (
-                    torch.sum((F.cross_entropy(inputs, targets, reduction="none") - min_loss) * mask.squeeze(1))
-                    / mask_sum
-                )  # cross_entropy already sum over dim=1
 
-                # inputs = torch.log_softmax(inputs, dim=1)
-                # loss = torch.sum(F.kl_div(inputs, targets, reduction="none").sum(dim=1) * mask.squeeze(1)) / mask_sum
+def regression_loss(inputs: Tensor, targets: Tensor, mask: Tensor = None, scaling: float = 1000.0) -> Tensor:
+    """L1 regression loss with optional masking and scaling.
 
-                # focal loss
-                # ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-                # pt = torch.exp(-ce_loss)
-                # focal_loss = (1 - pt) ** 5 * ce_loss
-                # loss = torch.sum(focal_loss * mask.squeeze(1)) / mask_sum
+    Args:
+        inputs: Predictions, shape (B, C, ...)
+        targets: Target values, shape (B, C, ...)
+        mask: Optional mask
+        scaling: Scale factor for loss normalization
 
-        return loss
+    Returns:
+        Scalar loss value
+    """
+    inputs = inputs.float()
+
+    if inputs.shape[-2:] != targets.shape[-2:]:
+        inputs = F.interpolate(inputs, size=targets.shape[-2:], mode="bilinear", align_corners=False)
+
+    if mask is None:
+        return F.mse_loss(inputs, targets) / scaling
+
+    mask = mask.float()
+    mask_sum = mask.sum().clamp(min=1.0)
+    return (F.l1_loss(inputs, targets, reduction="none") * mask).sum() / mask_sum / scaling
+
+
+# =============================================================================
+# Head Modules (Loss only - activations computed inline)
+# =============================================================================
+
+class PhaseHead(nn.Module):
+    """Head for phase picking - computes loss on backbone output."""
+
+    def __init__(self, num_classes: int = 3):
+        super().__init__()
+        self.num_classes = num_classes
+
+    def forward(self, logits: Tensor, targets: Tensor = None, mask: Tensor = None):
+        loss = kl_divergence_loss(logits, targets, mask, self.num_classes) if targets is not None else None
+        return logits, loss
+
+
+class PolarityHead(nn.Module):
+    """Head for polarity prediction - computes loss on backbone output."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, logits: Tensor, targets: Tensor = None, mask: Tensor = None):
+        loss = kl_divergence_loss(logits, targets, mask, num_classes=1) if targets is not None else None
+        return logits, loss
 
 
 class EventHead(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=(1, 1),
-        padding=(0, 0),
-        scaling=1000.0,
-        feature_name: str = "event",
-    ) -> None:
+    """Head for event detection and timing."""
+
+    def __init__(self, scaling: float = 1000.0):
         super().__init__()
-        self.out_channels = out_channels
-        self.feature_name = feature_name
         self.scaling = scaling
-        # self.layers = nn.Conv2d(
-        #     in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding
-        # )
-        # self.layers = nn.Sequential(
-        #     nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=(7, 1), padding=(3, 0)),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding),
-        #     nn.LeakyReLU(),
-        # )
-        self.layers = nn.Sequential(
-            nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size, padding=padding),
-            nn.LeakyReLU(),
-            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding),
-            nn.LeakyReLU(),
-        )
 
-    def forward(self, features, targets=None, mask=None):
-        x = features[self.feature_name]
-        x = self.layers(x) * self.scaling
+    def forward_center(self, logits: Tensor, targets: Tensor = None, mask: Tensor = None):
+        loss = kl_divergence_loss(logits, targets, mask, num_classes=1) if targets is not None else None
+        return logits, loss
 
-        loss = None
-        if targets is not None:
-            loss = self.losses(x, targets, mask)
-        return x, loss
-
-    def losses(self, inputs, targets, mask=None):
-        inputs = inputs.float()
-
-        nx_in, nt_in = inputs.shape[-2:]
-        nx_ta, nt_ta = targets.shape[-2:]
-        assert nt_ta == nt_in
-        if nx_ta != nx_in:
-            inputs = F.interpolate(inputs, size=(nx_ta, nt_ta), mode="bilinear", align_corners=False)
-
-        if mask is None:
-            loss = F.mse_loss(inputs, targets) / self.scaling
-        else:
-            mask = mask.type_as(inputs)
-            mask_sum = mask.sum()
-            if mask_sum == 0.0:
-                mask_sum = 1.0
-            loss = torch.sum(F.l1_loss(inputs, targets, reduction="none") * mask) / mask_sum / self.scaling
-            # loss = torch.sum(torch.abs(inputs - targets) * mask, dim=(1, 2, 3)).mean() / mask_sum
-
-        return loss
+    def forward_time(self, preds: Tensor, targets: Tensor = None, mask: Tensor = None):
+        loss = regression_loss(preds, targets, mask, self.scaling) if targets is not None else None
+        return preds, loss
 
 
 class PromptHead(nn.Module):
-    def __init__(
-        self, prompt_embed_dim=32 * 4, input_size=[8, 16 * 16], embedding_size=[8, 16], feature_name="prompt"
-    ):
-        super().__init__()
+    """Head for prompt-based picking (SAM-style)."""
 
+    def __init__(self, prompt_embed_dim: int = 128, input_size=(8, 256), embedding_size=(8, 16)):
+        super().__init__()
         self.prompt_embed_dim = prompt_embed_dim
         self.input_size = input_size
         self.embedding_size = embedding_size
-        self.feature_name = feature_name
 
         self.prompt_encoder = PromptEncoder(
             embed_dim=prompt_embed_dim,
@@ -203,105 +189,95 @@ class PromptHead(nn.Module):
             iou_head_hidden_dim=16,
         )
 
-    def forward(self, features, points, pos, targets=None):
+    def forward(self, features: Tensor, points: Tensor, pos: Tensor, targets: Tensor = None):
         B, S, T, _ = pos.shape
 
         pos = pos.view(B, S * T, 3)
-        labels = torch.ones((points.shape[0], points.shape[1]))
+        labels = torch.ones((points.shape[0], points.shape[1]), device=points.device)
         points = (points, labels)
-        labels = torch.ones((pos.shape[0], pos.shape[1]))
-        pos = (pos, labels)
+        pos_labels = torch.ones((pos.shape[0], pos.shape[1]), device=pos.device)
+        pos = (pos, pos_labels)
         image_size = (S, T * 16)
         image_embedding_size = (S, T)
 
         point_embeddings, dense_embeddings = self.prompt_encoder(
-            points=points, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
+            points=points, boxes=None, masks=None,
+            image_size=image_size, image_embedding_size=image_embedding_size
         )
         pos_embeddings, _ = self.prompt_encoder(
-            points=pos, boxes=None, masks=None, image_size=image_size, image_embedding_size=image_embedding_size
+            points=pos, boxes=None, masks=None,
+            image_size=image_size, image_embedding_size=image_embedding_size
         )
-        C = point_embeddings.shape[-1]  # BxNxC
-        pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, S, T)  # Bx(ST)xC -> BxSxTxC
-
-        # ## DEBUG pos_embeddings
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(12, 5))
-        # plt.subplot(1, 3, 1)
-        # plt.pcolormesh(pos_embeddings[0, :, 0, :].detach().cpu().numpy())
-        # plt.colorbar()
-        # plt.xlabel("Time")
-        # plt.subplot(1, 3, 2)
-        # plt.pcolormesh(pos_embeddings[0, :, :, 0].detach().cpu().numpy())
-        # plt.colorbar()
-        # plt.xlabel("Station")
-        # plt.savefig("pos_embeddings.png")
-        # plt.close()
-        # raise
+        C = point_embeddings.shape[-1]
+        pos_embeddings = pos_embeddings.permute(0, 2, 1).reshape(B, C, S, T)
 
         low_res_masks = []
         iou_predictions = []
-        image_embeddings = features[self.feature_name]
 
-        for i in range(B):  ## FIXME: Don't understand why have to use loop here
-            low_res_masks_, iou_predictions_ = self.mask_decoder(
-                image_embeddings=image_embeddings[i : i + 1],
-                image_pe=pos_embeddings[i : i + 1],
-                sparse_prompt_embeddings=point_embeddings[i : i + 1],
-                dense_prompt_embeddings=dense_embeddings[i : i + 1],
+        for i in range(B):
+            mask, iou = self.mask_decoder(
+                image_embeddings=features[i:i+1],
+                image_pe=pos_embeddings[i:i+1],
+                sparse_prompt_embeddings=point_embeddings[i:i+1],
+                dense_prompt_embeddings=dense_embeddings[i:i+1],
                 multimask_output=False,
             )
-
-            low_res_masks.append(low_res_masks_)
-            iou_predictions.append(iou_predictions_)
+            low_res_masks.append(mask)
+            iou_predictions.append(iou)
 
         low_res_masks = torch.cat(low_res_masks, dim=0)
-        iou_predictions = torch.cat(iou_predictions, dim=0)
 
         loss = None
         if targets is not None:
-            loss = self.losses(low_res_masks, targets)
+            # Focal loss for prompt
+            prob = low_res_masks.sigmoid()
+            min_loss = -(
+                targets * torch.nan_to_num(torch.log(targets)) +
+                (1 - targets) * torch.nan_to_num(torch.log(1 - targets))
+            )
+            ce_loss = F.binary_cross_entropy_with_logits(low_res_masks, targets, reduction="none") - min_loss
+            p_t = prob * targets + (1 - prob) * (1 - targets)
+            loss = 10 * (ce_loss * ((1 - p_t) ** 2)).mean()
 
         return low_res_masks, loss
 
-    def losses(self, inputs, targets):
-        inputs = inputs.float()
-        prob = inputs.sigmoid()
 
-        # ## focal loss
-        # bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-        # pt = torch.exp(-bce_loss) # probability of the correct class
-        # focal_loss = (1 - pt) ** 2 * bce_loss # alpha=1, gamma=2
-        # loss = torch.mean(focal_loss) * 100
-
-        min_loss = -(
-            targets * torch.nan_to_num(torch.log(targets)) + (1 - targets) * torch.nan_to_num(torch.log(1 - targets))
-        )
-        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") - min_loss
-        p_t = prob * targets + (1 - prob) * (1 - targets)
-        gamma = 2.0
-        loss = ce_loss * ((1 - p_t) ** gamma)
-        loss = 10 * torch.mean(loss)
-
-        return loss
-
+# =============================================================================
+# PhaseNet Model
+# =============================================================================
 
 class PhaseNet(nn.Module):
+    """PhaseNet: Deep learning model for seismic phase picking.
+
+    Args:
+        backbone: Backbone type ("unet", "unet64", "unet256", "unet1024")
+        log_scale: Apply log transform to input
+        add_stft: Add STFT features
+        add_polarity: Enable polarity prediction
+        add_event: Enable event detection
+        add_prompt: Enable prompt-based picking
+        event_center_loss_weight: Weight for event center loss
+        event_time_loss_weight: Weight for event time loss
+        polarity_loss_weight: Weight for polarity loss
+        prompt_loss_weight: Weight for prompt loss
+    """
+
     def __init__(
         self,
-        backbone="xunet",
-        log_scale=False,
-        add_stft=False,
-        add_polarity=False,
-        add_event=False,
-        add_prompt=False,
-        event_center_loss_weight=1.0,
-        event_time_loss_weight=1.0,
-        polarity_loss_weight=1.0,
-        prompt_loss_weight=1.0,
-        window_attention=False,
+        backbone: str = "unet",
+        log_scale: bool = False,
+        add_stft: bool = False,
+        add_polarity: bool = False,
+        add_event: bool = False,
+        add_prompt: bool = False,
+        event_center_loss_weight: float = 1.0,
+        event_time_loss_weight: float = 1.0,
+        polarity_loss_weight: float = 1.0,
+        prompt_loss_weight: float = 1.0,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__()
+
         self.backbone_name = backbone
         self.add_stft = add_stft
         self.add_event = add_event
@@ -312,157 +288,169 @@ class PhaseNet(nn.Module):
         self.polarity_loss_weight = polarity_loss_weight
         self.prompt_loss_weight = prompt_loss_weight
 
-        if backbone == "unet":
-            # self.backbone = UNet(
-            #     init_features=8,
-            #     upsample="conv_transpose",
-            #     log_scale=log_scale,
-            #     add_stft=add_stft,
-            #     add_polarity=add_polarity,
-            #     add_event=add_event,
-            #     add_prompt=add_prompt,
-            # )
-            self.backbone = UNet(
-                channels=3,
-                dim=16,
-                out_dim=16,
-                log_scale=log_scale,
-                add_stft=add_stft,
-                add_polarity=add_polarity,
-                add_event=add_event,
-                add_prompt=add_prompt,
-            )
-        elif backbone == "xunet":
-            self.backbone = XUnet(
-                channels=3,
-                dim=32,
-                out_dim=32,
-                log_scale=log_scale,
-                add_stft=add_stft,
-                add_polarity=add_polarity,
-                add_event=add_event,
-                add_prompt=add_prompt,
-                window_attention=window_attention,
-                **kwargs,
-            )
-        else:
-            raise ValueError("backbone only supports unet or xunet")
+        # Build backbone with seismic-optimized defaults
+        backbone_kwargs = {
+            **SEISMIC_UNET_CONFIG,  # minimal seismic defaults
+            "channels": 3,
+            "phase_channels": 3,
+            "log_scale": log_scale,
+            "add_stft": add_stft,
+            "add_polarity": add_polarity,
+            "add_event": add_event,
+            "add_prompt": add_prompt,
+            **kwargs,  # user overrides
+        }
 
         if backbone == "unet":
-            self.phase_picker = UNetHead(16, 3, feature_name="phase")
-            if self.add_polarity:
-                self.polarity_picker = UNetHead(16, 1, feature_name="polarity")
-            if self.add_event:
-                self.event_detector = UNetHead(16, 1, feature_name="event")
-                self.event_timer = EventHead(16, 1, feature_name="event")
-            if self.add_prompt:
-                self.prompt_picker = PromptHead(prompt_embed_dim=64, feature_name="prompt")
-
-        elif backbone == "xunet":
-            self.phase_picker = UNetHead(32, 3, feature_name="phase")
-            if self.add_polarity:
-                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
-            if self.add_event:
-                self.event_detector = UNetHead(32, 1, feature_name="event")
-                self.event_timer = EventHead(32, 1, feature_name="event")
-            if self.add_prompt:
-                self.prompt_picker = PromptHead(prompt_embed_dim=128, feature_name="prompt")
+            self.backbone = Unet(**backbone_kwargs)
         else:
-            raise ValueError("backbone only supports unet or xunet")
+            raise ValueError(f"Unknown backbone: {backbone}. Use 'unet'.")
+
+        # Compute embed_dim from dim_mults
+        dim = backbone_kwargs.get("dim", 32)
+        dim_mults = backbone_kwargs.get("dim_mults", (1, 2, 4, 8))
+        embed_dim = dim * dim_mults[-1]  # mid_dim for prompt
+
+        # Heads (loss computation only)
+        self.phase_head = PhaseHead(num_classes=3)
+
+        if self.add_polarity:
+            self.polarity_head = PolarityHead()
+
+        if self.add_event:
+            self.event_head = EventHead()
+
+        if self.add_prompt:
+            self.prompt_head = PromptHead(prompt_embed_dim=embed_dim)
 
     @property
     def device(self):
         return next(self.parameters()).device
 
-    def forward(self, batched_inputs: Tensor) -> Dict[str, Tensor]:
-        data = batched_inputs["data"].to(self.device)
+    def forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        data = batch["data"].to(self.device)
 
-        phase_pick = batched_inputs["phase_pick"].to(self.device) if "phase_pick" in batched_inputs else None
-        phase_mask = batched_inputs["phase_mask"].to(self.device) if "phase_mask" in batched_inputs else None
-        event_center = batched_inputs["event_center"].to(self.device) if "event_center" in batched_inputs else None
-        event_time = batched_inputs["event_time"].to(self.device) if "event_time" in batched_inputs else None
-        if "event_center_mask" in batched_inputs:
-            event_center_mask = batched_inputs["event_center_mask"].to(self.device)
-            event_time_mask = batched_inputs["event_time_mask"].to(self.device)
-        elif "event_mask" in batched_inputs:
-            event_center_mask = batched_inputs["event_mask"].to(self.device)
-            event_time_mask = batched_inputs["event_mask"].to(self.device)
-        else:
-            event_center_mask = None
-            event_time_mask = None
-        polarity = batched_inputs["polarity"].to(self.device) if "polarity" in batched_inputs else None
-        polarity_mask = batched_inputs["polarity_mask"].to(self.device) if "polarity_mask" in batched_inputs else None
-        prompt_center = batched_inputs["prompt_center"].float() if "prompt_center" in batched_inputs else None
-        if self.__class__.__name__ not in ["PhaseNetDAS"]:
-            phase_mask = None
-            event_center_mask = None
+        # Get targets
+        phase_pick = batch.get("phase_pick")
+        phase_mask = batch.get("phase_mask")
+        event_center = batch.get("event_center")
+        event_time = batch.get("event_time")
+        # Event masks: separate masks for detection vs regression tasks
+        # - event_center_mask: mask for center detection loss (Gaussian prediction)
+        # - event_time_mask: mask for time regression loss (timing error)
+        event_center_mask = batch.get("event_center_mask")
+        event_time_mask = batch.get("event_time_mask")
+        polarity = batch.get("polarity")
+        polarity_mask = batch.get("polarity_mask")
+        prompt_center = batch.get("prompt_center")
 
-        if self.backbone_name == "swin2":
-            station_location = batched_inputs["station_location"].to(self.device)
-            features = self.backbone(data, station_location)
-        else:
-            features = self.backbone(data)
+        # Move to device
+        if phase_pick is not None:
+            phase_pick = phase_pick.to(self.device)
+        if polarity is not None:
+            polarity = polarity.to(self.device)
+        if polarity_mask is not None:
+            polarity_mask = polarity_mask.to(self.device)
+        if event_center is not None:
+            event_center = event_center.to(self.device)
+        if event_time is not None:
+            event_time = event_time.to(self.device)
+        if event_center_mask is not None:
+            event_center_mask = event_center_mask.to(self.device)
+        if event_time_mask is not None:
+            event_time_mask = event_time_mask.to(self.device)
+
+        # Backbone forward
+        features = self.backbone(data)
 
         output = {"loss": 0.0}
-        if self.__class__.__name__ == "PhaseNetDAS":
-            nx, nt = features["phase"].shape[-2:]
-            features["phase"] = F.interpolate(
-                features["phase"], size=(nx // 16, nt // 4), mode="bilinear", align_corners=False
-            )
 
-        output_phase, loss_phase = self.phase_picker(features, phase_pick, mask=phase_mask)
-        output["phase"] = output_phase
+        # Phase picking
+        phase_logits, loss_phase = self.phase_head(features["phase"], phase_pick)
+        output["phase"] = phase_logits
         if loss_phase is not None:
             output["loss_phase"] = loss_phase
-            output["loss"] += loss_phase
+            output["loss"] = output["loss"] + loss_phase
 
-        if self.add_polarity:
-            output_polarity, loss_polarity = self.polarity_picker(features, polarity, mask=polarity_mask)
-            output["polarity"] = output_polarity
+        # Polarity
+        if self.add_polarity and "polarity" in features:
+            polarity_logits, loss_polarity = self.polarity_head(
+                features["polarity"], polarity, polarity_mask
+            )
+            output["polarity"] = polarity_logits
             if loss_polarity is not None:
                 output["loss_polarity"] = loss_polarity * self.polarity_loss_weight
-                output["loss"] += loss_polarity * self.polarity_loss_weight
+                output["loss"] = output["loss"] + loss_polarity * self.polarity_loss_weight
 
-        # if self.add_stft and self.training:
-        if self.add_stft:
+        # STFT spectrogram
+        if self.add_stft and "spectrogram" in features:
             output["spectrogram"] = features["spectrogram"]
 
-        if self.add_event:
-            output_event_center, loss_event_center = self.event_detector(
-                features, event_center, mask=event_center_mask
+        # Event detection
+        if self.add_event and "event" in features:
+            event_logits, loss_event_center = self.event_head.forward_center(
+                features["event"], event_center, event_center_mask
             )
-            output["event_center"] = output_event_center
+            output["event_center"] = event_logits
             if loss_event_center is not None:
                 output["loss_event_center"] = loss_event_center * self.event_center_loss_weight
-                output["loss"] += loss_event_center * self.event_center_loss_weight
-            output_event_time, loss_event_time = self.event_timer(features, event_time, mask=event_time_mask)
-            output["event_time"] = output_event_time
+                output["loss"] = output["loss"] + loss_event_center * self.event_center_loss_weight
+
+            # Event time regression (reuse event features, scaled)
+            event_time_pred, loss_event_time = self.event_head.forward_time(
+                features["event"] * 1000.0, event_time, event_time_mask
+            )
+            output["event_time"] = event_time_pred
             if loss_event_time is not None:
                 output["loss_event_time"] = loss_event_time * self.event_time_loss_weight
-                output["loss"] += loss_event_time * self.event_time_loss_weight
+                output["loss"] = output["loss"] + loss_event_time * self.event_time_loss_weight
 
-        if self.add_prompt:
-            points = batched_inputs["prompt"].unsqueeze(1)  # [B, 1, 3]
-            pos = batched_inputs["position"]  # [B, S, T, 3]
-            output_prompt, loss_prompt = self.prompt_picker(features, points, pos, prompt_center)
-            output["prompt"] = output_prompt
+        # Prompt-based picking
+        if self.add_prompt and "prompt" in features:
+            points = batch["prompt"].unsqueeze(1)
+            pos = batch["position"]
+            prompt_logits, loss_prompt = self.prompt_head(
+                features["prompt"], points, pos, prompt_center
+            )
+            output["prompt"] = prompt_logits
             if loss_prompt is not None:
-                output["prompt_center"] = torch.sigmoid(output_prompt)
+                output["prompt_center"] = torch.sigmoid(prompt_logits)
                 output["loss_prompt"] = loss_prompt * self.prompt_loss_weight
-                output["loss"] += loss_prompt * self.prompt_loss_weight
+                output["loss"] = output["loss"] + loss_prompt * self.prompt_loss_weight
 
         return output
 
 
+# =============================================================================
+# Factory Function
+# =============================================================================
+
 def build_model(
-    backbone="unet",
-    log_scale=True,
-    window_attention=False,
-    *args,
+    backbone: str = "unet",
+    log_scale: bool = True,
+    add_stft: bool = False,
+    add_polarity: bool = False,
+    add_event: bool = False,
     **kwargs,
 ) -> PhaseNet:
+    """Build a PhaseNet model.
+
+    Args:
+        backbone: Backbone type
+        log_scale: Apply log transform
+        add_stft: Add STFT features
+        add_polarity: Enable polarity prediction
+        add_event: Enable event detection
+        **kwargs: Additional arguments passed to PhaseNet
+
+    Returns:
+        PhaseNet model instance
+    """
     return PhaseNet(
         backbone=backbone,
         log_scale=log_scale,
-        window_attention=window_attention,
+        add_stft=add_stft,
+        add_polarity=add_polarity,
+        add_event=add_event,
+        **kwargs,
     )

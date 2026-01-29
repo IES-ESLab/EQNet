@@ -1,3 +1,15 @@
+"""
+Training script for EQNet models.
+
+Follows best practices from:
+- Karpathy's nanoGPT: Clean, minimal, educational
+- timm: Registry patterns, good defaults
+- torchvision: Reference training scripts, distributed utilities
+
+Usage:
+    python train.py --model phasenet --hf-dataset AI4EPS/quakeflow_nc
+    python train.py --model phasenet_plus --data-path /path/to/data
+"""
 import datetime
 import logging
 import math
@@ -5,146 +17,117 @@ import os
 import random
 import time
 from contextlib import nullcontext
-from glob import glob
+from typing import Optional
 
-import matplotlib
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.data
-
-#from torchinfo import summary
-import datasets
-import eqnet
-import utils
-import wandb
-from eqnet.data import (
-    AutoEncoderIterableDataset,
-    DASIterableDataset,
-    SeismicNetworkIterableDataset,
-    SeismicTraceIterableDataset,
-)
-from eqnet.models.unet import moving_normalize
-from eqnet.utils.station_sampler import StationSampler, create_groups, cut_reorder_keys
-
+import matplotlib
 matplotlib.use("agg")
+
+import eqnet
+import eqnet.utils as eqnet_utils
+import utils
+try:
+    import wandb
+except ImportError:
+    wandb = None
+from eqnet.data import SeismicTraceIterableDataset, CEEDDataset, CEEDIterableDataset, DASIterableDataset
+from eqnet.data.ceed import default_train_transforms, default_eval_transforms
+from eqnet.models.unet import moving_normalize
+
+# DAS model names for dataset selection
+DAS_MODELS = {"phasenet_das", "phasenet_das_plus"}
+
 logger = logging.getLogger("EQNet")
-# mp.set_start_method("spawn", force=True)
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Model feature registry - which losses each model uses
+MODEL_FEATURES = {
+    "phasenet": {"phase"},
+    "phasenet_tf": {"phase"},
+    "phasenet_plus": {"phase", "event", "polarity"},
+    "phasenet_tf_plus": {"phase", "event", "polarity"},
+    "phasenet_prompt": {"phase", "event", "polarity", "prompt"},
+    "phasenet_das": {"phase"},
+    "phasenet_das_plus": {"phase", "event"},
+}
 
 
-def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
-    model.eval()
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
-        metric_logger.add_meter("loss_phase", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus"]:
-        metric_logger.add_meter("loss_event_center", utils.SmoothedValue(window_size=1, fmt="{value}"))
-        metric_logger.add_meter("loss_event_time", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
-        metric_logger.add_meter("loss_polarity", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model == "phasenet_prompt":
-        metric_logger.add_meter("loss_prompt", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    header = f"Test: "
-
-    processed_samples = 0
-    with torch.inference_mode():
-        for meta in metric_logger.log_every(data_loader, args.print_freq, header):
-            output = model(meta)
-            batch_size = meta["data"].shape[0]
-
-            metric_logger.meters["loss"].update(output["loss"].item(), n=batch_size)
-            if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
-                metric_logger.meters["loss_phase"].update(output["loss_phase"].item(), n=batch_size)
-            if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus"]:
-                metric_logger.meters["loss_event_center"].update(output["loss_event_center"].item(), n=batch_size)
-                metric_logger.meters["loss_event_time"].update(output["loss_event_time"].item(), n=batch_size)
-            if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
-                metric_logger.meters["loss_polarity"].update(output["loss_polarity"].item(), n=batch_size)
-            if args.model == "phasenet_prompt":
-                metric_logger.meters["loss_prompt"].update(output["loss_prompt"].item(), n=batch_size)
-
-            processed_samples += batch_size
-            if processed_samples > total_samples:
-                break
-
-    metric_logger.synchronize_between_processes()
-    print(f"Test loss = {metric_logger.loss.global_avg:.3e}")
-    if args.wandb and utils.is_main_process():
-        log = {
-            "test/test_loss": metric_logger.loss.global_avg,
-            "test/epoch": epoch,
-        }
-        if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
-            log["test/loss_phase"] = metric_logger.loss_phase.global_avg
-        if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
-            log["test/loss_event_center"] = metric_logger.loss_event_center.global_avg
-            log["test/loss_event_time"] = metric_logger.loss_event_time.global_avg
-        if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
-            log["test/loss_polarity"] = metric_logger.loss_polarity.global_avg
-        if args.model == "phasenet_prompt":
-            log["test/loss_prompt"] = metric_logger.loss_prompt.global_avg
-        wandb.log(log)
-
-    plot_results(meta, model, output, args, epoch, "test")
-    del meta, output
-
-    return metric_logger
+def get_model_features(model_name: str) -> set:
+    """Get features supported by a model."""
+    return MODEL_FEATURES.get(model_name, {"phase"})
 
 
-def get_lr(it, max_lr, min_lr, warmup_steps, max_steps):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        # return max_lr * (it+1) / warmup_steps + min_lr
-        return (max_lr - min_lr) * it / warmup_steps + min_lr
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
+# =============================================================================
+# Learning Rate Schedule (Karpathy style)
+# =============================================================================
+
+def get_lr(step: int, max_lr: float, min_lr: float, warmup_steps: int, max_steps: int) -> float:
+    """Cosine learning rate schedule with linear warmup."""
+    if step < warmup_steps:
+        return (max_lr - min_lr) * step / max(1, warmup_steps) + min_lr
+    if step >= max_steps or max_steps <= warmup_steps:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff starts at 1 and goes to 0
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
 
+# =============================================================================
+# Training and Evaluation
+# =============================================================================
+
 def train_one_epoch(
-    model,
-    optimizer,
-    lr_scheduler,
-    data_loader,
-    model_ema,
-    scaler,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
+    data_loader: torch.utils.data.DataLoader,
+    model_ema: Optional[utils.ExponentialMovingAverage],
+    scaler: Optional[torch.cuda.amp.GradScaler],
     args,
-    epoch,
-    total_samples,
+    epoch: int,
+    total_samples: int,
 ):
+    """Train for one epoch."""
+    features = get_model_features(args.model)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
-        metric_logger.add_meter("loss_phase", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
-        metric_logger.add_meter("loss_event_center", utils.SmoothedValue(window_size=1, fmt="{value}"))
-        metric_logger.add_meter("loss_event_time", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
-        metric_logger.add_meter("loss_polarity", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    if args.model == "phasenet_prompt":
-        metric_logger.add_meter("loss_prompt", utils.SmoothedValue(window_size=1, fmt="{value}"))
-    header = f"Epoch: [{epoch}]"
 
+    # Add loss meters based on model features
+    for feat in features:
+        if feat == "phase":
+            metric_logger.add_meter("loss_phase", utils.SmoothedValue(window_size=1, fmt="{value}"))
+        elif feat == "event":
+            metric_logger.add_meter("loss_event_center", utils.SmoothedValue(window_size=1, fmt="{value}"))
+            metric_logger.add_meter("loss_event_time", utils.SmoothedValue(window_size=1, fmt="{value}"))
+        elif feat == "polarity":
+            metric_logger.add_meter("loss_polarity", utils.SmoothedValue(window_size=1, fmt="{value}"))
+        elif feat == "prompt":
+            metric_logger.add_meter("loss_prompt", utils.SmoothedValue(window_size=1, fmt="{value}"))
+
+    header = f"Epoch: [{epoch}]"
     ctx = (
         nullcontext()
         if args.device in ["cpu", "mps"]
         else torch.amp.autocast(device_type=args.device, dtype=args.ptdtype)
     )
+
     model.train()
     processed_samples = 0
-    for i, meta in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+    last_batch, last_output = None, None
 
+    for i, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         optimizer.zero_grad()
+
         with ctx:
-            output = model(meta)
+            output = model(batch)
         loss = output["loss"]
+        last_batch, last_output = batch, output
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -158,6 +141,7 @@ def train_one_epoch(
             if args.clip_grad_norm is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
             optimizer.step()
+
         lr_scheduler.step()
 
         if model_ema and i % args.model_ema_steps == 0:
@@ -165,504 +149,413 @@ def train_one_epoch(
             if epoch < args.lr_warmup_epochs:
                 model_ema.n_averaged.fill_(0)
 
-        batch_size = meta["data"].shape[0]
+        batch_size = batch["data"].shape[0]
         processed_samples += batch_size
 
+        # Update metrics
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-        if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
-            metric_logger.update(loss_phase=output["loss_phase"].item())
-        if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus"]:
-            metric_logger.update(loss_event_center=output["loss_event_center"].item())
-            metric_logger.update(loss_event_time=output["loss_event_time"].item())
-        if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
-            metric_logger.update(loss_polarity=output["loss_polarity"].item())
-        if args.model == "phasenet_prompt":
-            metric_logger.update(loss_prompt=output["loss_prompt"].item())
+        for feat in features:
+            if feat == "phase" and "loss_phase" in output:
+                metric_logger.update(loss_phase=output["loss_phase"].item())
+            elif feat == "event":
+                if "loss_event_center" in output:
+                    metric_logger.update(loss_event_center=output["loss_event_center"].item())
+                if "loss_event_time" in output:
+                    metric_logger.update(loss_event_time=output["loss_event_time"].item())
+            elif feat == "polarity" and "loss_polarity" in output:
+                metric_logger.update(loss_polarity=output["loss_polarity"].item())
+            elif feat == "prompt" and "loss_prompt" in output:
+                metric_logger.update(loss_prompt=output["loss_prompt"].item())
+
+        # Wandb logging
         if args.wandb and utils.is_main_process():
             log = {
-                "train/train_loss": loss.item(),
+                "train/loss": loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/epoch": epoch,
-                "train/batch": i,
+                "train/step": i,
             }
-            if args.model in ["phasenet_prompt","phasenet_plus", "phasenet_tf_plus", "phasenet_das_plus", "phasenet", "phasenet_tf", "phasenet_das"]:
-                log["train/loss_phase"] = output["loss_phase"].item()
-            if args.model in ["phasenet_prompt","phasenet_plus",  "phasenet_tf_plus", "phasenet_das_plus"]:
-                log["train/loss_event_center"] = output["loss_event_center"].item()
-                log["train/loss_event_time"] = output["loss_event_time"].item()
-            if args.model in ["phasenet_prompt", "phasenet_plus", "phasenet_tf_plus"]:
-                log["train/loss_polarity"] = output["loss_polarity"].item()
-            if args.model == "phasenet_prompt":
-                log["train/loss_prompt"] = output["loss_prompt"].item()
+            for key in ["loss_phase", "loss_event_center", "loss_event_time", "loss_polarity", "loss_prompt"]:
+                if key in output:
+                    log[f"train/{key}"] = output[key].item()
             wandb.log(log)
 
         if processed_samples >= total_samples:
             break
 
+        # Periodic checkpoint
         if (i + 1) % 1000 == 0:
-            utils.save_on_master(model.state_dict(), os.path.join(args.output_dir, f"model_tmp.pth"))
+            utils.save_on_master(model.state_dict(), os.path.join(args.output_dir, "model_tmp.pth"))
 
-    plot_results(meta, model, output, args, epoch, "train")
-    del meta, output, loss
+    # Plot training results
+    plot_results(last_batch, last_output, args, epoch, "train")
 
 
-def plot_results(meta, model, output, args, epoch, prefix=""):
+@torch.inference_mode()
+def evaluate(
+    model: nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    args,
+    epoch: int = 0,
+    total_samples: int = 1,
+):
+    """Evaluate the model."""
+    features = get_model_features(args.model)
+    metric_logger = utils.MetricLogger(delimiter="  ")
+
+    for feat in features:
+        if feat == "phase":
+            metric_logger.add_meter("loss_phase", utils.SmoothedValue(window_size=1, fmt="{value}"))
+        elif feat == "event":
+            metric_logger.add_meter("loss_event_center", utils.SmoothedValue(window_size=1, fmt="{value}"))
+            metric_logger.add_meter("loss_event_time", utils.SmoothedValue(window_size=1, fmt="{value}"))
+        elif feat == "polarity":
+            metric_logger.add_meter("loss_polarity", utils.SmoothedValue(window_size=1, fmt="{value}"))
+        elif feat == "prompt":
+            metric_logger.add_meter("loss_prompt", utils.SmoothedValue(window_size=1, fmt="{value}"))
+
+    model.eval()
+    processed_samples = 0
+    last_batch, last_output = None, None
+
+    for batch in metric_logger.log_every(data_loader, args.print_freq, "Test:"):
+        output = model(batch)
+        last_batch, last_output = batch, output
+        batch_size = batch["data"].shape[0]
+
+        metric_logger.meters["loss"].update(output["loss"].item(), n=batch_size)
+        for feat in features:
+            if feat == "phase" and "loss_phase" in output:
+                metric_logger.meters["loss_phase"].update(output["loss_phase"].item(), n=batch_size)
+            elif feat == "event":
+                if "loss_event_center" in output:
+                    metric_logger.meters["loss_event_center"].update(output["loss_event_center"].item(), n=batch_size)
+                if "loss_event_time" in output:
+                    metric_logger.meters["loss_event_time"].update(output["loss_event_time"].item(), n=batch_size)
+            elif feat == "polarity" and "loss_polarity" in output:
+                metric_logger.meters["loss_polarity"].update(output["loss_polarity"].item(), n=batch_size)
+            elif feat == "prompt" and "loss_prompt" in output:
+                metric_logger.meters["loss_prompt"].update(output["loss_prompt"].item(), n=batch_size)
+
+        processed_samples += batch_size
+        if processed_samples > total_samples:
+            break
+
+    metric_logger.synchronize_between_processes()
+    print(f"Test loss = {metric_logger.loss.global_avg:.3e}")
+
+    if args.wandb and utils.is_main_process():
+        log = {"test/loss": metric_logger.loss.global_avg, "test/epoch": epoch}
+        for key in ["loss_phase", "loss_event_center", "loss_event_time", "loss_polarity", "loss_prompt"]:
+            if hasattr(metric_logger, key):
+                log[f"test/{key}"] = getattr(metric_logger, key).global_avg
+        wandb.log(log)
+
+    plot_results(last_batch, last_output, args, epoch, "test")
+    return metric_logger
+
+
+def plot_results(batch, output, args, epoch, prefix=""):
+    """Plot training/evaluation results."""
+    if batch is None or output is None:
+        return
+
     with torch.inference_mode():
-        if args.model == "phasenet":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            meta["data"] = moving_normalize(meta["data"])
-            print("Plotting...")
-            eqnet.utils.plot_phasenet_train(meta, phase, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix)
-            del phase
+        if "phase" not in output:
+            return
 
-        if args.model == "phasenet_tf":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            #event_center = torch.sigmoid(output["event_center"]).cpu().float()
-            #event_time = output["event_time"].cpu().float()
-            meta["spectrogram"] = output["spectrogram"].cpu().float()
-            print("Plotting...")
-            eqnet.utils.plot_phasenet_tf_train(
-                meta,
-                phase,
-                event_center=None,#event_center,
-                event_time=None,#event_time,
-                epoch=epoch,
-                figure_dir=args.figure_dir,
-                prefix=prefix,
+        phase = torch.softmax(output["phase"], dim=1).cpu().float()
+        batch["data"] = moving_normalize(batch["data"])
+
+        # DAS models
+        if args.model == "phasenet_das":
+            eqnet_utils.plot_phasenet_das_train(
+                batch, phase, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
             )
-            del phase#, event_center, event_time
-
-        elif args.model == "phasenet_plus":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            event_center = torch.sigmoid(output["event_center"]).cpu().float()
-            event_time = output["event_time"].cpu().float()
-            polarity = torch.sigmoid(output["polarity"]).cpu().float()
-            meta["data"] = moving_normalize(meta["data"])
-            print("Plotting...")
-            eqnet.utils.plot_phasenet_plus_train(
-                meta,
-                phase,
-                polarity=polarity,
-                event_center=event_center,
-                event_time=event_time,
-                epoch=epoch,
-                figure_dir=args.figure_dir,
-                prefix=prefix,
-            )
-            del phase, event_center, polarity
-
-        elif args.model == "phasenet_tf_plus":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            event_center = torch.sigmoid(output["event_center"]).cpu().float()
-            event_time = output["event_time"].cpu().float()
-            polarity = torch.sigmoid(output["polarity"]).cpu().float()
-            meta["data"] = moving_normalize(meta["data"])
-            print("Plotting...")
-            ## FIXME: add spectrogram
-            eqnet.utils.plot_phasenet_plus_train(
-                meta,
-                phase,
-                polarity=polarity,
-                event_center=event_center,
-                event_time=event_time,
-                epoch=epoch,
-                figure_dir=args.figure_dir,
-                prefix=prefix,
-            )
-            del phase, event_center, polarity
-
-        elif args.model == "phasenet_prompt":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            event_center = torch.sigmoid(output["event_center"]).cpu().float()
-            event_time = output["event_time"].cpu().float()
-            polarity = torch.sigmoid(output["polarity"]).cpu().float()
-            prompt_center = output["prompt_center"].cpu().float()
-            meta["data"] = moving_normalize(meta["data"])
-            print("Plotting...")
-            eqnet.utils.plot_phasenet_prompt_train(
-                meta,
-                phase,
-                polarity=polarity,
-                event_center=event_center,
-                event_time=event_time,
-                prompt_center=prompt_center,
-                epoch=epoch,
-                figure_dir=args.figure_dir,
-                prefix=prefix,
-            )
-            del phase, event_center, polarity
-
-        elif args.model == "deepdenoiser":
-            pass
-
-        elif args.model == "phasenet_das":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
-            meta["data"] = moving_normalize(meta["data"])
-            print("Plotting...")
-            eqnet.utils.plot_phasenet_das_train(meta, phase, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix)
-            del phase
-
         elif args.model == "phasenet_das_plus":
-            phase = torch.softmax(output["phase"], dim=1).cpu().float()
             event_center = torch.sigmoid(output["event_center"]).cpu().float() if "event_center" in output else None
             event_time = output["event_time"].cpu().float() if "event_time" in output else None
-            polarity = torch.sigmoid(output["polarity"]).cpu().float() if "polarity" in output else None
-            meta["data"] = moving_normalize(meta["data"])
-            print("Plotting...")
-            eqnet.utils.plot_phasenet_das_plus_train(
-                meta,
-                phase,
-                polarity=polarity,
-                event_center=event_center,
-                event_time=event_time,
-                epoch=epoch,
-                figure_dir=args.figure_dir,
-                prefix=prefix,
+            eqnet_utils.plot_phasenet_das_plus_train(
+                batch, phase, polarity=None, event_center=event_center,
+                event_time=event_time, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
             )
-            del phase, event_center, polarity
+        # Seismic models with polarity
+        elif args.model in ("phasenet_plus", "phasenet_tf_plus"):
+            polarity = torch.sigmoid(output["polarity"]).cpu().float() if "polarity" in output else None
+            event_center = torch.sigmoid(output["event_center"]).cpu().float() if "event_center" in output else None
+            event_time = output["event_time"].cpu().float() if "event_time" in output else None
+            eqnet_utils.plot_phasenet_plus_train(
+                batch, phase, polarity=polarity, event_center=event_center,
+                event_time=event_time, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
+            )
+        # Seismic models with spectrogram
+        elif args.model in ("phasenet_tf",):
+            batch["spectrogram"] = output["spectrogram"].cpu().float() if "spectrogram" in output else None
+            eqnet_utils.plot_phasenet_tf_train(
+                batch, phase, event_center=None, event_time=None,
+                epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
+            )
+        # Base phasenet
+        else:
+            eqnet_utils.plot_phasenet_train(
+                batch, phase, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
+            )
+        print("Plotting...")
 
-        elif args.model == "autoencoder":
-            preds = model(meta)
-            print("Plotting...")
-            eqnet.utils.plot_autoencoder_das_train(meta, preds, epoch=epoch, figure_dir=args.figure_dir)
-            del preds
 
-        elif args.model == "eqnet":
-            phase = F.softmax(output["phase"], dim=1).cpu().float()
-            event = torch.sigmoid(output["event"]).cpu().float()
-            print("Plotting...")
-            eqnet.utils.plot_eqnet_train(meta, phase, event, epoch=epoch, figure_dir=args.figure_dir)
-            del phase, event
+# =============================================================================
+# Dataset Factory
+# =============================================================================
 
+def get_dataset_type(args) -> str:
+    """Determine dataset type based on args and model."""
+    if args.dataset_type != "auto":
+        return args.dataset_type
+    # Auto-detect: DAS models use DAS dataset
+    if args.model in DAS_MODELS:
+        return "das"
+    # Default to seismic_trace for other models
+    return "seismic_trace"
+
+
+def create_dataset(args, training: bool = True, rank: int = 0, world_size: int = 1):
+    """Create dataset based on configuration."""
+    dataset_type = get_dataset_type(args)
+
+    # CEED dataset (seismic, 3-component)
+    if dataset_type == "ceed":
+        transforms = default_train_transforms(crop_length=4096) if training else default_eval_transforms(crop_length=4096)
+        if args.streaming:
+            return CEEDIterableDataset(
+                region=args.ceed_region,
+                years=args.ceed_years,
+                days=args.ceed_days,
+                transforms=transforms,
+                min_snr=args.min_snr,
+                buffer_size=args.buffer_size,
+                shuffle_buffer_size=args.buffer_size,
+            )
+        else:
+            return CEEDDataset(
+                region=args.ceed_region,
+                years=args.ceed_years,
+                days=args.ceed_days,
+                transforms=transforms,
+                min_snr=args.min_snr,
+            )
+
+    # DAS dataset (single-channel strain rate)
+    if dataset_type == "das":
+        return DASIterableDataset(
+            data_path=args.data_path if training else (args.test_data_path or args.data_path),
+            data_list=args.data_list if training else args.test_data_list,
+            label_path=args.label_path if training else (args.test_label_path or args.label_path),
+            label_list=args.label_list if training else args.test_label_list,
+            noise_list=args.noise_list if training else args.test_noise_list,
+            phases=args.phases,
+            nt=args.nt,
+            nx=args.nx,
+            format=args.format,
+            training=training,
+            stack_noise=args.stack_noise if training else False,
+            stack_event=args.stack_event if training else False,
+            resample_space=args.resample_space if training else False,
+            resample_time=args.resample_time if training else False,
+            masking=args.masking if training else False,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    # Default: SeismicTraceIterableDataset (seismic, 3-component)
+    return SeismicTraceIterableDataset(
+        data_path=args.data_path if training else args.test_data_path,
+        data_list=args.data_list if training else args.test_data_list,
+        hdf5_file=args.hdf5_file if training else args.test_hdf5_file,
+        hf_dataset=args.hf_dataset,
+        format=args.format,
+        training=training,
+        stack_event=args.stack_event if training else False,
+        picks_dict=args.picks_dict,
+        events_dict=args.events_dict,
+        stack_noise=args.stack_noise if training else False,
+        flip_polarity=args.flip_polarity if training else False,
+        drop_channel=args.drop_channel if training else False,
+        rank=rank,
+        world_size=world_size,
+    )
+
+
+# =============================================================================
+# Main Training Loop
+# =============================================================================
 
 def main(args):
+    # Setup output directory
     if args.output_dir:
         utils.mkdir(args.output_dir)
-        figure_dir = os.path.join(args.output_dir, "figures")
-        args.figure_dir = figure_dir
-        utils.mkdir(figure_dir)
+        args.figure_dir = os.path.join(args.output_dir, "figures")
+        utils.mkdir(args.figure_dir)
 
     utils.init_distributed_mode(args)
     print(args)
 
-    if args.distributed:
-        rank = utils.get_rank()
-        world_size = utils.get_world_size()
-    else:
-        rank, world_size = 0, 1
+    # Distributed setup
+    rank = utils.get_rank() if args.distributed else 0
+    world_size = utils.get_world_size() if args.distributed else 1
 
-    torch.manual_seed(1337 + rank)
-    random.seed(1337 + rank)
-    np.random.seed(1337 + rank)
+    # Set seeds for reproducibility
+    seed = 1337 + rank
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(1337 + rank)
+        torch.cuda.manual_seed(seed)
 
     device = torch.device(args.device)
+
+    # Mixed precision setup
     dtype = "bfloat16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "float16"
     ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
-    scaler = torch.cuda.amp.GradScaler(enabled=((dtype == "float16") & torch.cuda.is_available()))
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16" and torch.cuda.is_available()))
     args.dtype, args.ptdtype = dtype, ptdtype
-    torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-    torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+
+    # CUDA optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = not args.use_deterministic_algorithms
     if args.use_deterministic_algorithms:
-        torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True)
-    else:
-        torch.backends.cudnn.benchmark = True
 
-    if args.model in ["phasenet", "phasenet_plus", "phasenet_tf", "phasenet_tf_plus"]:
-        dataset = SeismicTraceIterableDataset(
-            data_path=args.data_path,
-            data_list=args.data_list,
-            hdf5_file=args.hdf5_file,
-            hf_dataset=args.hf_dataset,
-            format=args.format,  # ["h5", "hf"]
-            training=True,
-            stack_event=args.stack_event,
-            picks_dict=args.picks_dict,
-            events_dict=args.events_dict,
-            stack_noise=args.stack_noise,
-            flip_polarity=args.flip_polarity,
-            drop_channel=args.drop_channel,
-            rank=rank,
-            world_size=world_size,
-        )
-        train_sampler = None
-        if args.test_hdf5_file is not None:
-            dataset_test = SeismicTraceIterableDataset(
-                data_path=args.test_data_path,
-                data_list=args.test_data_list,
-                hdf5_file=args.test_hdf5_file,
-                hf_dataset=args.hf_dataset,
-                format=args.format,  # ["h5", "hf"]
-                training=True,
-                stack_event=False,
-                stack_noise=False,
-                flip_polarity=False,
-                drop_channel=False,
-                rank=rank,
-                world_size=world_size,
-            )
-        else:
-            dataset_test = None
-        test_sampler = None
-    elif args.model in ["phasenet_das", "phasenet_das_plus"]:
-        dataset = DASIterableDataset(
-            data_path=args.data_path,
-            data_list=args.data_list,
-            label_path=args.label_path,
-            label_list=args.label_list,
-            noise_list=args.noise_list,
-            phases=args.phases,
-            nt=args.nt,
-            nx=args.nx,
-            format="h5",
-            training=True,
-            stack_noise=args.stack_noise,
-            stack_event=args.stack_event,
-            resample_space=args.resample_space,
-            resample_time=args.resample_time,
-            masking=args.masking,
-            rank=rank,
-            world_size=world_size,
-        )
-        train_sampler = None
-        if args.test_data_path is not None:
-            dataset_test = DASIterableDataset(
-                data_path=args.test_data_path,
-                data_list=args.test_data_list,
-                label_path=args.test_label_path,
-                label_list=args.test_label_list,
-                noise_list=args.test_noise_list,
-                phases=args.phases,
-                nt=args.nt,
-                nx=args.nx,
-                format="h5",
-                training=True,
-                stack_noise=False,
-                stack_event=False,
-                resample_space=False,
-                resample_time=False,
-                masking=False,
-                rank=rank,
-                world_size=world_size,
-            )
-        else:
-            dataset_test = None
-        test_sampler = None
-    elif args.model == "autoencoder":
-        dataset = AutoEncoderIterableDataset(
-            data_path=args.data_path,
-            format="h5",
-            training=True,
-        )
-        train_sampler = None
-        dataset_test = dataset
-        test_sampler = None
-    elif args.model == "eqnet":
-        if args.huggingface_dataset:
-            try:
-                # Get the directory of the train.py
-                code_dir = os.path.dirname(os.path.abspath(__file__))
-                script_dir = os.path.join(code_dir, "eqnet/data/quakeflow_nc.py")
-                dataset = datasets.load_dataset(script_dir, split="train", name="NCEDC_full_size")
-            except:
-                dataset = datasets.load_dataset("AI4EPS/quakeflow_nc", split="train", name="NCEDC_full_size")
+    # Create datasets
+    dataset = create_dataset(args, training=True, rank=rank, world_size=world_size)
+    # Test dataset: check for test data path/list depending on dataset type
+    has_test_data = (
+        args.test_hdf5_file
+        or args.test_data_path
+        or args.test_data_list
+        or args.test_label_list
+    )
+    dataset_test = create_dataset(args, training=False, rank=rank, world_size=world_size) if has_test_data else None
 
-            dataset = dataset.with_format("torch")
-            dataset_dict = dataset.train_test_split(test_size=0.2, shuffle=False)
-            dataset = dataset_dict["train"]
-            dataset_test = dataset_dict["test"]
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        drop_last=True,
+    )
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        drop_last=False,
+    ) if dataset_test else None
 
-            if args.distributed:
-                train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-                test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
-            else:
-                train_sampler = torch.utils.data.RandomSampler(dataset)
-                test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-
-            group_ids = create_groups(dataset, args.num_stations_list)
-            dataset = dataset.map(lambda x: cut_reorder_keys(x, num_stations_list=args.num_stations_list))
-            train_batch_sampler = StationSampler(train_sampler, group_ids, args.batch_size, args.num_stations_list)
-
-        else:
-            dataset = SeismicNetworkIterableDataset(args.dataset)
-            train_sampler = None
-            dataset_test = dataset
-            test_sampler = None
-    elif args.model == "phasenet_prompt":
-        dataset = SeismicNetworkIterableDataset(hdf5_file=args.hdf5_file, training=True)
-        train_sampler = None
-        dataset_test = dataset
-        test_sampler = None
-    else:
-        raise f"Unknown model {args.model}"
-
-    if args.huggingface_dataset:
-        data_loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_sampler=train_batch_sampler,
-            num_workers=args.workers,
-        )
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test,
-            batch_size=1,
-            sampler=test_sampler,
-            num_workers=args.workers,
-            collate_fn=None,
-            drop_last=False,
-        )
-    else:
-        data_loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            sampler=train_sampler,
-            num_workers=args.workers,
-            # collate_fn=utils.collate_fn,
-            collate_fn=None,
-            # shuffle=True,
-            drop_last=True,
-        )
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test,
-            batch_size=args.batch_size,
-            sampler=test_sampler,
-            num_workers=args.workers,
-            collate_fn=None,
-            drop_last=False,
-        )
-
+    # Build model
     model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone)
-    logger.info("Model:\n{}".format(model))
-    print("Model: {}".format(model))
-
-    # summary(
-    #     model,
-    #     input_data=[next(iter(data_loader))],
-    #     depth=5,
-    #     mode="train",
-    #     # col_names=["output_size", "num_params", "kernel_size"],
-    #     # verbose=2,
-    # )
-
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-
+    logger.info(f"Model:\n{model}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     model.to(device)
+
     if args.compile:
-        print("compiling the model...")
-        model = torch.compile(model)  # requires PyTorch 2.0
+        print("Compiling model...")
+        model = torch.compile(model)
 
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    # logging
+    # Wandb logging
     if args.wandb and utils.is_main_process():
         wandb.init(
-            project=args.wandb_project if args.wandb_project else args.model,
+            project=args.wandb_project or args.model,
             name=args.wandb_name,
             entity=args.wandb_group,
             dir=args.wandb_dir,
-            config=args,
+            config=vars(args),
         )
-        if args.wandb_watch:
-            wandb.watch(model, log="all", log_freq=args.print_freq)
 
-    if args.resume_wandb:
-        if utils.is_main_process():
-            if args.model in ["phasenet_das", "phasenet_das_plus"]:
-                model_url = "ai4eps/model-registry/PhaseNet-DAS:latest"
-                artifact = wandb.use_artifact(model_url, type="model")
-                artifact_dir = artifact.download()
-                checkpoint = torch.load(glob(os.path.join(artifact_dir, "*.pth"))[0], map_location="cpu")
-                model.load_state_dict(checkpoint["model"], strict=True)
-
-    custom_keys_weight_decay = []
-    if args.bias_weight_decay is not None:
-        custom_keys_weight_decay.append(("bias", args.bias_weight_decay))
-    if args.transformer_embedding_decay is not None:
-        for key in ["class_token", "position_embedding", "relative_position_bias_table"]:
-            custom_keys_weight_decay.append((key, args.transformer_embedding_decay))
+    # Optimizer and scheduler
     parameters = utils.set_weight_decay(
-        model,
-        args.weight_decay,
+        model, args.weight_decay,
         norm_weight_decay=args.norm_weight_decay,
-        custom_keys_weight_decay=custom_keys_weight_decay if len(custom_keys_weight_decay) > 0 else None,
     )
+    optimizer = torch.optim.AdamW(parameters, lr=1.0, weight_decay=args.weight_decay)
 
-    # optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
-    optimizer = torch.optim.AdamW(
-        parameters, lr=1.0, weight_decay=args.weight_decay
-    )  # lr multiplied by lr in lr_scheduler
-    iters_per_epoch = max(1, len(data_loader))
+    try:
+        iters_per_epoch = max(1, len(data_loader))
+    except TypeError:
+        # IterableDataset doesn't have __len__, use fallback
+        iters_per_epoch = args.iters_per_epoch
     warmup_steps = args.lr_warmup_epochs * iters_per_epoch
-    max_lr = args.lr
-    min_lr = args.lr * args.lr_min_ratio
     max_steps = args.epochs * iters_per_epoch
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda it: get_lr(it, max_lr, min_lr, warmup_steps, max_steps)
+        optimizer,
+        lr_lambda=lambda it: get_lr(it, args.lr, args.lr * args.lr_min_ratio, warmup_steps, max_steps)
     )
 
+    # Distributed wrapper
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=True  ## FIXME: What layers are not used?
-        )
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
+    # EMA
     model_ema = None
     if args.model_ema:
-        adjust = args.world_size * args.batch_size * args.model_ema_steps / args.epochs
-        alpha = 1.0 - args.model_ema_decay
-        alpha = min(1.0, alpha * adjust)
+        adjust = world_size * args.batch_size * args.model_ema_steps / args.epochs
+        alpha = min(1.0, (1.0 - args.model_ema_decay) * adjust)
         model_ema = utils.ExponentialMovingAverage(model_without_ddp, device=device, decay=1.0 - alpha)
 
+    # Resume from checkpoint
     if args.resume:
-        if args.checkpoint is not None:
-            print(f"Loading model and optimizer from checkpoint '{args.checkpoint}'")
-            checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        elif os.path.isfile(args.output_dir + "/checkpoint.pth"):
-            print(f"Loading model and optimizer from checkpoint '{args.output_dir}/checkpoint.pth'")
-            checkpoint = torch.load(args.output_dir + "/checkpoint.pth", map_location="cpu", weights_only=False)
-        else:
-            print(f"No checkpoint found")
-        if checkpoint is not None:
+        checkpoint_path = args.checkpoint or os.path.join(args.output_dir, "checkpoint.pth")
+        if os.path.isfile(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             model_without_ddp.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
             args.start_epoch = checkpoint["epoch"] + 1
-            if model_ema:
+            if model_ema and "model_ema" in checkpoint:
                 model_ema.load_state_dict(checkpoint["model_ema"])
-            if scaler:
+            if scaler and "scaler" in checkpoint:
                 scaler.load_state_dict(checkpoint["scaler"])
 
+    # Training loop
     start_time = time.time()
     best_loss = float("inf")
+
+    # Get dataset sizes (handle IterableDataset which has no len)
+    # Use iters_per_epoch if specified (useful for debugging/limiting iterations)
+    try:
+        dataset_size = len(dataset)
+        # Allow iters_per_epoch to override for debugging
+        if args.iters_per_epoch and args.iters_per_epoch * args.batch_size < dataset_size:
+            dataset_size = args.iters_per_epoch * args.batch_size
+    except TypeError:
+        dataset_size = args.iters_per_epoch * args.batch_size
+    try:
+        dataset_test_size = len(dataset_test) if dataset_test else 0
+        if args.iters_per_epoch and args.iters_per_epoch * args.batch_size < dataset_test_size:
+            dataset_test_size = args.iters_per_epoch * args.batch_size
+    except TypeError:
+        dataset_test_size = args.iters_per_epoch * args.batch_size
+
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed and (train_sampler is not None):
-            train_sampler.set_epoch(epoch)
+        if args.distributed and hasattr(data_loader.sampler, "set_epoch"):
+            data_loader.sampler.set_epoch(epoch)
 
-        tmp_time = time.time()
         train_one_epoch(
-            model,
-            optimizer,
-            lr_scheduler,
-            data_loader,
-            model_ema,
-            scaler,
-            args,
-            epoch,
-            len(dataset),
+            model, optimizer, lr_scheduler, data_loader, model_ema,
+            scaler, args, epoch, dataset_size,
         )
-        print(f"Training time of epoch {epoch} of rank {rank}: {time.time() - tmp_time:.3f}")
 
-        if args.test_hdf5_file is not None:
-            tmp_time = time.time()
-            metric = evaluate(model, data_loader_test, scaler, args, epoch, len(dataset_test))
+        metric = None
+        if data_loader_test:
+            metric = evaluate(model, data_loader_test, args, epoch, dataset_test_size)
             if model_ema:
-                metric = evaluate(model_ema, data_loader_test, scaler, args, epoch, len(dataset_test))
-            print(f"Testing time of epoch {epoch} of rank {rank}: {time.time() - tmp_time:.3f}")
+                evaluate(model_ema, data_loader_test, args, epoch, dataset_test_size)
 
-        tmp_time = time.time()
+        # Save checkpoint
         checkpoint = {
             "model": model_without_ddp.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -677,213 +570,122 @@ def main(args):
 
         utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
         utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-        if utils.is_main_process():
-            if args.test_hdf5_file is None:
-                best_loss = None
-            elif metric.loss.global_avg < best_loss:
-                best_loss = metric.loss.global_avg
-            torch.save(checkpoint, os.path.join(args.output_dir, "model_best.pth"))
-            if args.wandb:
-                best_model = wandb.Artifact(
-                    f"{args.wandb_name}",
-                    type="model",
-                    metadata=dict(epoch=epoch, loss=best_loss),
-                )
-                best_model.add_file(os.path.join(args.output_dir, "model_best.pth"))
-                wandb.log_artifact(best_model)
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f"Training time {total_time_str}")
+        # Save best model
+        if utils.is_main_process():
+            current_loss = metric.loss.global_avg if metric else 0
+            if current_loss < best_loss:
+                best_loss = current_loss
+                torch.save(checkpoint, os.path.join(args.output_dir, "model_best.pth"))
+
+                if args.wandb:
+                    artifact = wandb.Artifact(args.wandb_name or "model", type="model", metadata={"epoch": epoch, "loss": best_loss})
+                    artifact.add_file(os.path.join(args.output_dir, "model_best.pth"))
+                    wandb.log_artifact(artifact)
+
+    total_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
+    print(f"Training completed in {total_time}")
+
     if args.wandb and utils.is_main_process():
         wandb.finish()
 
 
+# =============================================================================
+# Argument Parser
+# =============================================================================
+
 def get_args_parser(add_help=True):
     import argparse
+    parser = argparse.ArgumentParser(description="EQNet Training", add_help=add_help)
 
-    parser = argparse.ArgumentParser(description="PyTorch Segmentation Training", add_help=add_help)
+    # Data
+    parser.add_argument("--data-path", default="./", type=str)
+    parser.add_argument("--data-list", nargs="+", default=None)
+    parser.add_argument("--hdf5-file", default=None, type=str)
+    parser.add_argument("--hf-dataset", default=None, type=str)
+    parser.add_argument("--format", default="h5", type=str, choices=["h5", "hf"])
+    parser.add_argument("--test-data-path", default=None, type=str)
+    parser.add_argument("--test-data-list", nargs="+", default=None)
+    parser.add_argument("--test-hdf5-file", default=None, type=str)
+    parser.add_argument("--picks-dict", default=None, type=str)
+    parser.add_argument("--events-dict", default=None, type=str)
 
-    parser.add_argument("--data-path", default="./", type=str, help="dataset path")
-    parser.add_argument("--data-list", nargs="+", default=None, type=str, help="dataset list")
-    parser.add_argument("--label-path", default="./", type=str, help="label path")
-    parser.add_argument("--label-list", nargs="+", default=None, type=str, help="label path")
-    parser.add_argument("--noise-list", nargs="+", default=None, type=str, help="noise list")
-    parser.add_argument("--hdf5-file", default=None, type=str, help="hdf5 file for training")
-    parser.add_argument("--hf-dataset", default=None, type=str, help="huggingface dataset")
-    parser.add_argument("--format", default="h5", type=str, help="data format (h5, hf)")
-    parser.add_argument("--test-data-path", default=None, type=str, help="test dataset path")
-    parser.add_argument("--test-data-list", default="+", type=None, help="test dataset list")
-    parser.add_argument("--test-label-path", default="./", type=None, help="test label path")
-    parser.add_argument("--test-label-list", default="+", type=None, help="test label path")
-    parser.add_argument("--test-noise-list", default="+", type=None, help="test noise list")
-    parser.add_argument("--test-hdf5-file", default=None, type=str, help="hdf5 file for testing")
-    parser.add_argument("--picks-dict", default=None, type=str, help="picks dictionary for training augmentation")
-    parser.add_argument("--events-dict", default=None, type=str, help="events dictionary for training augmentation")
-    parser.add_argument("--dataset", default="", type=str, help="dataset name")
-    parser.add_argument("--model", default="phasenet_das", type=str, help="model name")
-    parser.add_argument("--backbone", default="unet", type=str, help="model backbone")
-    parser.add_argument(
-        "--device",
-        default="cuda",
-        type=str,
-        help="device (Use cuda or cpu Default: cuda)",
-    )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="compile model to torchscript",
-    )
-    parser.add_argument(
-        "-b",
-        "--batch-size",
-        default=8,
-        type=int,
-        help="images per gpu, the total batch size is $NGPU x batch_size",
-    )
-    parser.add_argument(
-        "--epochs",
-        default=100,
-        type=int,
-        metavar="N",
-        help="number of total epochs to run",
-    )
-    parser.add_argument(
-        "-j",
-        "--workers",
-        default=4,
-        type=int,
-        metavar="N",
-        help="number of data loading workers (default: 16)",
-    )
+    # Dataset type (auto-detected for DAS models)
+    parser.add_argument("--dataset-type", default="auto", choices=["auto", "seismic_trace", "ceed", "das"])
 
-    ## training hyper params
-    parser.add_argument("--opt", default="adamw", type=str, help="optimizer")
-    parser.add_argument("--lr", default=3e-4, type=float, help="initial learning rate")
-    parser.add_argument(
-        "--wd",
-        "--weight-decay",
-        default=1e-4,
-        type=float,
-        metavar="W",
-        help="weight decay (default: 1e-4)",
-        dest="weight_decay",
-    )
-    parser.add_argument(
-        "--norm-weight-decay",
-        default=None,
-        type=float,
-        help="weight decay for Normalization layers (default: None, same value as --wd)",
-    )
-    parser.add_argument(
-        "--bias-weight-decay",
-        default=None,
-        type=float,
-        help="weight decay for bias parameters of all layers (default: None, same value as --wd)",
-    )
-    parser.add_argument(
-        "--transformer-embedding-decay",
-        default=None,
-        type=float,
-        help="weight decay for embedding parameters for vision transformer models (default: None, same value as --wd)",
-    )
-    parser.add_argument(
-        "--clip-grad-norm",
-        default=None,
-        type=float,
-        help="clip gradient norm (default: None, no clipping)",
-    )
-    parser.add_argument(
-        "--lr-warmup-epochs",
-        default=1,
-        type=int,
-        help="the number of epochs to warmup (default: 1)",
-    )
-    parser.add_argument(
-        "--lr-scheduler", default="cosineannealinglr", type=str, help="name of lr scheduler (default: multisteplr)"
-    )
-    parser.add_argument(
-        "--lr-min-ratio", default=0.1, type=float, help="minimum lr of lr schedule (default: 0.1 of lr)"
-    )
-    parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
-    parser.add_argument("--output-dir", default="./output", type=str, help="path to save outputs")
-    parser.add_argument("--resume", action="store_true", help="resume automatically")
-    parser.add_argument("--checkpoint", default=None, type=str, help="path of checkpoint")
-    parser.add_argument("--resume_wandb", action="store_true", help="resume from wandb")
-    parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
-    parser.add_argument(
-        "--sync-bn",
-        help="Use sync batch norm",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--test-only",
-        dest="test_only",
-        help="Only test the model",
-        action="store_true",
-    )
+    # CEED dataset
+    parser.add_argument("--ceed-region", default="SC", type=str)
+    parser.add_argument("--ceed-years", nargs="+", type=int, default=None)
+    parser.add_argument("--ceed-days", nargs="+", type=int, default=None)
+    parser.add_argument("--min-snr", type=float, default=0.0)
+    parser.add_argument("--streaming", action="store_true")
+    parser.add_argument("--iters-per-epoch", type=int, default=1000, help="Iterations per epoch for streaming datasets")
+    parser.add_argument("--buffer-size", type=int, default=1000, help="Buffer size for sample stacking (use 1 for fast debugging)")
 
-    # model moving average
-    parser.add_argument(
-        "--model-ema", action="store_true", help="enable tracking Exponential Moving Average of model parameters"
-    )
-    parser.add_argument(
-        "--model-ema-steps",
-        type=int,
-        default=32,
-        help="the number of iterations that controls how often to update the EMA model (default: 32)",
-    )
-    parser.add_argument(
-        "--model-ema-decay",
-        type=float,
-        default=0.99998,
-        help="decay factor for Exponential Moving Average of model parameters (default: 0.99998)",
-    )
-    parser.add_argument(
-        "--use-deterministic-algorithms", action="store_true", help="Forces the use of deterministic algorithms only."
-    )
+    # DAS dataset
+    parser.add_argument("--label-path", default="./", type=str)
+    parser.add_argument("--label-list", nargs="+", default=None)
+    parser.add_argument("--noise-list", nargs="+", default=None)
+    parser.add_argument("--test-label-path", default=None, type=str)
+    parser.add_argument("--test-label-list", nargs="+", default=None)
+    parser.add_argument("--test-noise-list", nargs="+", default=None)
+    parser.add_argument("--phases", nargs="+", default=["P", "S"], type=str)
+    parser.add_argument("--nt", default=3072, type=int, help="DAS time samples")
+    parser.add_argument("--nx", default=5120, type=int, help="DAS space samples")
+    parser.add_argument("--resample-space", action="store_true")
+    parser.add_argument("--resample-time", action="store_true")
+    parser.add_argument("--masking", action="store_true")
+    parser.add_argument("--random-crop", action="store_true")
 
-    # distributed training parameters
-    parser.add_argument("--world-size", default=1, type=int, help="number of distributed processes")
-    parser.add_argument(
-        "--dist-url",
-        default="env://",
-        type=str,
-        help="url used to set up distributed training",
-    )
+    # Model
+    parser.add_argument("--model", default="phasenet", type=str)
+    parser.add_argument("--backbone", default="unet", type=str)
 
-    # Mixed precision training parameters
-    parser.add_argument(
-        "--amp",
-        action="store_true",
-        help="Use torch.cuda.amp for mixed precision training",
-    )
+    # Training
+    parser.add_argument("--device", default="cuda", type=str)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("-b", "--batch-size", default=8, type=int)
+    parser.add_argument("--epochs", default=100, type=int)
+    parser.add_argument("-j", "--workers", default=4, type=int)
 
-    ## Data Augmentation
-    parser.add_argument("--phases", default=["P", "S"], type=str, nargs="+", help="phases to use")
-    parser.add_argument("--nt", default=1024 * 3, type=int, help="number of time samples")
-    parser.add_argument("--nx", default=1024 * 5, type=int, help="number of space samples")
-    parser.add_argument("--stack-noise", action="store_true", help="Stack noise")
-    parser.add_argument("--stack-event", action="store_true", help="Stack event")
-    parser.add_argument("--flip-polarity", action="store_true", help="Flip polarity")
-    parser.add_argument("--drop-channel", action="store_true", help="Drop channel")
-    parser.add_argument("--resample-space", action="store_true", help="Resample space resolution")
-    parser.add_argument("--resample-time", action="store_true", help="Resample time  resolution")
-    parser.add_argument("--masking", action="store_true", help="Masking of the input data")
+    # Optimizer
+    parser.add_argument("--lr", default=3e-4, type=float)
+    parser.add_argument("--weight-decay", default=1e-4, type=float)
+    parser.add_argument("--norm-weight-decay", default=None, type=float)
+    parser.add_argument("--clip-grad-norm", default=None, type=float)
+    parser.add_argument("--lr-warmup-epochs", default=1, type=int)
+    parser.add_argument("--lr-min-ratio", default=0.1, type=float)
 
-    # wandb
-    parser.add_argument("--wandb", action="store_true", help="use wandb")
-    parser.add_argument("--wandb-project", default=None, type=str, help="wandb project name")
-    parser.add_argument("--wandb-name", default=None, type=str, help="wandb run name")
-    parser.add_argument("--wandb-group", default=None, type=str, help="wandb group name")
-    parser.add_argument("--wandb-dir", default="./", type=str, help="wandb dir")
-    parser.add_argument("--wandb-watch", action="store_true", help="wandb watch model")
+    # Checkpointing
+    parser.add_argument("--output-dir", default="./output", type=str)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--checkpoint", default=None, type=str)
+    parser.add_argument("--start-epoch", default=0, type=int)
 
-    # huggingface dataset
-    parser.add_argument("--huggingface-dataset", action="store_true", help="use huggingface dataset")
-    parser.add_argument(
-        "--num-stations-list", default=[5, 10, 20], type=int, nargs="+", help="possible stations number of the dataset"
-    )
+    # EMA
+    parser.add_argument("--model-ema", action="store_true")
+    parser.add_argument("--model-ema-steps", type=int, default=32)
+    parser.add_argument("--model-ema-decay", type=float, default=0.99998)
+
+    # Distributed
+    parser.add_argument("--world-size", default=1, type=int)
+    parser.add_argument("--dist-url", default="env://", type=str)
+    parser.add_argument("--sync-bn", action="store_true")
+    parser.add_argument("--use-deterministic-algorithms", action="store_true")
+
+    # Augmentation
+    parser.add_argument("--stack-noise", action="store_true")
+    parser.add_argument("--stack-event", action="store_true")
+    parser.add_argument("--flip-polarity", action="store_true")
+    parser.add_argument("--drop-channel", action="store_true")
+
+    # Logging
+    parser.add_argument("--print-freq", default=10, type=int)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default=None, type=str)
+    parser.add_argument("--wandb-name", default=None, type=str)
+    parser.add_argument("--wandb-group", default=None, type=str)
+    parser.add_argument("--wandb-dir", default="./", type=str)
 
     return parser
 

@@ -1,0 +1,40 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Git
+.git/
+.github/
+
+# Claude
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Tests and docs (not needed for training)
+tests/
+docs/
+sources/
+
+# Task notes
+taskv*.md
+
+# Output and logs
+output/
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

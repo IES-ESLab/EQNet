@@ -1,88 +1,67 @@
-from .phasenet import PhaseNet, UNetHead, EventHead
-from .unet import UNet
-from .x_unet import XUnet
+"""
+PhaseNet-DAS: Deep learning for DAS (Distributed Acoustic Sensing) phase picking.
+
+Inherits from PhaseNet with DAS-specific configuration:
+- Input: (batch, 1, nx, nt) - single channel DAS data
+- Output: phase probabilities (P/S/Noise) and optionally event detection
+"""
+from .phasenet import PhaseNet
+
+
+# DAS-specific UNet configuration overrides
+DAS_UNET_CONFIG = dict(
+    dim=8,  # reduced from 32 for faster training
+    channels=1,  # DAS is single channel
+    phase_channels=3,  # P, S, Noise
+    # DAS: downsample both space and time with stride 4
+    space_stride=4,
+    time_stride=4,
+    space_kernel=7,
+    time_kernel=7,
+)
 
 
 class PhaseNetDAS(PhaseNet):
+    """PhaseNet for DAS data.
+
+    Inherits from PhaseNet with DAS-specific defaults:
+    - Single channel input (channels=1)
+    - Stride 4 downsampling in both dimensions
+    - 7x7 kernels for spatial-temporal convolutions
+    """
+
     def __init__(
         self,
-        backbone="xunet",
-        log_scale=False,
-        add_stft=False,
-        add_polarity=False,
-        add_event=False,
-        add_prompt=False,
-        event_center_loss_weight=1.0,
-        event_time_loss_weight=1.0,
-        polarity_loss_weight=1.0,
+        backbone: str = "unet",
+        log_scale: bool = True,
+        add_stft: bool = False,
+        add_polarity: bool = False,
+        add_event: bool = False,
         **kwargs,
     ) -> None:
+        # Merge DAS defaults with user kwargs (user kwargs take precedence)
+        das_kwargs = {**DAS_UNET_CONFIG, **kwargs}
+
         super().__init__(
             backbone=backbone,
             log_scale=log_scale,
             add_stft=add_stft,
             add_polarity=add_polarity,
             add_event=add_event,
-            add_prompt=add_prompt,
-            event_center_loss_weight=event_center_loss_weight,
-            event_time_loss_weight=event_time_loss_weight,
-            polarity_loss_weight=polarity_loss_weight,
-            **kwargs,
+            **das_kwargs,
         )
-        self.backbone_name = backbone
-        self.add_stft = add_stft
-        self.add_event = add_event
-        self.add_polarity = add_polarity
-        self.add_prompt = add_prompt
-        self.event_center_loss_weight = event_center_loss_weight
-        self.event_time_loss_weight = event_time_loss_weight
-        self.polarity_loss_weight = polarity_loss_weight
-
-        if backbone == "unet":
-            self.backbone = UNet(
-                channels=1,
-                dim=16,
-                out_dim=32,
-                kernel_size=(7, 7),
-                log_scale=log_scale,
-                add_stft=add_stft,
-                add_polarity=add_polarity,
-                add_event=add_event,
-                add_prompt=add_prompt,
-            )
-        elif backbone == "xunet":
-            self.backbone = XUnet(
-                channels=1,
-                dim=16,
-                out_dim=32,
-                kernel_size=(1, 7, 7),
-                log_scale=log_scale,
-                add_stft=add_stft,
-                add_polarity=add_polarity,
-                add_event=add_event,
-                add_prompt=add_prompt,
-            )
-        else:
-            raise ValueError(f"Invalid backbone: {backbone}")
-
-        if backbone == "unet":
-            self.phase_picker = UNetHead(32, 3, feature_name="phase")
-            if self.add_polarity:
-                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
-            if self.add_event:
-                self.event_detector = UNetHead(32, 1, feature_name="event")
-                self.event_timer = EventHead(32, 1, feature_name="event")
-
-        elif backbone == "xunet":
-            self.phase_picker = UNetHead(32, 3, feature_name="phase")
-            if self.add_polarity:
-                self.polarity_picker = UNetHead(32, 1, feature_name="polarity")
-            if self.add_event:
-                self.event_detector = UNetHead(32, 1, feature_name="event")
-                self.event_timer = EventHead(32, 1, feature_name="event")
-        else:
-            raise ValueError("backbone only supports unet or xunet")
 
 
-def build_model(backbone="unet", log_scale=True, *args, **kwargs) -> PhaseNetDAS:
-    return PhaseNetDAS(backbone, log_scale, *args, **kwargs)
+def build_model(
+    backbone: str = "unet",
+    log_scale: bool = True,
+    add_event: bool = False,
+    **kwargs,
+) -> PhaseNetDAS:
+    """Build a PhaseNet-DAS model."""
+    return PhaseNetDAS(
+        backbone=backbone,
+        log_scale=log_scale,
+        add_event=add_event,
+        **kwargs,
+    )

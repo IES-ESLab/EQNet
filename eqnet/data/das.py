@@ -1,28 +1,844 @@
+"""
+DAS (Distributed Acoustic Sensing) Data Loading Module
+
+A modern, efficient dataset implementation for DAS phase picking following
+best practices from computer vision (torchvision, timm, albumentations).
+
+Design Principles:
+1. Transform-based augmentation operating on DASSample dataclass
+2. Compose pattern for chaining transforms
+3. Clean separation: loading -> transforms -> label generation
+4. Support for both local filesystem and Google Cloud Storage (GCS)
+
+Example:
+    >>> from eqnet.data.das import DASSample, default_train_transforms, DASIterableDataset
+    >>> dataset = DASIterableDataset(
+    ...     data_path="gs://quakeflow_das/ridgecrest_north",
+    ...     label_path="gs://quakeflow_das/ridgecrest_north",
+    ...     training=True,
+    ...     transforms=default_train_transforms(),
+    ... )
+"""
+from __future__ import annotations
+
+import json
 import os
 import random
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from glob import glob
+from typing import Any, Callable, Sequence
 
 import fsspec
 import h5py
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy
 import scipy.signal
 import torch
-import torch.multiprocessing as mp
-import torch.nn as nn
 import torch.nn.functional as F
-from scipy.interpolate import interp1d
 from torch.utils.data import Dataset, IterableDataset
-import os
-import time
 
-# mp.set_start_method("spawn", force=True)
+# =============================================================================
+# GCS Configuration
+# =============================================================================
+
+BUCKET_DAS = "gs://quakeflow_das"
+GCS_CREDENTIALS_PATH = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+DEFAULT_SAMPLING_RATE = 100  # Hz
+DEFAULT_SPATIAL_INTERVAL = 10.0  # meters
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class DASLabelConfig:
+    """Configuration for DAS label generation."""
+    phase_width: int = 150  # Gaussian width for phase picks (samples)
+    event_width: int = 150  # Gaussian width for event center
+    mask_width_factor: float = 1.5  # mask_width = width * factor
+    gaussian_threshold: float = 0.1  # Values below this are zeroed
+
+
+# =============================================================================
+# DASSample Dataclass
+# =============================================================================
+
+@dataclass
+class DASSample:
+    """A DAS sample with waveform and phase annotations.
+
+    This is the core data structure passed through transforms.
+    Phase picks are stored as lists of (channel_index, time_index) tuples
+    until final label generation.
+
+    Attributes:
+        waveform: DAS data array of shape (nt, nx) or (1, nt, nx)
+        p_picks: List of (channel_index, time_index) for P-wave picks
+        s_picks: List of (channel_index, time_index) for S-wave picks
+        event_centers: List of (channel_index, center_time) for events
+        event_durations: List of (channel_index, duration) for events
+        snr: Signal-to-noise ratio
+        amp_signal: Signal amplitude
+        amp_noise: Noise amplitude
+        dt_s: Temporal sampling interval (seconds)
+        dx_m: Spatial sampling interval (meters)
+        file_name: Source file name
+        begin_time: Start time of the waveform
+    """
+    waveform: np.ndarray  # (nt, nx) or (1, nt, nx)
+    p_picks: list[tuple[int, float]] = field(default_factory=list)
+    s_picks: list[tuple[int, float]] = field(default_factory=list)
+    event_centers: list[tuple[int, float]] = field(default_factory=list)
+    event_durations: list[tuple[int, float]] = field(default_factory=list)
+
+    # Metadata
+    snr: float = 0.0
+    amp_signal: float = 0.0
+    amp_noise: float = 0.0
+    dt_s: float = 0.01
+    dx_m: float = 10.0
+    file_name: str = ""
+    begin_time: datetime | None = None
+
+    @property
+    def nt(self) -> int:
+        """Number of time samples."""
+        return self.waveform.shape[-2] if self.waveform.ndim == 3 else self.waveform.shape[0]
+
+    @property
+    def nx(self) -> int:
+        """Number of spatial channels."""
+        return self.waveform.shape[-1]
+
+    @property
+    def nch(self) -> int:
+        """Number of data channels (always 1 for DAS)."""
+        return 1 if self.waveform.ndim == 2 else self.waveform.shape[0]
+
+    def copy(self) -> "DASSample":
+        """Create a deep copy of the sample."""
+        return DASSample(
+            waveform=self.waveform.copy(),
+            p_picks=self.p_picks.copy(),
+            s_picks=self.s_picks.copy(),
+            event_centers=self.event_centers.copy(),
+            event_durations=self.event_durations.copy(),
+            snr=self.snr,
+            amp_signal=self.amp_signal,
+            amp_noise=self.amp_noise,
+            dt_s=self.dt_s,
+            dx_m=self.dx_m,
+            file_name=self.file_name,
+            begin_time=self.begin_time,
+        )
+
+    def ensure_3d(self) -> "DASSample":
+        """Ensure waveform is 3D (nch, nt, nx)."""
+        if self.waveform.ndim == 2:
+            self.waveform = self.waveform[np.newaxis, :, :]
+        return self
+
+    def to_tensor(self) -> torch.Tensor:
+        """Convert waveform to torch tensor."""
+        self.ensure_3d()
+        return torch.from_numpy(self.waveform.astype(np.float32))
+
+
+# =============================================================================
+# Transform Base Classes - Following CV Best Practices
+# =============================================================================
+
+class DASTransform(ABC):
+    """Base class for all DAS transforms.
+
+    Transforms operate on DASSample objects, modifying both waveform and
+    phase picks. This is similar to how object detection transforms
+    operate on both images and bounding boxes.
+    """
+
+    @abstractmethod
+    def __call__(self, sample: DASSample) -> DASSample:
+        pass
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}()"
+
+
+class DASCompose(DASTransform):
+    """Compose multiple transforms together.
+
+    Example:
+        >>> transforms = DASCompose([
+        ...     DASNormalize(),
+        ...     DASRandomCrop(nt=3072, nx=5120),
+        ...     DASFlipLR(p=0.5),
+        ... ])
+    """
+
+    def __init__(self, transforms: Sequence[DASTransform]):
+        self.transforms = list(transforms)
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        for t in self.transforms:
+            sample = t(sample)
+        return sample
+
+    def __repr__(self) -> str:
+        lines = [f"{self.__class__.__name__}(["]
+        for t in self.transforms:
+            lines.append(f"    {t},")
+        lines.append("])")
+        return "\n".join(lines)
+
+
+class DASIdentity(DASTransform):
+    """Identity transform - returns sample unchanged."""
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        return sample
+
+
+# =============================================================================
+# Basic Waveform Transforms
+# =============================================================================
+
+class DASNormalize(DASTransform):
+    """Normalize DAS waveform.
+
+    Args:
+        mode: "global" for global normalization, "channel" for per-channel
+        eps: Small value for numerical stability
+    """
+
+    def __init__(self, mode: str = "global", eps: float = 1e-10):
+        self.mode = mode
+        self.eps = eps
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        sample.ensure_3d()
+        data = np.nan_to_num(sample.waveform)
+        data = data - data.mean(axis=-2, keepdims=True)
+
+        if self.mode == "global":
+            std = data.std()
+        else:
+            std = data.std(axis=-2, keepdims=True)
+
+        if np.any(std > self.eps):
+            data = data / np.maximum(std, self.eps)
+
+        sample.waveform = data.astype(np.float32)
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASNormalize(mode='{self.mode}')"
+
+
+class DASMedianFilter(DASTransform):
+    """Remove median along spatial axis (common-mode rejection)."""
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        sample.ensure_3d()
+        sample.waveform = sample.waveform - np.median(sample.waveform, axis=-1, keepdims=True)
+        return sample
+
+
+class DASHighpassFilter(DASTransform):
+    """Apply highpass filter to waveform."""
+
+    def __init__(self, freq: float = 1.0, sampling_rate: float = DEFAULT_SAMPLING_RATE):
+        from scipy import signal
+        self.freq = freq
+        self.sampling_rate = sampling_rate
+        self.b, self.a = signal.butter(2, freq, "hp", fs=sampling_rate)
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        from scipy import signal
+        sample.ensure_3d()
+        sample.waveform = signal.filtfilt(self.b, self.a, sample.waveform, axis=-2).astype(np.float32)
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASHighpassFilter(freq={self.freq})"
+
+
+# =============================================================================
+# Spatial-Temporal Transforms
+# =============================================================================
+
+class DASRandomCrop(DASTransform):
+    """Randomly crop waveform to fixed size, adjusting phase picks.
+
+    Args:
+        nt: Target time samples
+        nx: Target spatial samples
+        min_label_sum: Minimum sum of phase labels to accept crop
+        max_tries: Maximum attempts to find valid crop
+    """
+
+    def __init__(
+        self,
+        nt: int = 3072,
+        nx: int = 5120,
+        min_label_sum: float = 0.0,
+        max_tries: int = 100,
+    ):
+        self.nt = nt
+        self.nx = nx
+        self.min_label_sum = min_label_sum
+        self.max_tries = max_tries
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        sample.ensure_3d()
+        _, nt_orig, nx_orig = sample.waveform.shape
+
+        if nt_orig <= self.nt and nx_orig <= self.nx:
+            return sample
+
+        best_t0, best_x0 = 0, 0
+        best_sum = 0
+
+        for _ in range(self.max_tries):
+            t0 = random.randint(0, max(0, nt_orig - self.nt))
+            x0 = random.randint(0, max(0, nx_orig - self.nx))
+
+            # Count picks in this crop
+            pick_sum = sum(
+                1 for ch, t in sample.p_picks + sample.s_picks
+                if x0 <= ch < x0 + self.nx and t0 <= t < t0 + self.nt
+            )
+
+            if pick_sum > best_sum:
+                best_sum = pick_sum
+                best_t0, best_x0 = t0, x0
+
+            if pick_sum >= self.min_label_sum:
+                break
+
+        # Apply crop
+        sample.waveform = sample.waveform[:, best_t0:best_t0 + self.nt, best_x0:best_x0 + self.nx].copy()
+
+        # Adjust picks
+        sample.p_picks = [
+            (ch - best_x0, t - best_t0)
+            for ch, t in sample.p_picks
+            if best_x0 <= ch < best_x0 + self.nx and best_t0 <= t < best_t0 + self.nt
+        ]
+        sample.s_picks = [
+            (ch - best_x0, t - best_t0)
+            for ch, t in sample.s_picks
+            if best_x0 <= ch < best_x0 + self.nx and best_t0 <= t < best_t0 + self.nt
+        ]
+        sample.event_centers = [
+            (ch - best_x0, t - best_t0)
+            for ch, t in sample.event_centers
+            if best_x0 <= ch < best_x0 + self.nx and best_t0 <= t < best_t0 + self.nt
+        ]
+        sample.event_durations = [
+            (ch - best_x0, d)
+            for ch, d in sample.event_durations
+            if best_x0 <= ch < best_x0 + self.nx
+        ]
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASRandomCrop(nt={self.nt}, nx={self.nx})"
+
+
+class DASFlipLR(DASTransform):
+    """Randomly flip waveform horizontally (spatial axis).
+
+    Args:
+        p: Probability of flipping
+    """
+
+    def __init__(self, p: float = 0.5):
+        self.p = p
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        if random.random() < self.p:
+            sample.ensure_3d()
+            nx = sample.nx
+            sample.waveform = np.flip(sample.waveform, axis=-1).copy()
+
+            # Adjust channel indices
+            sample.p_picks = [(nx - 1 - ch, t) for ch, t in sample.p_picks]
+            sample.s_picks = [(nx - 1 - ch, t) for ch, t in sample.s_picks]
+            sample.event_centers = [(nx - 1 - ch, t) for ch, t in sample.event_centers]
+            sample.event_durations = [(nx - 1 - ch, d) for ch, d in sample.event_durations]
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASFlipLR(p={self.p})"
+
+
+class DASResampleTime(DASTransform):
+    """Resample time axis by a random factor.
+
+    Args:
+        min_factor: Minimum scale factor
+        max_factor: Maximum scale factor
+    """
+
+    def __init__(self, min_factor: float = 0.5, max_factor: float = 3.0):
+        self.min_factor = min_factor
+        self.max_factor = max_factor
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        sample.ensure_3d()
+        factor = random.uniform(self.min_factor, self.max_factor)
+        if abs(factor - 1.0) < 0.01:
+            return sample
+
+        # Resample waveform
+        data_tensor = torch.from_numpy(sample.waveform).unsqueeze(0)
+        data_resampled = F.interpolate(
+            data_tensor, scale_factor=(factor, 1), mode="bilinear", align_corners=False
+        ).squeeze(0).numpy()
+        sample.waveform = data_resampled.astype(np.float32)
+
+        # Scale time indices
+        sample.p_picks = [(ch, t * factor) for ch, t in sample.p_picks]
+        sample.s_picks = [(ch, t * factor) for ch, t in sample.s_picks]
+        sample.event_centers = [(ch, t * factor) for ch, t in sample.event_centers]
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASResampleTime(min_factor={self.min_factor}, max_factor={self.max_factor})"
+
+
+class DASResampleSpace(DASTransform):
+    """Resample spatial axis by a random factor.
+
+    Args:
+        min_factor: Minimum scale factor
+        max_factor: Maximum scale factor
+    """
+
+    def __init__(self, min_factor: float = 0.5, max_factor: float = 5.0):
+        self.min_factor = min_factor
+        self.max_factor = max_factor
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        sample.ensure_3d()
+        factor = random.uniform(self.min_factor, self.max_factor)
+        if abs(factor - 1.0) < 0.01:
+            return sample
+
+        # Resample waveform
+        data_tensor = torch.from_numpy(sample.waveform)
+        data_resampled = F.interpolate(data_tensor, scale_factor=factor, mode="nearest")
+        sample.waveform = data_resampled.numpy().astype(np.float32)
+
+        # Scale channel indices
+        sample.p_picks = [(int(ch * factor), t) for ch, t in sample.p_picks]
+        sample.s_picks = [(int(ch * factor), t) for ch, t in sample.s_picks]
+        sample.event_centers = [(int(ch * factor), t) for ch, t in sample.event_centers]
+        sample.event_durations = [(int(ch * factor), d) for ch, d in sample.event_durations]
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASResampleSpace(min_factor={self.min_factor}, max_factor={self.max_factor})"
+
+
+# =============================================================================
+# Masking Transforms
+# =============================================================================
+
+class DASMasking(DASTransform):
+    """Randomly mask a time window in the waveform.
+
+    Args:
+        max_mask_nt: Maximum mask width in time samples
+        p: Probability of applying mask
+    """
+
+    def __init__(self, max_mask_nt: int = 256, p: float = 0.2):
+        self.max_mask_nt = max_mask_nt
+        self.p = p
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        if random.random() > self.p:
+            return sample
+
+        sample.ensure_3d()
+        _, nt, nx = sample.waveform.shape
+
+        mask_nt = random.randint(32, min(self.max_mask_nt, nt // 2))
+        t0 = random.randint(0, nt - mask_nt)
+
+        sample.waveform[:, t0:t0 + mask_nt, :] = 0.0
+
+        # Remove picks in masked region
+        sample.p_picks = [(ch, t) for ch, t in sample.p_picks if not (t0 <= t < t0 + mask_nt)]
+        sample.s_picks = [(ch, t) for ch, t in sample.s_picks if not (t0 <= t < t0 + mask_nt)]
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASMasking(max_mask_nt={self.max_mask_nt}, p={self.p})"
+
+
+# =============================================================================
+# Stacking Transforms
+# =============================================================================
+
+class DASStackEvents(DASTransform):
+    """Stack multiple events onto a single waveform.
+
+    This is one of the most important augmentations for DAS data.
+    Similar to Mixup/CutMix in computer vision.
+
+    Args:
+        p: Probability of stacking
+        min_snr: Minimum SNR required to apply stacking
+        max_shift: Maximum temporal shift for alignment
+    """
+
+    def __init__(self, p: float = 0.3, min_snr: float = 10.0, max_shift: int = 2048):
+        self.p = p
+        self.min_snr = min_snr
+        self.max_shift = max_shift
+        self._sample_fn: Callable[[], DASSample | None] | None = None
+
+    def set_sample_fn(self, fn: Callable[[], DASSample | None]):
+        """Set function to get random samples for stacking."""
+        self._sample_fn = fn
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        if random.random() > self.p or sample.snr < self.min_snr:
+            return sample
+        if self._sample_fn is None:
+            return sample
+
+        sample2 = self._sample_fn()
+        if sample2 is None:
+            return sample
+
+        sample.ensure_3d()
+        sample2.ensure_3d()
+
+        if sample.waveform.shape != sample2.waveform.shape:
+            return sample
+
+        # Random shift and amplitude scaling
+        shift = random.randint(-self.max_shift, self.max_shift)
+        scale = 1 + random.random() * 2
+
+        # Stack waveforms
+        waveform2 = np.roll(sample2.waveform, shift, axis=-2)
+        sample.waveform = sample.waveform * scale + waveform2 * scale
+
+        # Merge picks with shift
+        nt = sample.nt
+        sample.p_picks += [(ch, (t + shift) % nt) for ch, t in sample2.p_picks]
+        sample.s_picks += [(ch, (t + shift) % nt) for ch, t in sample2.s_picks]
+        sample.event_centers += [(ch, (t + shift) % nt) for ch, t in sample2.event_centers]
+        sample.event_durations += sample2.event_durations
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASStackEvents(p={self.p}, min_snr={self.min_snr})"
+
+
+class DASStackNoise(DASTransform):
+    """Stack noise onto the waveform.
+
+    Args:
+        max_ratio: Maximum noise amplitude ratio relative to signal
+        p: Probability of applying
+    """
+
+    def __init__(self, max_ratio: float = 2.0, p: float = 0.5):
+        self.max_ratio = max_ratio
+        self.p = p
+        self._noise_fn: Callable[[], np.ndarray | None] | None = None
+
+    def set_noise_fn(self, fn: Callable[[], np.ndarray | None]):
+        """Set function to get random noise samples."""
+        self._noise_fn = fn
+
+    def __call__(self, sample: DASSample) -> DASSample:
+        if random.random() > self.p or self._noise_fn is None:
+            return sample
+
+        noise = self._noise_fn()
+        if noise is None:
+            return sample
+
+        sample.ensure_3d()
+        if noise.shape != sample.waveform.shape:
+            return sample
+
+        ratio = random.uniform(0, self.max_ratio) * max(0, sample.snr - 2)
+        sample.waveform = sample.waveform + noise * ratio
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"DASStackNoise(max_ratio={self.max_ratio}, p={self.p})"
+
+
+# =============================================================================
+# Label Generation
+# =============================================================================
+
+def generate_das_phase_labels(
+    sample: DASSample,
+    config: DASLabelConfig = DASLabelConfig(),
+    phases: list[str] = ["P", "S"],
+) -> dict[str, np.ndarray]:
+    """Generate phase labels from a DASSample.
+
+    Args:
+        sample: DASSample with picks
+        config: Label configuration
+        phases: Phase types to generate labels for
+
+    Returns:
+        Dictionary with phase_pick, phase_mask arrays
+    """
+    sample.ensure_3d()
+    _, nt, nx = sample.waveform.shape
+
+    # Create label arrays
+    n_phases = len(phases)
+    target = np.zeros([n_phases + 1, nt, nx], dtype=np.float32)
+    phase_mask = np.zeros([1, nt, nx], dtype=np.float32)
+
+    # Get picks for each phase
+    picks_by_phase = {"P": sample.p_picks, "S": sample.s_picks}
+
+    sigma = config.phase_width / 6
+    t = np.arange(nt)
+
+    # Track which channels have all phases
+    space_mask = np.zeros((n_phases, nx), dtype=bool)
+
+    for i, phase in enumerate(phases):
+        picks = picks_by_phase.get(phase, [])
+        for ch, phase_time in picks:
+            ch = int(ch)
+            if 0 <= ch < nx:
+                gaussian = np.exp(-((t - phase_time) ** 2) / (2 * sigma ** 2))
+                gaussian[gaussian < config.gaussian_threshold] = 0.0
+                target[i + 1, :, ch] += gaussian
+                space_mask[i, ch] = True
+                phase_mask[0, :, ch] = 1.0
+
+    # Compute noise channel (1 - sum of phases)
+    valid_mask = np.all(space_mask, axis=0)  # (nx,) - channels with all phases
+    # Sum phase labels along phase axis (axis=0 of target[1:])
+    phase_sum = np.sum(target[1:, :, :], axis=0)  # (nt, nx)
+    target[0, :, :] = np.maximum(0, 1 - phase_sum)
+    # Zero out channels without all phases
+    target[:, :, ~valid_mask] = 0
+
+    return {
+        "phase_pick": target,
+        "phase_mask": phase_mask,
+    }
+
+
+def generate_das_event_labels(
+    sample: DASSample,
+    config: DASLabelConfig = DASLabelConfig(),
+) -> dict[str, np.ndarray]:
+    """Generate event labels from a DASSample.
+
+    Args:
+        sample: DASSample with event centers/durations
+        config: Label configuration
+
+    Returns:
+        Dictionary with event_center, event_time, event_center_mask, event_time_mask
+    """
+    sample.ensure_3d()
+    _, nt, nx = sample.waveform.shape
+
+    target_center = np.zeros([1, nt, nx], dtype=np.float32)
+    target_time = np.zeros([1, nt, nx], dtype=np.float32)
+    center_mask = np.zeros([1, nt, nx], dtype=np.float32)
+    time_mask = np.zeros([1, nt, nx], dtype=np.float32)
+
+    sigma = config.event_width / 6
+    mask_width = int(config.event_width * config.mask_width_factor)
+    t = np.arange(nt)
+
+    for (ch_c, center), (ch_d, duration) in zip(sample.event_centers, sample.event_durations):
+        ch = int(ch_c)
+        if 0 <= ch < nx:
+            gaussian = np.exp(-((t - center) ** 2) / (2 * sigma ** 2))
+            gaussian[gaussian < 0.05] = 0.0
+            target_center[0, :, ch] += gaussian
+            target_time[0, :, ch] = t - center + duration
+            center_mask[0, :, ch] = 1.0
+
+            t0 = max(0, int(center) - mask_width)
+            t1 = min(nt, int(center) + mask_width)
+            time_mask[0, t0:t1, ch] = 1.0
+
+    return {
+        "event_center": target_center,
+        "event_time": target_time,
+        "event_center_mask": center_mask,
+        "event_time_mask": time_mask,
+    }
+
+
+def generate_das_labels(
+    sample: DASSample,
+    config: DASLabelConfig = DASLabelConfig(),
+    phases: list[str] = ["P", "S"],
+) -> dict[str, np.ndarray]:
+    """Generate all labels from a DASSample.
+
+    Args:
+        sample: DASSample with picks and event info
+        config: Label configuration
+        phases: Phase types
+
+    Returns:
+        Combined dictionary of all labels
+    """
+    labels = generate_das_phase_labels(sample, config, phases)
+    labels.update(generate_das_event_labels(sample, config))
+    return labels
+
+
+# =============================================================================
+# Default Transform Presets
+# =============================================================================
+
+def default_train_transforms(
+    nt: int = 3072,
+    nx: int = 5120,
+    enable_stacking: bool = True,
+    enable_noise_stacking: bool = True,
+    enable_resample_time: bool = False,
+    enable_resample_space: bool = False,
+    enable_masking: bool = True,
+) -> DASCompose:
+    """Default transforms for DAS training.
+
+    Args:
+        nt: Target time samples
+        nx: Target spatial samples
+        enable_stacking: Enable event stacking
+        enable_noise_stacking: Enable noise stacking
+        enable_resample_time: Enable time resampling
+        enable_resample_space: Enable space resampling
+        enable_masking: Enable masking augmentation
+    """
+    transforms = [DASNormalize()]
+
+    if enable_resample_time:
+        transforms.append(DASResampleTime(0.5, 3.0))
+
+    if enable_resample_space:
+        transforms.append(DASResampleSpace(0.5, 5.0))
+
+    if enable_stacking:
+        transforms.append(DASStackEvents(p=0.3, min_snr=10.0))
+
+    transforms.append(DASRandomCrop(nt=nt, nx=nx))
+
+    if enable_noise_stacking:
+        transforms.append(DASStackNoise(max_ratio=2.0, p=0.5))
+
+    transforms.extend([
+        DASFlipLR(p=0.5),
+    ])
+
+    if enable_masking:
+        transforms.append(DASMasking(max_mask_nt=256, p=0.2))
+
+    transforms.append(DASNormalize())
+
+    return DASCompose(transforms)
+
+
+def default_eval_transforms(min_nt: int = 1024, min_nx: int = 1024) -> DASCompose:
+    """Default transforms for DAS evaluation."""
+    return DASCompose([
+        DASNormalize(),
+    ])
+
+
+def minimal_transforms() -> DASCompose:
+    """Minimal transforms - just normalize."""
+    return DASCompose([DASNormalize()])
+
+
+# =============================================================================
+# GCS Utilities
+# =============================================================================
+
+def get_gcs_storage_options() -> dict:
+    """Load GCS credentials for authenticated access.
+
+    Checks for application default credentials at the standard path.
+    Returns empty dict if credentials not found (for anonymous access).
+    """
+    if os.path.exists(GCS_CREDENTIALS_PATH):
+        with open(GCS_CREDENTIALS_PATH, "r") as f:
+            token = json.load(f)
+        return {"token": token}
+    return {}
+
+
+def get_filesystem(path: str):
+    """Get appropriate filesystem for the given path.
+
+    Args:
+        path: Local path or GCS path (gs://...)
+
+    Returns:
+        (filesystem, path_without_protocol) tuple
+    """
+    if path.startswith("gs://"):
+        storage_options = get_gcs_storage_options()
+        fs = fsspec.filesystem("gcs", **storage_options)
+        # Remove gs:// prefix for gcs filesystem
+        path_clean = path[5:]  # Remove "gs://"
+        return fs, path_clean
+    else:
+        fs = fsspec.filesystem("file")
+        return fs, path
+
+
+def open_file(path: str, mode: str = "rb"):
+    """Open a file from local or GCS path.
+
+    Args:
+        path: Local path or GCS path (gs://...)
+        mode: File open mode
+
+    Returns:
+        File-like object
+    """
+    if path.startswith("gs://"):
+        storage_options = get_gcs_storage_options()
+        return fsspec.open(path, mode, **storage_options)
+    else:
+        return fsspec.open(path, mode)
+
+
+# =============================================================================
+# Legacy Helper Functions (used by DASIterableDataset)
+# =============================================================================
 
 def normalize(data: torch.Tensor):
-    """channel-wise normalization
+    """Channel-wise normalization for torch tensors.
 
     Args:
         data (tensor): [nch, nt, nx]
@@ -86,23 +902,6 @@ def generate_phase_label(
     space_mask = np.all(space_mask, axis=0)  ## traces with all picks
     target[0:1, :, space_mask] = np.maximum(0, 1 - np.sum(target[1:, :, space_mask], axis=0, keepdims=True))
     target[:, :, ~space_mask] = 0
-
-    # plt.figure(figsize=(12, 12))
-    # plt.subplot(3, 1, 1)
-    # plt.imshow((data[0, :, :] - torch.mean(data[0, :, :], dim=0, keepdims=True))/torch.std(data[0, :, :], dim=0, keepdims=True), vmin=-2, vmax=2, aspect="auto", cmap="seismic")
-    # plt.subplot(3, 1, 2)
-    # target_ = np.zeros([max(3, len(phase_list)+1), nt, nx], dtype=np.float32)
-    # for i in range(target.shape[0]):
-    #     target_[i, :, :] = target[i, :, :]
-    # if target_.shape[0] == 4:
-    #     # target_ =  target_[1:, :, :]
-    #     target_ = target_[[1, 2, 3], :, :]
-    # print(target_.shape, target.shape)
-    # plt.imshow(target_.transpose(1, 2, 0), aspect="auto")
-    # plt.subplot(3, 1, 3)
-    # plt.imshow(time_mask[0,:,:], aspect="auto")
-    # plt.savefig("test_label.png")
-    # raise
     time_mask = time_mask[np.newaxis, :, :]
 
     return target, time_mask
@@ -420,23 +1219,6 @@ def resample_time(data, picks, noise=None, factor=1):
     return data_, picks_, noise_
 
 
-def filter_channels(picks):
-    """filter channels with all pick types"""
-
-    commmon_channel_index = []
-    for event_index in picks["event_index"].unique():
-        for phase_type in picks["phase_type"].unique():
-            commmon_channel_index.append(
-                picks[(picks["event_index"] == event_index) & (picks["phase_type"] == phase_type)][
-                    "channel_index"
-                ].tolist()
-            )
-    commmon_channel_index = set.intersection(*map(set, commmon_channel_index))
-    picks = picks[picks["channel_index"].isin(commmon_channel_index)]
-    return picks
-
-
-
 def read_PASSCAL_segy(fid, nTraces=1250, nSample=900000, TraceOff=0, strain_rate=True):
     """Function to read PASSCAL segy raw data
     For Ridgecrest data, there are 1250 channels in total,
@@ -468,22 +1250,68 @@ def read_PASSCAL_segy(fid, nTraces=1250, nSample=900000, TraceOff=0, strain_rate
     return data
 
 
-def roll_by_gather(data, dim, shifts: torch.LongTensor):
-    nch, h, w = data.shape
+def padding(data: torch.Tensor, min_nt: int = 1024, min_nx: int = 1024) -> torch.Tensor:
+    """Pad data to multiples of min_nt and min_nx.
 
-    if dim == 0:
-        arange1 = torch.arange(h).view((1, h, 1)).repeat((nch, 1, w))
-        arange2 = (arange1 - shifts) % h
-        return torch.gather(data, 1, arange2)
-    elif dim == 1:
-        arange1 = torch.arange(w).view((1, 1, w)).repeat((nch, h, 1))
-        arange2 = (arange1 - shifts.unsqueeze(0)) % w
-        return torch.gather(data, 2, arange2)
-    else:
-        raise ValueError("dim must be 0 or 1")
+    Args:
+        data: Tensor of shape (nch, nt, nx)
+        min_nt: Minimum time samples (pads to multiple)
+        min_nx: Minimum space samples (pads to multiple)
 
+    Returns:
+        Padded tensor
+    """
+    nch, nt, nx = data.shape
+    pad_nt = (min_nt - nt % min_nt) % min_nt
+    pad_nx = (min_nx - nx % min_nx) % min_nx
+
+    if pad_nt > 0 or pad_nx > 0:
+        with torch.no_grad():
+            # F.pad format: (left, right, top, bottom) for 3D input
+            data = F.pad(data, (0, pad_nx, 0, pad_nt), mode="constant")
+
+    return data
+
+
+# =============================================================================
+# Dataset Classes
+# =============================================================================
 
 class DASIterableDataset(IterableDataset):
+    """DAS Iterable Dataset supporting local and GCS paths.
+
+    Args:
+        data_path: Local path or GCS path (gs://...) to data directory
+        data_list: List of data files or path to file containing list
+        format: Data format ("h5", "npz", "npy", "segy")
+        prefix: File prefix filter
+        suffix: File suffix filter
+        nt: Number of time samples per patch
+        nx: Number of space samples per patch
+        min_nt: Minimum time samples for padding
+        min_nx: Minimum space samples for padding
+        training: Whether in training mode
+        phases: Phase types to use (e.g., ["P", "S"])
+        label_path: Local path or GCS path to labels directory
+        subdir: Subdirectory depth for label->data path conversion
+        label_list: List of label files or path to file containing list
+        noise_list: List of noise files for augmentation
+        stack_noise: Whether to stack noise during training
+        stack_event: Whether to stack events during training
+        resample_time: Whether to resample time axis
+        resample_space: Whether to resample space axis
+        skip_existing: Skip files with existing picks
+        pick_path: Path to save/check picks
+        folder_depth: Parent folder depth for pick_path
+        num_patch: Number of patches per sample
+        masking: Apply masking augmentation
+        highpass_filter: Highpass filter frequency
+        system: DAS system type ("optasense" or None)
+        cut_patch: Whether to cut into patches
+        rank: Worker rank for distributed training
+        world_size: Total workers for distributed training
+    """
+
     def __init__(
         self,
         data_path="./",
@@ -533,20 +1361,24 @@ class DASIterableDataset(IterableDataset):
         self.prefix = prefix
         self.suffix = suffix
         self.subdir = subdir
+        self.label_path = label_path
 
-        self.data_path = data_path
+        # Determine if using GCS
+        self.use_gcs = data_path.startswith("gs://") if data_path else False
+
+        # Load data list
         if data_list is not None:
-            if type(data_list) == list:
+            if isinstance(data_list, list):
                 self.data_list = []
                 for data_list_ in data_list:
-                    with open(data_list_, "r") as f:
-                        # read lines without \n
-                        self.data_list += f.read().rstrip("\n").split("\n")
+                    self.data_list += self._read_text_file(data_list_).rstrip("\n").split("\n")
             else:
-                with open(data_list, "r") as f:
-                    self.data_list = f.read().rstrip("\n").split("\n")
+                self.data_list = self._read_text_file(data_list).rstrip("\n").split("\n")
         else:
-            self.data_list = glob(os.path.join(self.data_path, f"{prefix}*{suffix}.{format}"))
+            # List files from local or GCS
+            self.data_list = self._list_files(
+                self.data_path, f"{prefix}*{suffix}.{format}"
+            )
 
         if not training:
             self.data_list = self.data_list[rank::world_size]
@@ -566,31 +1398,30 @@ class DASIterableDataset(IterableDataset):
         ## training and data augmentation
         self.training = training
         self.phases = phases
-        self.label_path = label_path
+
+        # Load label list
         if label_list is not None:
-            if type(label_list) is list:
+            if isinstance(label_list, list):
                 self.label_list = []
                 for label_list_ in label_list:
-                    with open(label_list_, "r") as f:
-                        self.label_list += f.read().rstrip("\n").split("\n")
+                    self.label_list += self._read_text_file(label_list_).rstrip("\n").split("\n")
             else:
-                with open(label_list, "r") as f:
-                    self.label_list = f.read().rstrip("\n").split("\n")
+                self.label_list = self._read_text_file(label_list).rstrip("\n").split("\n")
             if training:
                 self.label_list = self.label_list[: len(self.label_list) // world_size * world_size]
             self.label_list = self.label_list[rank::world_size]
         else:
-            self.label_list = glob(self.label_path + f"/*.csv")
+            # List label files from local or GCS
+            self.label_list = self._list_files(self.label_path, "*.csv")
         self.min_picks = kwargs["min_picks"] if "min_picks" in kwargs else 500
+        self.noise_list = None
         if noise_list is not None:
-            if type(noise_list) is list:
+            if isinstance(noise_list, list):
                 self.noise_list = []
                 for noise_list_ in noise_list:
-                    with open(noise_list_, "r") as f:
-                        self.noise_list += f.read().rstrip("\n").split("\n")
+                    self.noise_list += self._read_text_file(noise_list_).rstrip("\n").split("\n")
             else:
-                with open(noise_list, "r") as f:
-                    self.noise_list = f.read().rstrip("\n").split("\n")
+                self.noise_list = self._read_text_file(noise_list).rstrip("\n").split("\n")
         self.stack_noise = stack_noise
         self.stack_event = stack_event
         self.resample_space = resample_space
@@ -610,6 +1441,89 @@ class DASIterableDataset(IterableDataset):
         ## pre-calcuate length
         self._data_len = self._count()
 
+    def _list_files(self, path: str, pattern: str) -> list[str]:
+        """List files matching pattern from local or GCS path.
+
+        Args:
+            path: Local path or GCS path (gs://...)
+            pattern: Glob pattern to match
+
+        Returns:
+            List of file paths
+        """
+        if path.startswith("gs://"):
+            fs, path_clean = get_filesystem(path)
+            # Use fsspec glob
+            full_pattern = f"{path_clean}/{pattern}"
+            files = fs.glob(full_pattern)
+            # Return with gs:// prefix
+            return [f"gs://{f}" for f in files]
+        else:
+            return glob(os.path.join(path, pattern))
+
+    @staticmethod
+    def _read_text_file(file_path: str) -> str:
+        """Read text file from local or GCS.
+
+        Args:
+            file_path: Local path or GCS path
+
+        Returns:
+            File contents as string
+        """
+        if file_path.startswith("gs://"):
+            fs = fsspec.filesystem("gcs", **get_gcs_storage_options())
+            with fs.open(file_path, "r") as f:
+                return f.read()
+        else:
+            with open(file_path, "r") as f:
+                return f.read()
+
+    def _open_h5_file(self, file_path: str):
+        """Open an HDF5 file from local or GCS.
+
+        Args:
+            file_path: Local path or GCS path
+
+        Returns:
+            Context manager for h5py.File
+        """
+        return open_file(file_path, "rb")
+
+    def _read_csv(self, file_path: str) -> pd.DataFrame:
+        """Read CSV file from local or GCS.
+
+        Args:
+            file_path: Local path or GCS path
+
+        Returns:
+            pandas DataFrame
+        """
+        if file_path.startswith("gs://"):
+            storage_options = get_gcs_storage_options()
+            return pd.read_csv(file_path, storage_options=storage_options)
+        else:
+            return pd.read_csv(file_path)
+
+    def _construct_data_path(self, label_file: str) -> str:
+        """Construct data file path from label file path.
+
+        Args:
+            label_file: Path to label file (CSV)
+
+        Returns:
+            Path to corresponding data file (H5)
+        """
+        # Convert label path to data path
+        data_file = "/".join(
+            label_file.replace("labels", "data").replace(".csv", ".h5").split("/")[-self.subdir:]
+        )
+        # Join with data_path preserving GCS prefix if needed
+        if self.data_path.startswith("gs://"):
+            return f"{self.data_path.rstrip('/')}/{data_file}"
+        else:
+            return os.path.join(self.data_path, data_file)
+
     def __len__(self):
         return self._data_len
 
@@ -621,7 +1535,7 @@ class DASIterableDataset(IterableDataset):
             return len(self.data_list)
         else:
             if self.format == "h5":
-                with fsspec.open(self.data_list[0], "rb") as fs:
+                with self._open_h5_file(self.data_list[0]) as fs:
                     with h5py.File(fs, "r") as meta:
                         if self.system == "optasense":
                             attrs = {}
@@ -632,9 +1546,9 @@ class DASIterableDataset(IterableDataset):
                             else:
                                 nx, nt = meta["Acquisition/Raw[0]/RawData"].shape
                                 dx = meta["Acquisition"].attrs["SpatialSamplingInterval"]
-                                fs = meta["Acquisition/Raw[0]"].attrs["OutputDataRate"]
+                                fs_rate = meta["Acquisition/Raw[0]"].attrs["OutputDataRate"]
                                 attrs["dx_m"] = dx
-                                attrs["dt_s"] = 1.0 / fs
+                                attrs["dt_s"] = 1.0 / fs_rate
                         else:
                             nx, nt = meta["data"].shape
                             attrs = dict(meta["data"].attrs)
@@ -644,7 +1558,7 @@ class DASIterableDataset(IterableDataset):
 
             elif self.format == "segy":
                 print("Start reading segy file")
-                with fsspec.open(self.data_list[0], "rb") as fs:
+                with self._open_h5_file(self.data_list[0]) as fs:
                     nx, nt = read_PASSCAL_segy(fs).shape
                 print("End reading segy file")
             else:
@@ -666,12 +1580,29 @@ class DASIterableDataset(IterableDataset):
         else:
             return iter(self.sample(self.data_list[worker_id::num_workers]))
 
+    def _construct_file_path(self, base_path: str, relative_path: str) -> str:
+        """Construct full file path preserving GCS prefix.
+
+        Args:
+            base_path: Base path (local or GCS)
+            relative_path: Relative path to append
+
+        Returns:
+            Full path with proper prefix
+        """
+        if base_path.startswith("gs://"):
+            return f"{base_path.rstrip('/')}/{relative_path.lstrip('/')}"
+        else:
+            return os.path.join(base_path, relative_path)
+
     def sample_training(self, file_list):
         while True:
             ## load picks
             file_list = np.random.permutation(file_list)
             for label_file in file_list:
-                picks = pd.read_csv(self.label_path + "/" + label_file)
+                # Construct full label path
+                label_path_full = self._construct_file_path(self.label_path, label_file)
+                picks = self._read_csv(label_path_full)
                 if "channel_index" not in picks.columns:
                     picks = picks.rename(columns={"station_id": "channel_index"})
 
@@ -685,9 +1616,10 @@ class DASIterableDataset(IterableDataset):
                 data_file = "/".join(
                     label_file.replace("labels", "data").replace(".csv", ".h5").split("/")[-self.subdir:]
                 )  # folder/data/event_id
+                data_path_full = self._construct_file_path(self.data_path, data_file)
 
                 try:
-                    with fsspec.open(self.data_path + "/" + data_file, "rb") as f:
+                    with open_file(data_path_full, "rb") as f:
                         with h5py.File(f, "r") as fp:
                             data = fp["data"][:, :].T
                             dt = fp["data"].attrs["dt_s"]
@@ -696,8 +1628,8 @@ class DASIterableDataset(IterableDataset):
                         data = data / np.std(data)
                         data = torch.from_numpy(data.astype(np.float32))
 
-                except:
-                    print(f"Error reading {data_file}")
+                except Exception as e:
+                    print(f"Error reading {data_path_full}: {e}")
                     continue
 
                 ## basic normalize
@@ -707,8 +1639,9 @@ class DASIterableDataset(IterableDataset):
                 noise = None
                 if self.stack_noise and (self.noise_list is not None):
                     tmp = self.noise_list[np.random.randint(0, len(self.noise_list))]
+                    noise_path_full = self._construct_file_path(self.data_path, tmp)
                     try:
-                        with fsspec.open(os.path.join(self.data_path, tmp), "rb") as f:
+                        with open_file(noise_path_full, "rb") as f:
                             with h5py.File(f, "r") as fp:
                                 noise = fp["data"][:, :].T
                             ## The first 30s are noise in the training data
@@ -718,8 +1651,8 @@ class DASIterableDataset(IterableDataset):
                             noise = torch.from_numpy(noise.astype(np.float32))
 
                         noise = noise - torch.mean(noise, dim=1, keepdim=True)
-                    except:
-                        print(f"Error reading noise file {tmp}")
+                    except Exception as e:
+                        print(f"Error reading noise file {noise_path_full}: {e}")
                         noise = torch.zeros([1, self.nt, self.nx], dtype=torch.float32)
 
                 ## snr
@@ -854,16 +1787,18 @@ class DASIterableDataset(IterableDataset):
             sample = {}
 
             if self.format == "npz":
-                data = np.load(file)["data"]
+                with open_file(file, "rb") as f:
+                    data = np.load(f)["data"]
 
             elif self.format == "npy":
-                data = np.load(file)  # (nx, nt)
+                with open_file(file, "rb") as f:
+                    data = np.load(f)  # (nx, nt)
                 sample["begin_time"] = datetime.fromisoformat("1970-01-01 00:00:00")
                 sample["dt_s"] = 0.01
                 sample["dx_m"] = 10.0
 
             elif self.format == "h5" and (self.system is None):
-                with fsspec.open(file, "rb") as fs:
+                with open_file(file, "rb") as fs:
                     with h5py.File(fs, "r") as fp:
                         dataset = fp["data"]  # nt x nx
                         data = dataset[()]
@@ -878,7 +1813,7 @@ class DASIterableDataset(IterableDataset):
                         else:
                             sample["dx_m"] = self.dx
             elif (self.format == "h5") and (self.system == "optasense"):
-                with fsspec.open(file, "rb") as fs:
+                with open_file(file, "rb") as fs:
                     with h5py.File(fs, "r") as fp:
                         # dataset = fp["Data"]
                         if "Data" in fp:  # converted format by Ettore Biondi
@@ -889,11 +1824,11 @@ class DASIterableDataset(IterableDataset):
                         else:
                             dataset = fp["Acquisition/Raw[0]/RawData"]
                             dx = fp["Acquisition"].attrs["SpatialSamplingInterval"]
-                            fs = fp["Acquisition/Raw[0]"].attrs["OutputDataRate"]
+                            fs_rate = fp["Acquisition/Raw[0]"].attrs["OutputDataRate"]
                             begin_time = dataset.attrs["PartStartTime"].decode()
 
                             sample["dx_m"] = dx
-                            sample["dt_s"] = 1.0 / fs
+                            sample["dt_s"] = 1.0 / fs_rate
                             sample["begin_time"] = datetime.fromisoformat(begin_time.rstrip("Z"))
 
                         nx, nt = dataset.shape
@@ -911,7 +1846,7 @@ class DASIterableDataset(IterableDataset):
 
             elif self.format == "segy":
                 meta = {}
-                with fsspec.open(file, "rb") as fs:
+                with open_file(file, "rb") as fs:
                     data = read_PASSCAL_segy(fs)
 
                 ## FIXME: hard code for Ridgecrest DAS
@@ -1297,3 +2232,264 @@ class DASDataset(Dataset):
         sample["height"], sample["width"] = sample["data"].shape[-2:]
 
         return sample
+
+
+# =============================================================================
+# Sample Buffer for Stacking
+# =============================================================================
+
+class DASSampleBuffer:
+    """Efficient buffer for random sample access during stacking.
+
+    Uses reservoir sampling for streaming datasets.
+    """
+
+    def __init__(self, max_size: int = 100):
+        self.max_size = max_size
+        self.buffer: list[DASSample] = []
+        self.count = 0
+
+    def add(self, sample: DASSample):
+        """Add a sample to the buffer."""
+        if len(self.buffer) < self.max_size:
+            self.buffer.append(sample.copy())
+        else:
+            # Reservoir sampling
+            idx = random.randint(0, self.count)
+            if idx < self.max_size:
+                self.buffer[idx] = sample.copy()
+        self.count += 1
+
+    def get_random(self) -> DASSample | None:
+        """Get a random sample from the buffer."""
+        if not self.buffer:
+            return None
+        return random.choice(self.buffer).copy()
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+
+# =============================================================================
+# Factory Functions
+# =============================================================================
+
+def create_das_train_dataset(
+    data_path: str,
+    label_path: str,
+    label_list: str | list[str] | None = None,
+    noise_list: str | list[str] | None = None,
+    nt: int = 3072,
+    nx: int = 5120,
+    min_nt: int = 1024,
+    min_nx: int = 1024,
+    phases: list[str] = ["P", "S"],
+    stack_noise: bool = True,
+    stack_event: bool = True,
+    resample_time: bool = False,
+    resample_space: bool = False,
+    masking: bool = True,
+    num_patch: int = 2,
+    **kwargs,
+) -> DASIterableDataset:
+    """Create a DAS training dataset with default augmentation.
+
+    Args:
+        data_path: Path to data files (local or GCS)
+        label_path: Path to label files (local or GCS)
+        label_list: List of label files or path to file containing list
+        noise_list: List of noise files for augmentation
+        nt: Target time samples
+        nx: Target spatial samples
+        min_nt: Minimum time samples for padding
+        min_nx: Minimum space samples for padding
+        phases: Phase types to use
+        stack_noise: Enable noise stacking
+        stack_event: Enable event stacking
+        resample_time: Enable time resampling
+        resample_space: Enable space resampling
+        masking: Enable masking augmentation
+        num_patch: Number of patches per sample
+        **kwargs: Additional arguments
+
+    Returns:
+        DASIterableDataset instance
+    """
+    return DASIterableDataset(
+        data_path=data_path,
+        label_path=label_path,
+        label_list=label_list,
+        noise_list=noise_list,
+        nt=nt,
+        nx=nx,
+        min_nt=min_nt,
+        min_nx=min_nx,
+        training=True,
+        phases=phases,
+        stack_noise=stack_noise,
+        stack_event=stack_event,
+        resample_time=resample_time,
+        resample_space=resample_space,
+        masking=masking,
+        num_patch=num_patch,
+        **kwargs,
+    )
+
+
+def create_das_eval_dataset(
+    data_path: str,
+    nt: int = 3072,
+    nx: int = 5120,
+    min_nt: int = 1024,
+    min_nx: int = 1024,
+    format: str = "h5",
+    system: str | None = None,
+    cut_patch: bool = False,
+    highpass_filter: float | None = None,
+    **kwargs,
+) -> DASIterableDataset:
+    """Create a DAS evaluation dataset without augmentation.
+
+    Args:
+        data_path: Path to data files (local or GCS)
+        nt: Target time samples
+        nx: Target spatial samples
+        min_nt: Minimum time samples for padding
+        min_nx: Minimum space samples for padding
+        format: Data format (h5, npz, npy, segy)
+        system: DAS system type (optasense or None)
+        cut_patch: Whether to cut into patches
+        highpass_filter: Highpass filter frequency
+        **kwargs: Additional arguments
+
+    Returns:
+        DASIterableDataset instance
+    """
+    return DASIterableDataset(
+        data_path=data_path,
+        format=format,
+        nt=nt,
+        nx=nx,
+        min_nt=min_nt,
+        min_nx=min_nx,
+        training=False,
+        system=system,
+        cut_patch=cut_patch,
+        highpass_filter=highpass_filter,
+        **kwargs,
+    )
+
+
+def load_das_sample_from_h5(
+    file_path: str,
+    picks_df: pd.DataFrame | None = None,
+    phases: list[str] = ["P", "S"],
+) -> DASSample:
+    """Load a DASSample from an HDF5 file.
+
+    Args:
+        file_path: Path to H5 file (local or GCS)
+        picks_df: DataFrame with picks (channel_index, phase_index, phase_type)
+        phases: Phase types to extract
+
+    Returns:
+        DASSample instance
+    """
+    with open_file(file_path, "rb") as f:
+        with h5py.File(f, "r") as fp:
+            data = fp["data"][:, :].T  # (nx, nt) -> (nt, nx)
+            dt_s = fp["data"].attrs.get("dt_s", 0.01)
+            dx_m = fp["data"].attrs.get("dx_m", 10.0)
+
+    data = data[np.newaxis, :, :]  # (1, nt, nx)
+    data = data / np.std(data)
+    data = data - np.mean(data, axis=1, keepdims=True)
+
+    p_picks = []
+    s_picks = []
+    event_centers = []
+    event_durations = []
+
+    if picks_df is not None:
+        if "channel_index" not in picks_df.columns and "station_id" in picks_df.columns:
+            picks_df = picks_df.rename(columns={"station_id": "channel_index"})
+
+        for phase in phases:
+            phase_picks = picks_df[picks_df["phase_type"] == phase][
+                ["channel_index", "phase_index"]
+            ].values.tolist()
+            phase_picks = [(int(ch), float(t)) for ch, t in phase_picks]
+
+            if phase == "P":
+                p_picks = phase_picks
+            elif phase == "S":
+                s_picks = phase_picks
+
+        # Compute event centers from P and S picks
+        if p_picks and s_picks:
+            p_dict = {ch: t for ch, t in p_picks}
+            s_dict = {ch: t for ch, t in s_picks}
+            for ch in set(p_dict.keys()) & set(s_dict.keys()):
+                center = (p_dict[ch] + s_dict[ch]) / 2
+                duration = s_dict[ch] - p_dict[ch]
+                event_centers.append((ch, center))
+                event_durations.append((ch, duration))
+
+    return DASSample(
+        waveform=data.astype(np.float32),
+        p_picks=p_picks,
+        s_picks=s_picks,
+        event_centers=event_centers,
+        event_durations=event_durations,
+        dt_s=dt_s,
+        dx_m=dx_m,
+        file_name=os.path.basename(file_path),
+    )
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+
+__all__ = [
+    # Configuration
+    "DASLabelConfig",
+    "BUCKET_DAS",
+    # Sample
+    "DASSample",
+    "DASSampleBuffer",
+    # Transforms
+    "DASTransform",
+    "DASCompose",
+    "DASIdentity",
+    "DASNormalize",
+    "DASMedianFilter",
+    "DASHighpassFilter",
+    "DASRandomCrop",
+    "DASFlipLR",
+    "DASResampleTime",
+    "DASResampleSpace",
+    "DASMasking",
+    "DASStackEvents",
+    "DASStackNoise",
+    # Label generation
+    "generate_das_phase_labels",
+    "generate_das_event_labels",
+    "generate_das_labels",
+    # Transform presets
+    "default_train_transforms",
+    "default_eval_transforms",
+    "minimal_transforms",
+    # Datasets
+    "DASIterableDataset",
+    "DASDataset",
+    "AutoEncoderIterableDataset",
+    # Factory functions
+    "create_das_train_dataset",
+    "create_das_eval_dataset",
+    "load_das_sample_from_h5",
+    # GCS utilities
+    "get_gcs_storage_options",
+    "get_filesystem",
+    "open_file",
+]

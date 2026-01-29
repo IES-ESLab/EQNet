@@ -1,27 +1,27 @@
+"""PhaseNet Plus: Phase picking with polarity and event detection."""
 from .phasenet import PhaseNet
 
 
 def build_model(
-    backbone="unet",
-    log_scale=True,
-    add_stft=False,
-    add_polarity=True,
-    add_event=True,
-    event_center_loss_weight=1.0,
-    event_time_loss_weight=1.0,
-    polarity_loss_weight=1.0,
-    window_attention=False,
-    *args,
+    backbone: str = "unet",
+    log_scale: bool = True,
+    add_stft: bool = False,
+    add_polarity: bool = True,
+    add_event: bool = True,
+    event_center_loss_weight: float = 1.0,
+    event_time_loss_weight: float = 1.0,
+    polarity_loss_weight: float = 1.0,
     **kwargs,
 ) -> PhaseNet:
+    """Build PhaseNet Plus with polarity and event detection enabled."""
     return PhaseNet(
         backbone=backbone,
         log_scale=log_scale,
         add_stft=add_stft,
-        add_event=add_event,
         add_polarity=add_polarity,
+        add_event=add_event,
         event_center_loss_weight=event_center_loss_weight,
         event_time_loss_weight=event_time_loss_weight,
         polarity_loss_weight=polarity_loss_weight,
-        window_attention=window_attention,
+        **kwargs,
     )

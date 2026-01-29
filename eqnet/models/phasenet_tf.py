@@ -1,25 +1,21 @@
+"""PhaseNet with Time-Frequency (STFT) features."""
 from .phasenet import PhaseNet
 
 
 def build_model(
-    backbone="unet",
-    log_scale=True,
-    add_stft=True,
-    add_polarity=False,
-    add_event=False,
-    event_center_loss_weight=1.0,
-    event_time_loss_weight=1.0,
-    polarity_loss_weight=1.0,
-    *args,
+    backbone: str = "unet",
+    log_scale: bool = True,
+    add_stft: bool = True,
+    add_polarity: bool = False,
+    add_event: bool = False,
     **kwargs,
 ) -> PhaseNet:
+    """Build PhaseNet with STFT features enabled."""
     return PhaseNet(
         backbone=backbone,
         log_scale=log_scale,
         add_stft=add_stft,
-        add_event=add_event,
         add_polarity=add_polarity,
-        event_center_loss_weight=event_center_loss_weight,
-        event_time_loss_weight=event_time_loss_weight,
-        polarity_loss_weight=polarity_loss_weight,
+        add_event=add_event,
+        **kwargs,
     )

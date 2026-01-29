@@ -51,7 +51,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
         polarity_mask_old = np.zeros([self.nt, num_station])
         event_center_old = np.zeros([self.nt, num_station])
         event_time_old = np.zeros([self.nt, num_station])
-        event_mask_old = np.zeros([self.nt, num_station])
+        event_center_mask_old = np.zeros([self.nt, num_station])
+        event_time_mask_old = np.zeros([self.nt, num_station])
         station_location_old = np.zeros([3, num_station])
         prompt_center_old = np.zeros([self.nt, num_station])
         prompt_mask_old = np.zeros([self.nt, num_station])
@@ -81,7 +82,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             event_center = np.zeros([self.nt0, len(station_ids)])
             event_time = np.zeros([self.nt0, len(station_ids)])
             event_location = np.zeros([3])
-            event_mask = np.zeros([self.nt0, len(station_ids)])
+            event_center_mask = np.zeros([self.nt0, len(station_ids)])
+            event_time_mask = np.zeros([self.nt0, len(station_ids)])
             station_location = np.zeros([3, len(station_ids)])
             prompt_center = np.zeros([self.nt0, len(station_ids)])
             prompt_mask = np.zeros([self.nt0, len(station_ids)])
@@ -140,10 +142,10 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 # event_center[int(c0//self.feature_scale), i] = 1
                 # print(c0_width)
 
-                event_center[:, i], event_time[:, i], event_mask[:, i] = generate_event_label([c0], [t0], nt=self.nt0)
+                event_center[:, i], event_time[:, i], event_center_mask[:, i], event_time_mask[:, i] = generate_event_label([c0], [t0], nt=self.nt0)
                 event_location[:] = np.array([dx, dy, dz])
 
-                prompt_center[:, i], _, prompt_mask[:, i] = generate_event_label([c0], [t0], nt=self.nt0)
+                prompt_center[:, i], _, prompt_mask[:, i], _ = generate_event_label([c0], [t0], nt=self.nt0)
 
                 ## station location
                 station_location[0, i] = round(
@@ -193,7 +195,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             event_center = event_center[np.newaxis, ii : ii + self.nt, :]
             event_time = event_time[np.newaxis, ii : ii + self.nt, :]
             # event_location = event_location[:, ii : ii + self.nt, :]
-            event_mask = event_mask[np.newaxis, ii : ii + self.nt, :]
+            event_center_mask = event_center_mask[np.newaxis, ii : ii + self.nt, :]
+            event_time_mask = event_time_mask[np.newaxis, ii : ii + self.nt, :]
             polarity = polarity[np.newaxis, ii : ii + self.nt, :]
             polarity_mask = polarity_mask[np.newaxis, ii : ii + self.nt, :]
 
@@ -242,7 +245,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             polarity_mask = np.clip(polarity_mask + polarity_mask_old, 0, 1)
             event_center = np.clip(event_center + event_center_old, 0, 1)
             event_time += event_time_old
-            event_mask = np.clip(event_mask + event_mask_old, 0, 1)
+            event_center_mask = np.clip(event_center_mask + event_center_mask_old, 0, 1)
+            event_time_mask = np.clip(event_time_mask + event_time_mask_old, 0, 1)
 
             data_old = data_new
             phase_pick_old = phase_pick_new
@@ -259,7 +263,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             phase_mask = phase_mask.transpose(0, 2, 1)  # 1, nx, nt
             event_center = event_center.transpose(0, 2, 1)  # 1, nx, nt//16
             event_time = event_time.transpose(0, 2, 1)  # 1, nx, nt//16
-            event_mask = event_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_center_mask = event_center_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_time_mask = event_time_mask.transpose(0, 2, 1)  # 1, nx, nt//16
             polarity = polarity.transpose(0, 2, 1)  # 1, nx, nt//20
             polarity_mask = polarity_mask.transpose(0, 2, 1)  # 1, nx, nt//20
             prompt_center = prompt_center.transpose(0, 2, 1)  # 1, nx, nt//16
@@ -270,7 +275,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             polarity_mask = polarity_mask[..., :: self.polarity_feature_scale]
             event_center = event_center[..., :: self.event_feature_scale]
             event_time = event_time[..., :: self.event_feature_scale]
-            event_mask = event_mask[..., :: self.event_feature_scale]
+            event_center_mask = event_center_mask[..., :: self.event_feature_scale]
+            event_time_mask = event_time_mask[..., :: self.event_feature_scale]
             prompt_center = prompt_center[..., :: self.event_feature_scale]
             prompt_mask = prompt_mask[..., :: self.event_feature_scale]
 
@@ -282,7 +288,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 "polarity_mask": torch.from_numpy(polarity_mask).float(),
                 "event_center": torch.from_numpy(event_center).float(),
                 "event_time": torch.from_numpy(event_time).float(),
-                "event_mask": torch.from_numpy(event_mask).float(),
+                "event_center_mask": torch.from_numpy(event_center_mask).float(),
+                "event_time_mask": torch.from_numpy(event_time_mask).float(),
                 "station_location": torch.from_numpy(station_location).float(),
                 "prompt_center": torch.from_numpy(prompt_center).float(),
                 "prompt_mask": torch.from_numpy(prompt_mask).float(),
@@ -331,7 +338,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             event_center = np.zeros([self.nt0, len(station_ids)])
             event_time = np.zeros([self.nt0, len(station_ids)])
             event_location = np.zeros([3])
-            event_mask = np.zeros([self.nt0, len(station_ids)])
+            event_center_mask = np.zeros([self.nt0, len(station_ids)])
+            event_time_mask = np.zeros([self.nt0, len(station_ids)])
             station_location = np.zeros([3, len(station_ids)])
             prompt_center = np.zeros([self.nt0, len(station_ids)])
             prompt_mask = np.zeros([self.nt0, len(station_ids)])
@@ -391,10 +399,10 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 # event_center[int(c0//self.feature_scale), i] = 1
                 # print(c0_width)
 
-                event_center[:, i], event_time[:, i], event_mask[:, i] = generate_event_label([c0], [t0], nt=self.nt0)
+                event_center[:, i], event_time[:, i], event_center_mask[:, i], event_time_mask[:, i] = generate_event_label([c0], [t0], nt=self.nt0)
                 event_location[:] = np.array([dx, dy, dz])
 
-                prompt_center[:, i], _, prompt_mask[:, i] = generate_event_label([c0], [t0], nt=self.nt0)
+                prompt_center[:, i], _, prompt_mask[:, i], _ = generate_event_label([c0], [t0], nt=self.nt0)
 
                 ## station location
                 station_location[0, i] = round(
@@ -451,7 +459,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             event_center = event_center[np.newaxis, ii : ii + self.nt, :]
             event_time = event_time[np.newaxis, ii : ii + self.nt, :]
             # event_location = event_location[:, ii : ii + self.nt, :]
-            event_mask = event_mask[np.newaxis, ii : ii + self.nt, :]
+            event_center_mask = event_center_mask[np.newaxis, ii : ii + self.nt, :]
+            event_time_mask = event_time_mask[np.newaxis, ii : ii + self.nt, :]
             polarity = polarity[np.newaxis, ii : ii + self.nt, :]
             polarity_mask = polarity_mask[np.newaxis, ii : ii + self.nt, :]
 
@@ -494,7 +503,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             phase_mask = phase_mask.transpose(0, 2, 1)  # 1, nx, nt
             event_center = event_center.transpose(0, 2, 1)  # 1, nx, nt//16
             event_time = event_time.transpose(0, 2, 1)  # 1, nx, nt//16
-            event_mask = event_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_center_mask = event_center_mask.transpose(0, 2, 1)  # 1, nx, nt//16
+            event_time_mask = event_time_mask.transpose(0, 2, 1)  # 1, nx, nt//16
             polarity = polarity.transpose(0, 2, 1)  # 1, nx, nt//20
             polarity_mask = polarity_mask.transpose(0, 2, 1)  # 1, nx, nt//20
             prompt_center = prompt_center.transpose(0, 2, 1)  # 1, nx, nt//16
@@ -505,7 +515,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
             polarity_mask = polarity_mask[..., :: self.polarity_feature_scale]
             event_center = event_center[..., :: self.event_feature_scale]
             event_time = event_time[..., :: self.event_feature_scale]
-            event_mask = event_mask[..., :: self.event_feature_scale]
+            event_center_mask = event_center_mask[..., :: self.event_feature_scale]
+            event_time_mask = event_time_mask[..., :: self.event_feature_scale]
             prompt_center = prompt_center[..., :: self.event_feature_scale]
             prompt_mask = prompt_mask[..., :: self.event_feature_scale]
 
@@ -517,7 +528,8 @@ class SeismicNetworkIterableDataset(IterableDataset):
                 "polarity_mask": torch.from_numpy(polarity_mask).float(),
                 "event_center": torch.from_numpy(event_center).float(),
                 "event_time": torch.from_numpy(event_time).float(),
-                "event_mask": torch.from_numpy(event_mask).float(),
+                "event_center_mask": torch.from_numpy(event_center_mask).float(),
+                "event_time_mask": torch.from_numpy(event_time_mask).float(),
                 "station_location": torch.from_numpy(station_location).float(),
                 "prompt_center": torch.from_numpy(prompt_center).float(),
                 "prompt_mask": torch.from_numpy(prompt_mask).float(),
@@ -551,13 +563,13 @@ if __name__ == "__main__":
             axes[0, 2].plot(x["polarity_mask"][0, :, i] + i, linestyle="--", color="k")
 
             axes[0, 3].plot(x["event_center"][0, :, i] + i - 0.5)
-            axes[0, 3].plot(x["event_mask"][0, :, i] + i - 0.5, linestyle="--", color="k")
+            axes[0, 3].plot(x["event_time_mask"][0, :, i] + i - 0.5, linestyle="--", color="k")
             # axes[2].scatter(x["event_location"][0, :, i], x["event_location"][1, :, i])
 
-            event_time = x["event_time"][0, :, i] * x["event_mask"][0, :, i]
+            event_time = x["event_time"][0, :, i] * x["event_time_mask"][0, :, i]
             event_time = event_time / torch.max(event_time)
             axes[1, 0].plot(event_time + i)
-            axes[1, 0].plot(x["event_mask"][0, :, i] + i - 0.5, linestyle="--", color="k")
+            axes[1, 0].plot(x["event_time_mask"][0, :, i] + i - 0.5, linestyle="--", color="k")
 
             axes[1, 1].plot(x["position"][:, i, 0])
             axes[1, 1].axhline(x["prompt"][0], color="k", linestyle="--")

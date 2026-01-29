@@ -1,6 +1,7 @@
 torch
 torchvision
-numpy
+einops
+numpy<2
 scipy
 h5py
 matplotlib
@@ -8,3 +9,7 @@ pandas
 tqdm
 fsspec
 obspy
+gcsfs
+datasets>=2.18.0
+pyarrow>=15.0.0
+wandb
