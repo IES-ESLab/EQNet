@@ -17,10 +17,13 @@ A modern, efficient dataset implementation for DAS phase picking following
 best practices from computer vision (torchvision, timm, albumentations).
 
 Design Principles:
-1. Transform-based augmentation operating on Sample dataclass
-2. Compose pattern for chaining transforms
-3. Clean separation: loading -> transforms -> label generation
-4. Support for both local filesystem and Google Cloud Storage (GCS)
+1. COCO-style Target annotations: each event is a separate Target object,
+   making multi-event stacking trivial and per-event metadata preserved
+2. Unified (nch, nx, nt) internal format: (1, num_channels, num_time_samples)
+3. Transform-based augmentation operating on raw picks before label generation
+4. Compose pattern for chaining transforms
+5. Clean separation: loading -> transforms -> label generation
+6. Support for both local filesystem and Google Cloud Storage (GCS)
 
 Example:
     >>> from eqnet.data.das import Sample, default_train_transforms, DASIterableDataset
@@ -75,65 +78,30 @@ class LabelConfig:
 
 
 # =============================================================================
-# Sample Dataclass
+# Data Structures — COCO-style Target + Sample
 # =============================================================================
 
 @dataclass
-class Sample:
-    """A DAS sample with waveform and phase annotations.
+class Target:
+    """Per-event annotation for DAS data, following COCO/torchvision conventions.
 
-    This is the core data structure passed through transforms.
-    Phase picks are stored as lists of (channel_index, time_index) tuples
-    until final label generation.
+    Each Target represents ONE seismic event's picks on the waveform.
+    A Sample can have multiple Targets (e.g. from event stacking).
 
-    Attributes:
-        waveform: DAS data array of shape (nt, nx) or (1, nt, nx)
-        p_picks: List of (channel_index, time_index) for P-wave picks
-        s_picks: List of (channel_index, time_index) for S-wave picks
-        event_centers: List of (channel_index, center_time) for events
-        ps_intervals: List of (channel_index, S-P interval in samples) for events
-        snr: Signal-to-noise ratio
-        amp_signal: Signal amplitude
-        amp_noise: Noise amplitude
-        dt_s: Temporal sampling interval (seconds)
-        dx_m: Spatial sampling interval (meters)
-        file_name: Source file name
-        begin_time: Start time of the waveform
+    Picks are (channel_index, time_sample) tuples.
     """
-    waveform: np.ndarray  # (nt, nx) or (1, nt, nx)
     p_picks: list[tuple[int, float]] = field(default_factory=list)
     s_picks: list[tuple[int, float]] = field(default_factory=list)
-    event_centers: list[tuple[int, float]] = field(default_factory=list)
-    ps_intervals: list[tuple[int, float]] = field(default_factory=list)
+    event_centers: list[tuple[int, float]] = field(default_factory=list)  # (ch, center_time)
+    ps_intervals: list[tuple[int, float]] = field(default_factory=list)  # (ch, S-P interval)
 
-    # Metadata
+    # Per-event metadata
     snr: float = 0.0
     amp_signal: float = 0.0
     amp_noise: float = 0.0
-    dt_s: float = 0.01
-    dx_m: float = 10.0
-    file_name: str = ""
-    begin_time: datetime | None = None
 
-    @property
-    def nt(self) -> int:
-        """Number of time samples."""
-        return self.waveform.shape[-2] if self.waveform.ndim == 3 else self.waveform.shape[0]
-
-    @property
-    def nx(self) -> int:
-        """Number of spatial channels."""
-        return self.waveform.shape[-1]
-
-    @property
-    def nch(self) -> int:
-        """Number of data channels (always 1 for DAS)."""
-        return 1 if self.waveform.ndim == 2 else self.waveform.shape[0]
-
-    def copy(self) -> "Sample":
-        """Create a deep copy of the sample."""
-        return Sample(
-            waveform=self.waveform.copy(),
+    def copy(self) -> "Target":
+        return Target(
             p_picks=self.p_picks.copy(),
             s_picks=self.s_picks.copy(),
             event_centers=self.event_centers.copy(),
@@ -141,35 +109,156 @@ class Sample:
             snr=self.snr,
             amp_signal=self.amp_signal,
             amp_noise=self.amp_noise,
+        )
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.p_picks and not self.s_picks
+
+    def all_times(self) -> list[float]:
+        """All pick times (P + S)."""
+        return [t for _, t in self.p_picks] + [t for _, t in self.s_picks]
+
+    # -- Pick adjustment methods (in-place, return self for chaining) --
+
+    def crop(self, t0: int, nt: int, x0: int, nx: int) -> "Target":
+        """Keep picks in [x0, x0+nx) x [t0, t0+nt), shift to new origin."""
+        self.p_picks = [
+            (ch - x0, t - t0) for ch, t in self.p_picks
+            if x0 <= ch < x0 + nx and t0 <= t < t0 + nt
+        ]
+        self.s_picks = [
+            (ch - x0, t - t0) for ch, t in self.s_picks
+            if x0 <= ch < x0 + nx and t0 <= t < t0 + nt
+        ]
+        ec, ps = [], []
+        for (ch, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+            if x0 <= ch < x0 + nx and t0 <= t < t0 + nt:
+                ec.append((ch - x0, t - t0))
+                ps.append((ch - x0, d))
+        self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+    def shift_time(self, shift: int, nt: int, wrap: bool = True) -> "Target":
+        """Shift all time indices. Wraps modulo nt or clips to [0, nt)."""
+        if wrap:
+            self.p_picks = [(ch, (t + shift) % nt) for ch, t in self.p_picks]
+            self.s_picks = [(ch, (t + shift) % nt) for ch, t in self.s_picks]
+            self.event_centers = [(ch, (t + shift) % nt) for ch, t in self.event_centers]
+        else:
+            self.p_picks = [(ch, t + shift) for ch, t in self.p_picks if 0 <= t + shift < nt]
+            self.s_picks = [(ch, t + shift) for ch, t in self.s_picks if 0 <= t + shift < nt]
+            ec, ps = [], []
+            for (ch, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+                if 0 <= t + shift < nt:
+                    ec.append((ch, t + shift))
+                    ps.append((ch, d))
+            self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+    def scale_time(self, factor: float) -> "Target":
+        """Scale time indices by factor."""
+        self.p_picks = [(ch, t * factor) for ch, t in self.p_picks]
+        self.s_picks = [(ch, t * factor) for ch, t in self.s_picks]
+        ec, ps = [], []
+        for (ch, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+            ec.append((ch, t * factor))
+            ps.append((ch, d * factor))
+        self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+    def flip_space(self, nx: int) -> "Target":
+        """Flip channel indices for spatial flip."""
+        self.p_picks = [(nx - 1 - ch, t) for ch, t in self.p_picks]
+        self.s_picks = [(nx - 1 - ch, t) for ch, t in self.s_picks]
+        self.event_centers = [(nx - 1 - ch, t) for ch, t in self.event_centers]
+        self.ps_intervals = [(nx - 1 - ch, d) for ch, d in self.ps_intervals]
+        return self
+
+    def scale_space(self, factor: float) -> "Target":
+        """Scale channel indices by factor."""
+        self.p_picks = [(int(ch * factor), t) for ch, t in self.p_picks]
+        self.s_picks = [(int(ch * factor), t) for ch, t in self.s_picks]
+        self.event_centers = [(int(ch * factor), t) for ch, t in self.event_centers]
+        self.ps_intervals = [(int(ch * factor), d) for ch, d in self.ps_intervals]
+        return self
+
+    def mask_time(self, t0: int, t1: int) -> "Target":
+        """Remove picks in time window [t0, t1)."""
+        self.p_picks = [(ch, t) for ch, t in self.p_picks if not (t0 <= t < t1)]
+        self.s_picks = [(ch, t) for ch, t in self.s_picks if not (t0 <= t < t1)]
+        ec, ps = [], []
+        for (ch, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+            if not (t0 <= t < t1):
+                ec.append((ch, t))
+                ps.append((ch, d))
+        self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+
+@dataclass
+class Sample:
+    """A DAS sample with waveform and per-event annotations.
+
+    Waveform shape: (nch, nx, nt) = (1, num_channels, num_time_samples).
+    targets: list of Target, one per seismic event in the window.
+    """
+    waveform: np.ndarray  # (nch, nx, nt) — always 3D
+    targets: list[Target] = field(default_factory=list)
+
+    # Metadata
+    dt_s: float = 0.01
+    dx_m: float = 10.0
+    file_name: str = ""
+    begin_time: datetime | None = None
+
+    @property
+    def nch(self) -> int:
+        return self.waveform.shape[0]
+
+    @property
+    def nx(self) -> int:
+        return self.waveform.shape[1]
+
+    @property
+    def nt(self) -> int:
+        return self.waveform.shape[2]
+
+    @property
+    def snr(self) -> float:
+        """Max SNR across all targets."""
+        vals = [t.snr for t in self.targets if t.snr > 0]
+        return max(vals) if vals else 0.0
+
+    @property
+    def amp_signal(self) -> float:
+        """Weakest event signal (conservative for stacking ratio)."""
+        vals = [t.amp_signal for t in self.targets if t.amp_signal > 0]
+        return min(vals) if vals else 0.0
+
+    @property
+    def amp_noise(self) -> float:
+        """Worst-case noise level across events."""
+        vals = [t.amp_noise for t in self.targets if t.amp_noise > 0]
+        return max(vals) if vals else 0.0
+
+    def copy(self) -> "Sample":
+        return Sample(
+            waveform=self.waveform.copy(),
+            targets=[t.copy() for t in self.targets],
             dt_s=self.dt_s,
             dx_m=self.dx_m,
             file_name=self.file_name,
             begin_time=self.begin_time,
         )
 
-    def ensure_3d(self) -> "Sample":
-        """Ensure waveform is 3D (nch, nt, nx)."""
-        if self.waveform.ndim == 2:
-            self.waveform = self.waveform[np.newaxis, :, :]
-        return self
-
-    def to_tensor(self) -> torch.Tensor:
-        """Convert waveform to torch tensor."""
-        self.ensure_3d()
-        return torch.from_numpy(self.waveform.astype(np.float32))
-
 
 # =============================================================================
-# Transforms - Following CV Best Practices (torchvision/albumentations pattern)
+# Transforms — Following CV Best Practices (torchvision/albumentations pattern)
 # =============================================================================
 
 class Transform(ABC):
-    """Base class for all DAS transforms.
-
-    Transforms operate on Sample objects, modifying both waveform and
-    phase picks. This is similar to how object detection transforms
-    operate on both images and bounding boxes.
-    """
+    """Base class for all DAS transforms. Operates on Sample objects."""
 
     @abstractmethod
     def __call__(self, sample: Sample) -> Sample:
@@ -180,15 +269,7 @@ class Transform(ABC):
 
 
 class Compose(Transform):
-    """Compose multiple transforms together.
-
-    Example:
-        >>> transforms = Compose([
-        ...     Normalize(),
-        ...     RandomCrop(nt=3072, nx=5120),
-        ...     FlipLR(p=0.5),
-        ... ])
-    """
+    """Compose multiple transforms together."""
 
     def __init__(self, transforms: Sequence[Transform]):
         self.transforms = list(transforms)
@@ -207,19 +288,12 @@ class Compose(Transform):
 
 
 class Identity(Transform):
-    """Identity transform - returns sample unchanged."""
-
     def __call__(self, sample: Sample) -> Sample:
         return sample
 
 
 class RandomApply(Transform):
-    """Randomly apply a transform with given probability.
-
-    Args:
-        transform: Transform to apply
-        p: Probability of applying
-    """
+    """Randomly apply a transform with given probability."""
 
     def __init__(self, transform: Transform, p: float = 0.5):
         self.transform = transform
@@ -251,14 +325,13 @@ class Normalize(Transform):
         self.eps = eps
 
     def __call__(self, sample: Sample) -> Sample:
-        sample.ensure_3d()
         data = np.nan_to_num(sample.waveform)
-        data = data - data.mean(axis=-2, keepdims=True)
+        data = data - data.mean(axis=-1, keepdims=True)  # demean along time
 
         if self.mode == "global":
             std = data.std()
         else:
-            std = data.std(axis=-2, keepdims=True)
+            std = data.std(axis=-1, keepdims=True)
 
         if np.any(std > self.eps):
             data = data / np.maximum(std, self.eps)
@@ -274,9 +347,11 @@ class MedianFilter(Transform):
     """Remove median along spatial axis (common-mode rejection)."""
 
     def __call__(self, sample: Sample) -> Sample:
-        sample.ensure_3d()
-        sample.waveform = sample.waveform - np.median(sample.waveform, axis=-1, keepdims=True)
+        sample.waveform = sample.waveform - np.median(sample.waveform, axis=-2, keepdims=True)
         return sample
+
+    def __repr__(self) -> str:
+        return "MedianFilter()"
 
 
 class HighpassFilter(Transform):
@@ -290,8 +365,7 @@ class HighpassFilter(Transform):
 
     def __call__(self, sample: Sample) -> Sample:
         from scipy import signal
-        sample.ensure_3d()
-        sample.waveform = signal.filtfilt(self.b, self.a, sample.waveform, axis=-2).astype(np.float32)
+        sample.waveform = signal.filtfilt(self.b, self.a, sample.waveform, axis=-1).astype(np.float32)
         return sample
 
     def __repr__(self) -> str:
@@ -303,7 +377,7 @@ class HighpassFilter(Transform):
 # -----------------------------------------------------------------------------
 
 class RandomCrop(Transform):
-    """Randomly crop waveform to fixed size, adjusting phase picks.
+    """Randomly crop waveform to fixed size, adjusting picks via Target.crop().
 
     If the data is smaller than the target size, it is padded with reflection.
 
@@ -314,13 +388,7 @@ class RandomCrop(Transform):
         max_tries: Maximum attempts to find valid crop
     """
 
-    def __init__(
-        self,
-        nt: int = 3072,
-        nx: int = 5120,
-        min_label_sum: float = 0.0,
-        max_tries: int = 100,
-    ):
+    def __init__(self, nt: int = 3072, nx: int = 5120, min_label_sum: float = 0.0, max_tries: int = 100):
         self.nt = nt
         self.nx = nx
         self.min_label_sum = min_label_sum
@@ -328,28 +396,24 @@ class RandomCrop(Transform):
 
     def _pad_if_needed(self, sample: Sample) -> Sample:
         """Pad waveform with reflection if smaller than target."""
-        sample.ensure_3d()
-        _, nt_orig, nx_orig = sample.waveform.shape
+        _, nx_orig, nt_orig = sample.waveform.shape
 
         if nt_orig >= self.nt and nx_orig >= self.nx:
             return sample
 
-        # Pad using torch reflect mode
-        data_tensor = torch.from_numpy(sample.waveform).unsqueeze(0)  # (1, 1, nt, nx)
-
-        pad_nt = max(0, self.nt - nt_orig)
+        data_tensor = torch.from_numpy(sample.waveform).unsqueeze(0)  # (1, 1, nx, nt)
         pad_nx = max(0, self.nx - nx_orig)
-        # F.pad: (left, right, top, bottom) for 4D input
+        pad_nt = max(0, self.nt - nt_orig)
+        # F.pad for 4D: (last_right, last_left, second_last_right, second_last_left)
         if pad_nt > 0 or pad_nx > 0:
-            data_tensor = F.pad(data_tensor, (0, pad_nx, 0, pad_nt), mode="reflect")
+            data_tensor = F.pad(data_tensor, (0, pad_nt, 0, pad_nx), mode="reflect")
             sample.waveform = data_tensor.squeeze(0).numpy().astype(np.float32)
 
         return sample
 
     def __call__(self, sample: Sample) -> Sample:
         sample = self._pad_if_needed(sample)
-        sample.ensure_3d()
-        _, nt_orig, nx_orig = sample.waveform.shape
+        _, nx_orig, nt_orig = sample.waveform.shape
 
         if nt_orig <= self.nt and nx_orig <= self.nx:
             return sample
@@ -361,9 +425,9 @@ class RandomCrop(Transform):
             t0 = random.randint(0, max(0, nt_orig - self.nt))
             x0 = random.randint(0, max(0, nx_orig - self.nx))
 
-            # Count picks in this crop
             pick_sum = sum(
-                1 for ch, t in sample.p_picks + sample.s_picks
+                1 for target in sample.targets
+                for ch, t in target.p_picks + target.s_picks
                 if x0 <= ch < x0 + self.nx and t0 <= t < t0 + self.nt
             )
 
@@ -374,30 +438,12 @@ class RandomCrop(Transform):
             if pick_sum >= self.min_label_sum:
                 break
 
-        # Apply crop
-        sample.waveform = sample.waveform[:, best_t0:best_t0 + self.nt, best_x0:best_x0 + self.nx].copy()
+        # Apply crop: waveform is (nch, nx, nt)
+        sample.waveform = sample.waveform[:, best_x0:best_x0 + self.nx, best_t0:best_t0 + self.nt].copy()
 
-        # Adjust picks
-        sample.p_picks = [
-            (ch - best_x0, t - best_t0)
-            for ch, t in sample.p_picks
-            if best_x0 <= ch < best_x0 + self.nx and best_t0 <= t < best_t0 + self.nt
-        ]
-        sample.s_picks = [
-            (ch - best_x0, t - best_t0)
-            for ch, t in sample.s_picks
-            if best_x0 <= ch < best_x0 + self.nx and best_t0 <= t < best_t0 + self.nt
-        ]
-        sample.event_centers = [
-            (ch - best_x0, t - best_t0)
-            for ch, t in sample.event_centers
-            if best_x0 <= ch < best_x0 + self.nx and best_t0 <= t < best_t0 + self.nt
-        ]
-        sample.ps_intervals = [
-            (ch - best_x0, d)
-            for ch, d in sample.ps_intervals
-            if best_x0 <= ch < best_x0 + self.nx
-        ]
+        for target in sample.targets:
+            target.crop(best_t0, self.nt, best_x0, self.nx)
+        sample.targets = [t for t in sample.targets if not t.is_empty]
 
         return sample
 
@@ -417,16 +463,10 @@ class FlipLR(Transform):
 
     def __call__(self, sample: Sample) -> Sample:
         if random.random() < self.p:
-            sample.ensure_3d()
             nx = sample.nx
-            sample.waveform = np.flip(sample.waveform, axis=-1).copy()
-
-            # Adjust channel indices
-            sample.p_picks = [(nx - 1 - ch, t) for ch, t in sample.p_picks]
-            sample.s_picks = [(nx - 1 - ch, t) for ch, t in sample.s_picks]
-            sample.event_centers = [(nx - 1 - ch, t) for ch, t in sample.event_centers]
-            sample.ps_intervals = [(nx - 1 - ch, d) for ch, d in sample.ps_intervals]
-
+            sample.waveform = np.flip(sample.waveform, axis=-2).copy()  # flip spatial axis
+            for target in sample.targets:
+                target.flip_space(nx)
         return sample
 
     def __repr__(self) -> str:
@@ -446,22 +486,19 @@ class ResampleTime(Transform):
         self.max_factor = max_factor
 
     def __call__(self, sample: Sample) -> Sample:
-        sample.ensure_3d()
         factor = random.uniform(self.min_factor, self.max_factor)
         if abs(factor - 1.0) < 0.01:
             return sample
 
-        # Resample waveform
+        # Resample waveform: (1, nx, nt) -> unsqueeze -> (1, 1, nx, nt)
         data_tensor = torch.from_numpy(sample.waveform).unsqueeze(0)
         data_resampled = F.interpolate(
-            data_tensor, scale_factor=(factor, 1), mode="bilinear", align_corners=False
+            data_tensor, scale_factor=(1, factor), mode="bilinear", align_corners=False
         ).squeeze(0).numpy()
         sample.waveform = data_resampled.astype(np.float32)
 
-        # Scale time indices
-        sample.p_picks = [(ch, t * factor) for ch, t in sample.p_picks]
-        sample.s_picks = [(ch, t * factor) for ch, t in sample.s_picks]
-        sample.event_centers = [(ch, t * factor) for ch, t in sample.event_centers]
+        for target in sample.targets:
+            target.scale_time(factor)
 
         return sample
 
@@ -482,21 +519,19 @@ class ResampleSpace(Transform):
         self.max_factor = max_factor
 
     def __call__(self, sample: Sample) -> Sample:
-        sample.ensure_3d()
         factor = random.uniform(self.min_factor, self.max_factor)
         if abs(factor - 1.0) < 0.01:
             return sample
 
-        # Resample waveform
-        data_tensor = torch.from_numpy(sample.waveform)
-        data_resampled = F.interpolate(data_tensor, scale_factor=factor, mode="nearest")
-        sample.waveform = data_resampled.numpy().astype(np.float32)
+        # Resample waveform: (1, nx, nt) -> unsqueeze -> (1, 1, nx, nt)
+        data_tensor = torch.from_numpy(sample.waveform).unsqueeze(0)
+        data_resampled = F.interpolate(
+            data_tensor, scale_factor=(factor, 1), mode="nearest"
+        ).squeeze(0).numpy()
+        sample.waveform = data_resampled.astype(np.float32)
 
-        # Scale channel indices
-        sample.p_picks = [(int(ch * factor), t) for ch, t in sample.p_picks]
-        sample.s_picks = [(int(ch * factor), t) for ch, t in sample.s_picks]
-        sample.event_centers = [(int(ch * factor), t) for ch, t in sample.event_centers]
-        sample.ps_intervals = [(int(ch * factor), d) for ch, d in sample.ps_intervals]
+        for target in sample.targets:
+            target.scale_space(factor)
 
         return sample
 
@@ -524,17 +559,15 @@ class Masking(Transform):
         if random.random() > self.p:
             return sample
 
-        sample.ensure_3d()
-        _, nt, nx = sample.waveform.shape
-
+        nt = sample.nt
         mask_nt = random.randint(32, min(self.max_mask_nt, nt // 2))
         t0 = random.randint(0, nt - mask_nt)
 
-        sample.waveform[:, t0:t0 + mask_nt, :] = 0.0
+        sample.waveform[:, :, t0:t0 + mask_nt] = 0.0
 
-        # Remove picks in masked region
-        sample.p_picks = [(ch, t) for ch, t in sample.p_picks if not (t0 <= t < t0 + mask_nt)]
-        sample.s_picks = [(ch, t) for ch, t in sample.s_picks if not (t0 <= t < t0 + mask_nt)]
+        for target in sample.targets:
+            target.mask_time(t0, t0 + mask_nt)
+        sample.targets = [t for t in sample.targets if not t.is_empty]
 
         return sample
 
@@ -549,7 +582,7 @@ class Masking(Transform):
 class StackEvents(Transform):
     """Stack multiple events onto a single waveform.
 
-    This is one of the most important augmentations for DAS data.
+    Each stacked event becomes a separate Target in sample.targets.
     Similar to Mixup/CutMix in computer vision.
 
     Args:
@@ -578,26 +611,23 @@ class StackEvents(Transform):
         if sample2 is None:
             return sample
 
-        sample.ensure_3d()
-        sample2.ensure_3d()
-
         if sample.waveform.shape != sample2.waveform.shape:
             return sample
 
         # Random shift and amplitude scaling
         shift = random.randint(-self.max_shift, self.max_shift)
         scale = 1 + random.random() * 2
+        nt = sample.nt
 
-        # Stack waveforms
-        waveform2 = np.roll(sample2.waveform, shift, axis=-2)
+        # Stack waveforms: roll along time axis
+        waveform2 = np.roll(sample2.waveform, shift, axis=-1)
         sample.waveform = sample.waveform * scale + waveform2 * scale
 
-        # Merge picks with shift
-        nt = sample.nt
-        sample.p_picks += [(ch, (t + shift) % nt) for ch, t in sample2.p_picks]
-        sample.s_picks += [(ch, (t + shift) % nt) for ch, t in sample2.s_picks]
-        sample.event_centers += [(ch, (t + shift) % nt) for ch, t in sample2.event_centers]
-        sample.ps_intervals += sample2.ps_intervals
+        # Create shifted targets for stacked event
+        for target2 in sample2.targets:
+            new_target = target2.copy()
+            new_target.shift_time(shift, nt, wrap=True)
+            sample.targets.append(new_target)
 
         return sample
 
@@ -608,6 +638,10 @@ class StackEvents(Transform):
 class StackNoise(Transform):
     """Stack noise onto the waveform.
 
+    Supports two noise sources (tried in order):
+    1. Dedicated noise files via set_noise_fn
+    2. Pre-arrival extraction from other samples via set_sample_fn
+
     Args:
         max_ratio: Maximum noise amplitude ratio relative to signal
         p: Probability of applying
@@ -617,26 +651,51 @@ class StackNoise(Transform):
         self.max_ratio = max_ratio
         self.p = p
         self._noise_fn: Callable[[], np.ndarray | None] | None = None
+        self._sample_fn: Callable[[], Sample | None] | None = None
 
     def set_noise_fn(self, fn: Callable[[], np.ndarray | None]):
-        """Set function to get random noise samples."""
+        """Set function to get random noise arrays (e.g., from dedicated noise files)."""
         self._noise_fn = fn
 
+    def set_sample_fn(self, fn: Callable[[], Sample | None]):
+        """Set function to get random samples (for pre-arrival noise extraction)."""
+        self._sample_fn = fn
+
+    def _extract_tail_noise(self, donor: Sample, length: int) -> np.ndarray | None:
+        """Extract noise from the end of the donor waveform, past all picks."""
+        nt = donor.waveform.shape[-1]
+        if nt < length:
+            return None
+        all_times = [t for tgt in donor.targets for t in tgt.all_times()]
+        last_pick = int(max(all_times)) if all_times else 0
+        start = nt - length
+        if start < last_pick + 100:  # margin for label Gaussian tail
+            return None
+        return donor.waveform[..., start:]
+
+    def _get_noise(self, sample: Sample) -> np.ndarray | None:
+        """Get noise: dedicated files first, then tail extraction."""
+        if self._noise_fn is not None:
+            noise = self._noise_fn()
+            if noise is not None:
+                return noise
+        if self._sample_fn is not None:
+            donor = self._sample_fn()
+            if donor is not None:
+                return self._extract_tail_noise(donor, sample.nt)
+        return None
+
     def __call__(self, sample: Sample) -> Sample:
-        if random.random() > self.p or self._noise_fn is None:
+        if random.random() > self.p or sample.amp_signal == 0:
             return sample
-
-        noise = self._noise_fn()
-        if noise is None:
+        noise = self._get_noise(sample)
+        if noise is None or noise.shape != sample.waveform.shape:
             return sample
-
-        sample.ensure_3d()
-        if noise.shape != sample.waveform.shape:
+        noise_std = np.std(noise)
+        if noise_std <= 0:
             return sample
-
-        ratio = random.uniform(0, self.max_ratio) * max(0, sample.snr - 2)
-        sample.waveform = sample.waveform + noise * ratio
-
+        ratio = random.uniform(0, self.max_ratio) * sample.amp_signal
+        sample.waveform = sample.waveform + noise / noise_std * ratio
         return sample
 
     def __repr__(self) -> str:
@@ -647,151 +706,102 @@ class StackNoise(Transform):
 # Label Generation
 # =============================================================================
 
-def generate_phase_labels(
-    sample: Sample,
-    config: LabelConfig = LabelConfig(),
-    phases: list[str] = ["P", "S"],
-) -> dict[str, np.ndarray]:
-    """Generate phase labels from a Sample.
-
-    Args:
-        sample: Sample with picks
-        config: Label configuration
-        phases: Phase types to generate labels for
-
-    Returns:
-        Dictionary with phase_pick, phase_mask arrays
-    """
-    sample.ensure_3d()
-    _, nt, nx = sample.waveform.shape
-
-    n_phases = len(phases)
-    target = np.zeros([n_phases + 1, nt, nx], dtype=np.float32)
-    phase_mask = np.zeros([1, nt, nx], dtype=np.float32)
-
-    picks_by_phase = {"P": sample.p_picks, "S": sample.s_picks}
-
-    sigma = config.phase_width / 6
-    mask_width = int(config.phase_width * config.mask_width_factor)
-    t = np.arange(nt)
-
-    space_mask = np.zeros((n_phases, nx), dtype=bool)
-    picks_per_channel = {}  # ch -> list of (phase_idx, time)
-
-    for i, phase in enumerate(phases):
-        picks = picks_by_phase.get(phase, [])
-        for ch, phase_time in picks:
-            ch = int(ch)
-            if 0 <= ch < nx:
-                gaussian = np.exp(-((t - phase_time) ** 2) / (2 * sigma ** 2))
-                gaussian[gaussian < config.gaussian_threshold] = 0.0
-                target[i + 1, :, ch] += gaussian
-                space_mask[i, ch] = True
-                picks_per_channel.setdefault(ch, []).append(phase_time)
-
-    # Phase mask: entire channel if all phases present, narrow window otherwise
-    for ch in picks_per_channel:
-        if np.all(space_mask[:, ch]):
-            phase_mask[0, :, ch] = 1.0
-        else:
-            for pt in picks_per_channel[ch]:
-                t0 = max(0, int(pt) - mask_width)
-                t1 = min(nt, int(pt) + mask_width)
-                phase_mask[0, t0:t1, ch] = 1.0
-
-    # Compute noise channel (1 - sum of phases)
-    valid_mask = np.all(space_mask, axis=0)  # (nx,) - channels with all phases
-    phase_sum = np.sum(target[1:, :, :], axis=0)  # (nt, nx)
-    target[0, :, :] = np.maximum(0, 1 - phase_sum)
-    target[:, :, ~valid_mask] = 0
-
-    return {
-        "phase_pick": target,
-        "phase_mask": phase_mask,
-    }
-
-
-def generate_event_labels(
-    sample: Sample,
-    config: LabelConfig = LabelConfig(),
-) -> dict[str, np.ndarray]:
-    """Generate event labels from a Sample.
-
-    Args:
-        sample: Sample with event centers and ps_intervals
-        config: Label configuration (includes vp, vp_vs_ratio)
-
-    Returns:
-        Dictionary with:
-            event_center: Gaussian peak at event center
-            event_time: (t - center) + shift, in samples. The shift is the
-                estimated travel time to event_center, computed from ps_interval
-                assuming vp and vp/vs ratio. shift = ps_interval * (vp + vs) / (2 * (vp - vs)).
-            event_center_mask: Channels with events
-            event_time_mask: Time window around event center
-    """
-    sample.ensure_3d()
-    _, nt, nx = sample.waveform.shape
-
-    target_center = np.zeros([1, nt, nx], dtype=np.float32)
-    target_time = np.zeros([1, nt, nx], dtype=np.float32)
-    center_mask = np.zeros([1, nt, nx], dtype=np.float32)
-    time_mask = np.zeros([1, nt, nx], dtype=np.float32)
-
-    ps_dict = dict(sample.ps_intervals) if sample.ps_intervals else {}
-    vp = config.vp
-    vs = vp / config.vp_vs_ratio
-    sigma = config.event_width / 6
-    mask_width = int(config.event_width * config.mask_width_factor)
-    t = np.arange(nt)
-
-    for ch_c, center in sample.event_centers:
-        ch = int(ch_c)
-        if 0 <= ch < nx:
-            gaussian = np.exp(-((t - center) ** 2) / (2 * sigma ** 2))
-            gaussian[gaussian < 0.05] = 0.0
-            target_center[0, :, ch] += gaussian
-
-            # Estimate travel time to event center from ps_interval
-            ps_int = ps_dict.get(ch, 0.0)
-            ps_seconds = ps_int * sample.dt_s
-            distance = ps_seconds * vp * vs / (vp - vs)
-            center_travel = distance * (1 / vp + 1 / vs) / 2  # average of P and S travel times
-            shift = center_travel / sample.dt_s  # convert back to samples
-
-            center_mask[0, :, ch] = 1.0
-
-            t0 = max(0, int(center) - mask_width)
-            t1 = min(nt, int(center) + mask_width)
-            time_mask[0, t0:t1, ch] = 1.0
-            target_time[0, t0:t1, ch] = (t[t0:t1] - center) + shift
-
-    return {
-        "event_center": target_center,
-        "event_time": target_time,
-        "event_center_mask": center_mask,
-        "event_time_mask": time_mask,
-    }
-
-
 def generate_labels(
     sample: Sample,
     config: LabelConfig = LabelConfig(),
     phases: list[str] = ["P", "S"],
 ) -> dict[str, np.ndarray]:
-    """Generate all labels from a Sample.
+    """Generate all labels from Sample.targets.
 
-    Args:
-        sample: Sample with picks and event info
-        config: Label configuration
-        phases: Phase types
+    Iterates over all targets (events) in the sample, accumulating
+    Gaussian labels. Naturally handles multi-event windows from stacking.
 
     Returns:
-        Combined dictionary of all labels
+        All arrays have shape (label_ch, nx, nt) matching the unified format.
+        - phase_pick: (3, nx, nt) — [noise, P, S]
+        - phase_mask: (1, nx, nt)
+        - event_center: (1, nx, nt)
+        - event_time: (1, nx, nt)
+        - event_center_mask: (1, nx, nt)
+        - event_time_mask: (1, nx, nt)
     """
-    labels = generate_phase_labels(sample, config, phases)
-    labels.update(generate_event_labels(sample, config))
-    return labels
+    nx, nt = sample.nx, sample.nt
+    sigma = config.phase_width / 6
+    sigma_event = config.event_width / 6
+    mask_w = int(config.phase_width * config.mask_width_factor)
+    event_mask_w = int(config.event_width * config.mask_width_factor)
+    t = np.arange(nt)
+
+    p_label = np.zeros((nx, nt), dtype=np.float32)
+    s_label = np.zeros((nx, nt), dtype=np.float32)
+    event_center_label = np.zeros((nx, nt), dtype=np.float32)
+    event_time_label = np.zeros((nx, nt), dtype=np.float32)
+    event_center_mask = np.zeros((nx, nt), dtype=np.float32)
+    event_time_mask = np.zeros((nx, nt), dtype=np.float32)
+    phase_mask = np.zeros((nx, nt), dtype=np.float32)
+
+    has_p = np.zeros(nx, dtype=bool)
+    has_s = np.zeros(nx, dtype=bool)
+
+    vp = config.vp
+    vs = vp / config.vp_vs_ratio
+
+    picks_per_channel: dict[int, list[float]] = {}
+
+    def add_phase_picks(picks, label, has_flag):
+        for ch, ti in picks:
+            ch = int(ch)
+            if 0 <= ch < nx:
+                g = np.exp(-((t - ti) ** 2) / (2 * sigma ** 2))
+                g[g < config.gaussian_threshold] = 0.0
+                label[ch] += g
+                has_flag[ch] = True
+                picks_per_channel.setdefault(ch, []).append(ti)
+
+    for target in sample.targets:
+        add_phase_picks(target.p_picks, p_label, has_p)
+        add_phase_picks(target.s_picks, s_label, has_s)
+
+        # Event labels
+        for (ch, center), (_, ps_int) in zip(target.event_centers, target.ps_intervals):
+            ch = int(ch)
+            if 0 <= ch < nx:
+                g = np.exp(-((t - center) ** 2) / (2 * sigma_event ** 2))
+                g[g < 0.05] = 0.0
+                event_center_label[ch] += g
+
+                ps_seconds = ps_int * sample.dt_s
+                distance = ps_seconds * vp * vs / (vp - vs)
+                center_travel = distance * (1 / vp + 1 / vs) / 2
+                shift = center_travel / sample.dt_s
+
+                event_center_mask[ch, :] = 1.0
+                t0 = max(0, int(center) - event_mask_w)
+                t1 = min(nt, int(center) + event_mask_w)
+                event_time_mask[ch, t0:t1] = 1.0
+                event_time_label[ch, t0:t1] = (t[t0:t1] - center) + shift
+
+    # Phase mask: full channel if both P and S, narrow window otherwise
+    for ch in picks_per_channel:
+        if has_p[ch] and has_s[ch]:
+            phase_mask[ch, :] = 1.0
+        else:
+            for ti in picks_per_channel[ch]:
+                t0 = max(0, int(ti) - mask_w)
+                t1 = min(nt, int(ti) + mask_w)
+                phase_mask[ch, t0:t1] = 1.0
+
+    noise_label = np.maximum(0, 1.0 - p_label - s_label)
+
+    # All outputs: (label_ch, nx, nt)
+    return {
+        "phase_pick": np.stack([noise_label, p_label, s_label], axis=0),  # (3, nx, nt)
+        "phase_mask": phase_mask[np.newaxis],  # (1, nx, nt)
+        "event_center": event_center_label[np.newaxis],  # (1, nx, nt)
+        "event_time": event_time_label[np.newaxis],  # (1, nx, nt)
+        "event_center_mask": event_center_mask[np.newaxis],  # (1, nx, nt)
+        "event_time_mask": event_time_mask[np.newaxis],  # (1, nx, nt)
+    }
 
 
 # =============================================================================
@@ -807,17 +817,7 @@ def default_train_transforms(
     enable_resample_space: bool = False,
     enable_masking: bool = True,
 ) -> Compose:
-    """Default transforms for DAS training.
-
-    Args:
-        nt: Target time samples
-        nx: Target spatial samples
-        enable_stacking: Enable event stacking
-        enable_noise_stacking: Enable noise stacking
-        enable_resample_time: Enable time resampling
-        enable_resample_space: Enable space resampling
-        enable_masking: Enable masking augmentation
-    """
+    """Default transforms for DAS training."""
     transforms = [Normalize()]
 
     if enable_resample_time:
@@ -857,6 +857,32 @@ def minimal_transforms() -> Compose:
     return Compose([Normalize()])
 
 
+def _to_output(
+    sample: Sample,
+    label_config: LabelConfig,
+    phases: list[str],
+    event_feature_scale: int,
+) -> dict[str, torch.Tensor]:
+    """Convert transformed Sample to output dict with labels."""
+    labels = generate_labels(sample, label_config, phases)
+    s = event_feature_scale
+    data = torch.from_numpy(sample.waveform).float()
+    return {
+        "data": torch.nan_to_num(data),
+        "phase_pick": torch.from_numpy(labels["phase_pick"]).float(),
+        "phase_mask": torch.from_numpy(labels["phase_mask"]).float(),
+        "event_center": torch.from_numpy(labels["event_center"]).float()[:, :, ::s],
+        "event_time": torch.from_numpy(labels["event_time"]).float()[:, :, ::s],
+        "event_center_mask": torch.from_numpy(labels["event_center_mask"]).float()[:, :, ::s],
+        "event_time_mask": torch.from_numpy(labels["event_time_mask"]).float()[:, :, ::s],
+        "file_name": sample.file_name,
+        "height": data.shape[-2],
+        "width": data.shape[-1],
+        "dt_s": sample.dt_s,
+        "dx_m": sample.dx_m,
+    }
+
+
 # =============================================================================
 # GCS Utilities
 # =============================================================================
@@ -871,14 +897,7 @@ def get_gcs_storage_options() -> dict:
 
 
 def get_filesystem(path: str):
-    """Get appropriate filesystem for the given path.
-
-    Args:
-        path: Local path or GCS path (gs://...)
-
-    Returns:
-        (filesystem, path_without_protocol) tuple
-    """
+    """Get appropriate filesystem for the given path."""
     if path.startswith("gs://"):
         storage_options = get_gcs_storage_options()
         fs = fsspec.filesystem("gcs", **storage_options)
@@ -911,25 +930,21 @@ def calc_snr(
     """Calculate SNR from waveform and picks.
 
     Args:
-        data: Waveform array (nch, nt, nx) or (nt, nx)
+        data: Waveform array (nch, nx, nt)
         picks: List of (channel_index, time_index) tuples
-        noise_window: Number of samples before pick for noise
-        signal_window: Number of samples after pick for signal
 
     Returns:
         (snr, signal_std, noise_std)
     """
-    if data.ndim == 2:
-        data = data[np.newaxis, :, :]
+    nch, nx, nt = data.shape
 
     snrs, signals, noises = [], [], []
-    nch, nt, nx = data.shape
-    for trace, phase_time in picks:
-        trace = int(trace)
+    for ch, phase_time in picks:
+        ch = int(ch)
         phase_time = int(phase_time)
-        if 0 <= trace < nx and noise_window < phase_time < nt - signal_window:
-            noise = np.std(data[:, max(0, phase_time - noise_window):phase_time, trace])
-            signal = np.std(data[:, phase_time:phase_time + signal_window, trace])
+        if 0 <= ch < nx and noise_window < phase_time < nt - signal_window:
+            noise = np.std(data[:, ch, max(0, phase_time - noise_window):phase_time])
+            signal = np.std(data[:, ch, phase_time:phase_time + signal_window])
             if noise > 0 and signal > 0:
                 snrs.append(signal / noise)
                 signals.append(signal)
@@ -970,24 +985,25 @@ def read_PASSCAL_segy(fid, nTraces=1250, nSample=900000, TraceOff=0, strain_rate
     return data
 
 
-def padding(data: torch.Tensor, min_nt: int = 1024, min_nx: int = 1024) -> torch.Tensor:
-    """Pad data to multiples of min_nt and min_nx.
+def padding(data: torch.Tensor, min_nx: int = 1024, min_nt: int = 1024) -> torch.Tensor:
+    """Pad data to multiples of min_nx and min_nt.
 
     Args:
-        data: Tensor of shape (nch, nt, nx)
-        min_nt: Minimum time samples (pads to multiple)
+        data: Tensor of shape (nch, nx, nt)
         min_nx: Minimum space samples (pads to multiple)
+        min_nt: Minimum time samples (pads to multiple)
 
     Returns:
         Padded tensor
     """
-    nch, nt, nx = data.shape
-    pad_nt = (min_nt - nt % min_nt) % min_nt
+    nch, nx, nt = data.shape
     pad_nx = (min_nx - nx % min_nx) % min_nx
+    pad_nt = (min_nt - nt % min_nt) % min_nt
 
     if pad_nt > 0 or pad_nx > 0:
         with torch.no_grad():
-            data = F.pad(data, (0, pad_nx, 0, pad_nt), mode="constant")
+            # F.pad for 3D: (last_right, last_left, second_last_right, second_last_left)
+            data = F.pad(data, (0, pad_nt, 0, pad_nx), mode="constant")
 
     return data
 
@@ -1005,17 +1021,17 @@ def load_sample_from_h5(
         phases: Phase types to extract
 
     Returns:
-        Sample instance
+        Sample instance with waveform shape (1, nx, nt)
     """
     with open_file(file_path, "rb") as f:
         with h5py.File(f, "r") as fp:
-            data = fp["data"][:, :].T  # (nx, nt) -> (nt, nx)
+            data = fp["data"][:, :]  # (nx, nt) — keep native ordering
             dt_s = fp["data"].attrs.get("dt_s", 0.01)
             dx_m = fp["data"].attrs.get("dx_m", 10.0)
 
-    data = data[np.newaxis, :, :]  # (1, nt, nx)
+    data = data[np.newaxis, :, :]  # (1, nx, nt)
     data = data / (np.std(data) + 1e-10)
-    data = data - np.mean(data, axis=1, keepdims=True)
+    data = data - np.mean(data, axis=-1, keepdims=True)  # demean along time
 
     p_picks = []
     s_picks = []
@@ -1047,12 +1063,16 @@ def load_sample_from_h5(
                 event_centers.append((ch, center))
                 ps_intervals.append((ch, ps_int))
 
-    return Sample(
-        waveform=data.astype(np.float32),
+    target = Target(
         p_picks=p_picks,
         s_picks=s_picks,
         event_centers=event_centers,
         ps_intervals=ps_intervals,
+    )
+
+    return Sample(
+        waveform=data.astype(np.float32),
+        targets=[target] if not target.is_empty else [],
         dt_s=dt_s,
         dx_m=dx_m,
         file_name=os.path.basename(file_path),
@@ -1065,7 +1085,6 @@ def load_sample_from_h5(
 
 class SampleBuffer:
     """Efficient buffer for random sample access during stacking.
-
     Uses reservoir sampling for streaming datasets.
     """
 
@@ -1075,7 +1094,6 @@ class SampleBuffer:
         self.count = 0
 
     def add(self, sample: Sample):
-        """Add a sample to the buffer."""
         if len(self.buffer) < self.max_size:
             self.buffer.append(sample.copy())
         else:
@@ -1085,7 +1103,6 @@ class SampleBuffer:
         self.count += 1
 
     def get_random(self) -> Sample | None:
-        """Get a random sample from the buffer."""
         if not self.buffer:
             return None
         return random.choice(self.buffer).copy()
@@ -1270,8 +1287,10 @@ class DASIterableDataset(IterableDataset):
         for t in self.transforms.transforms:
             if isinstance(t, StackEvents):
                 t.set_sample_fn(self.sample_buffer.get_random)
-            elif isinstance(t, StackNoise) and self.noise_list:
-                t.set_noise_fn(self._load_random_noise)
+            elif isinstance(t, StackNoise):
+                if self.noise_list:
+                    t.set_noise_fn(self._load_random_noise)
+                t.set_sample_fn(self.sample_buffer.get_random)
 
     def _load_random_noise(self) -> np.ndarray | None:
         """Load a random noise file for stacking."""
@@ -1282,11 +1301,9 @@ class DASIterableDataset(IterableDataset):
         try:
             with open_file(noise_path, "rb") as f:
                 with h5py.File(f, "r") as fp:
-                    noise = fp["data"][:, :].T  # (nx, nt) -> (nt, nx)
-                # Roll to use noise portion
-                noise = np.roll(noise, max(0, self.nt - 3000), axis=0)
-                noise = noise[np.newaxis, :self.nt, :]  # (1, nt, nx)
-                noise = noise / (np.std(noise) + 1e-10)
+                    noise = fp["data"][:, :]  # (nx, nt) — keep native ordering
+                noise = np.roll(noise, max(0, self.nt - 3000), axis=-1)  # roll time
+                noise = noise[np.newaxis, :, :self.nt]  # (1, nx, nt)
                 return noise.astype(np.float32)
         except Exception as e:
             print(f"Error reading noise file {noise_path}: {e}")
@@ -1328,16 +1345,7 @@ class DASIterableDataset(IterableDataset):
             return os.path.join(base_path, relative_path)
 
     def _load_sample(self, label_file: str) -> Sample | None:
-        """Load a training sample from label file.
-
-        Reads CSV labels and corresponding H5 data, computes SNR.
-
-        Args:
-            label_file: Relative path to label CSV file
-
-        Returns:
-            Sample instance or None if loading fails
-        """
+        """Load a training sample from label file."""
         label_path_full = self._construct_file_path(self.label_path, label_file)
         picks_df = self._read_csv(label_path_full)
         if "channel_index" not in picks_df.columns:
@@ -1355,61 +1363,19 @@ class DASIterableDataset(IterableDataset):
             print(f"Error reading {data_path_full}: {e}")
             return None
 
-        # Calculate SNR
-        if sample.p_picks:
-            sample.snr, sample.amp_signal, sample.amp_noise = calc_snr(
-                sample.waveform, sample.p_picks
-            )
+        # Calculate SNR for the target
+        if sample.targets:
+            target = sample.targets[0]
+            if target.p_picks:
+                target.snr, target.amp_signal, target.amp_noise = calc_snr(
+                    sample.waveform, target.p_picks
+                )
 
         sample.file_name = os.path.splitext(label_file.split("/")[-1])[0]
         return sample
 
-    def _to_output(self, sample: Sample) -> dict[str, torch.Tensor]:
-        """Convert transformed Sample to output dict with labels.
-
-        Generates labels, converts to tensors, permutes (nt, nx) -> (nx, nt).
-        """
-        labels = generate_labels(sample, self.label_config, self.phases)
-
-        # Convert to tensors
-        data = torch.from_numpy(sample.waveform).float()
-        phase_pick = torch.from_numpy(labels["phase_pick"]).float()
-        phase_mask = torch.from_numpy(labels["phase_mask"]).float()
-        event_center = torch.from_numpy(labels["event_center"]).float()
-        event_time = torch.from_numpy(labels["event_time"]).float()
-        event_center_mask = torch.from_numpy(labels["event_center_mask"]).float()
-        event_time_mask = torch.from_numpy(labels["event_time_mask"]).float()
-
-        # Permute (nch, nt, nx) -> (nch, nx, nt) for the model
-        data = data.permute(0, 2, 1)
-        phase_pick = phase_pick.permute(0, 2, 1)
-        phase_mask = phase_mask.permute(0, 2, 1)
-        event_center = event_center.permute(0, 2, 1)
-        event_time = event_time.permute(0, 2, 1)
-        event_center_mask = event_center_mask.permute(0, 2, 1)
-        event_time_mask = event_time_mask.permute(0, 2, 1)
-
-        # Downsample event labels along spatial dimension
-        s = self.event_feature_scale
-        event_center = event_center[:, :, ::s]
-        event_time = event_time[:, :, ::s]
-        event_center_mask = event_center_mask[:, :, ::s]
-        event_time_mask = event_time_mask[:, :, ::s]
-
-        return {
-            "data": torch.nan_to_num(data),
-            "phase_pick": phase_pick,
-            "phase_mask": phase_mask,
-            "event_center": event_center,
-            "event_time": event_time,
-            "event_time_mask": event_time_mask,
-            "event_center_mask": event_center_mask,
-            "file_name": sample.file_name,
-            "height": data.shape[-2],
-            "width": data.shape[-1],
-            "dt_s": sample.dt_s,
-            "dx_m": sample.dx_m,
-        }
+    def _sample_to_output(self, sample: Sample) -> dict[str, torch.Tensor]:
+        return _to_output(sample, self.label_config, self.phases, self.event_feature_scale)
 
     def __len__(self):
         return self._data_len
@@ -1482,7 +1448,7 @@ class DASIterableDataset(IterableDataset):
                 for ii in range(self.num_patch):
                     s = sample.copy()
                     s = self.transforms(s)
-                    output = self._to_output(s)
+                    output = self._sample_to_output(s)
                     output["file_name"] = sample.file_name + f"_{ii:02d}"
                     yield output
 
@@ -1566,21 +1532,20 @@ class DASIterableDataset(IterableDataset):
                     data = data[..., :: int(0.01 / dt_s)]
                     meta["dt_s"] = 0.01
 
-            # Preprocessing
-            data = data - np.mean(data, axis=-1, keepdims=True)  # (nx, nt)
-            data = data - np.median(data, axis=-2, keepdims=True)
+            # Preprocessing — data is (nx, nt)
+            data = data - np.mean(data, axis=-1, keepdims=True)  # demean along time
+            data = data - np.median(data, axis=-2, keepdims=True)  # common-mode rejection
             if self.highpass_filter:
                 b, a = scipy.signal.butter(2, self.highpass_filter, "hp", fs=100)
                 data = scipy.signal.filtfilt(b, a, data, axis=-1)
 
-            data = data.T  # (nx, nt) -> (nt, nx)
-            data = data[np.newaxis, :, :]  # (1, nt, nx)
+            # (nx, nt) -> (1, nx, nt) — no transpose needed
+            data = data[np.newaxis, :, :]
             data = torch.from_numpy(data.astype(np.float32))
 
             if not self.cut_patch:
-                nt, nx = data.shape[1:]
-                data = padding(data, self.min_nt, self.min_nx)
-                data = data.permute(0, 2, 1)  # (1, nt, nx) -> (1, nx, nt)
+                nx, nt = data.shape[1:]
+                data = padding(data, self.min_nx, self.min_nt)
 
                 yield {
                     "data": data,
@@ -1594,32 +1559,31 @@ class DASIterableDataset(IterableDataset):
                     "dx_m": meta.get("dx_m", self.dx),
                 }
             else:
-                _, nt, nx = data.shape
-                for i in range(0, nt, self.nt):
-                    for j in range(0, nx, self.nx):
+                _, nx, nt = data.shape
+                for it in range(0, nt, self.nt):
+                    for ix in range(0, nx, self.nx):
                         if self.skip_existing:
                             patch_name = (
-                                os.path.splitext(file.split("/")[-1])[0] + f"_{i:04d}_{j:04d}.csv"
+                                os.path.splitext(file.split("/")[-1])[0] + f"_{it:04d}_{ix:04d}.csv"
                             )
                             if os.path.exists(os.path.join(self.pick_path, patch_name)):
                                 print(f"Skip existing file {patch_name}")
                                 continue
 
-                        data_patch = data[:, i:i + self.nt, j:j + self.nx]
-                        _, nt_, nx_ = data_patch.shape
-                        data_patch = padding(data_patch, self.min_nt, self.min_nx)
-                        data_patch = data_patch.permute(0, 2, 1)
+                        data_patch = data[:, ix:ix + self.nx, it:it + self.nt]
+                        _, nx_, nt_ = data_patch.shape
+                        data_patch = padding(data_patch, self.min_nx, self.min_nt)
 
                         yield {
                             "data": data_patch,
                             "nt": nt_,
                             "nx": nx_,
-                            "file_name": os.path.splitext(file)[0] + f"_{i:04d}_{j:04d}",
+                            "file_name": os.path.splitext(file)[0] + f"_{it:04d}_{ix:04d}",
                             "begin_time": (
-                                meta["begin_time"] + timedelta(seconds=i * float(meta["dt_s"]))
+                                meta["begin_time"] + timedelta(seconds=it * float(meta["dt_s"]))
                             ).isoformat(timespec="milliseconds"),
-                            "begin_time_index": i,
-                            "begin_channel_index": j,
+                            "begin_time_index": it,
+                            "begin_channel_index": ix,
                             "dt_s": meta.get("dt_s", self.dt),
                             "dx_m": meta.get("dx_m", self.dx),
                         }
@@ -1722,6 +1686,8 @@ class DASDataset(Dataset):
         for t in self.transforms.transforms:
             if isinstance(t, StackEvents):
                 t.set_sample_fn(self.sample_buffer.get_random)
+            elif isinstance(t, StackNoise):
+                t.set_sample_fn(self.sample_buffer.get_random)
 
     def __len__(self) -> int:
         if self.label_list:
@@ -1750,56 +1716,20 @@ class DASDataset(Dataset):
         sample = load_sample_from_h5(data_file, picks_df, self.phases)
 
         # Calculate SNR
-        if sample.p_picks:
-            sample.snr, sample.amp_signal, sample.amp_noise = calc_snr(
-                sample.waveform, sample.p_picks
-            )
+        if sample.targets:
+            target = sample.targets[0]
+            if target.p_picks:
+                target.snr, target.amp_signal, target.amp_noise = calc_snr(
+                    sample.waveform, target.p_picks
+                )
 
         # Add to buffer for stacking
         self.sample_buffer.add(sample)
 
         # Apply transforms
         sample = self.transforms(sample)
-
-        # Generate labels and convert to output
-        labels = generate_labels(sample, self.label_config, self.phases)
-
-        data = torch.from_numpy(sample.waveform).float()
-        phase_pick = torch.from_numpy(labels["phase_pick"]).float()
-        phase_mask = torch.from_numpy(labels["phase_mask"]).float()
-        event_center = torch.from_numpy(labels["event_center"]).float()
-        event_time = torch.from_numpy(labels["event_time"]).float()
-        event_center_mask = torch.from_numpy(labels["event_center_mask"]).float()
-        event_time_mask = torch.from_numpy(labels["event_time_mask"]).float()
-
-        # Permute (nch, nt, nx) -> (nch, nx, nt)
-        data = data.permute(0, 2, 1)
-        phase_pick = phase_pick.permute(0, 2, 1)
-        phase_mask = phase_mask.permute(0, 2, 1)
-        event_center = event_center.permute(0, 2, 1)
-        event_time = event_time.permute(0, 2, 1)
-        event_center_mask = event_center_mask.permute(0, 2, 1)
-        event_time_mask = event_time_mask.permute(0, 2, 1)
-
-        # Downsample event labels
-        s = self.event_feature_scale
-        event_center = event_center[:, :, ::s]
-        event_time = event_time[:, :, ::s]
-        event_center_mask = event_center_mask[:, :, ::s]
-        event_time_mask = event_time_mask[:, :, ::s]
-
-        return {
-            "data": torch.nan_to_num(data),
-            "phase_pick": phase_pick,
-            "phase_mask": phase_mask,
-            "event_center": event_center,
-            "event_time": event_time,
-            "event_time_mask": event_time_mask,
-            "event_center_mask": event_center_mask,
-            "file_name": os.path.splitext(os.path.basename(label_file))[0],
-            "height": data.shape[-2],
-            "width": data.shape[-1],
-        }
+        sample.file_name = os.path.splitext(os.path.basename(label_file))[0]
+        return _to_output(sample, self.label_config, self.phases, self.event_feature_scale)
 
     def _get_inference_item(self, idx: int) -> dict[str, torch.Tensor]:
         """Load an inference sample."""
@@ -1808,8 +1738,8 @@ class DASDataset(Dataset):
 
         if self.format == "h5":
             with h5py.File(file, "r") as f:
-                data = f["data"][()]
-                data = data[np.newaxis, :, :]  # (1, nt, nx)
+                data = f["data"][()]  # (nx, nt) from H5
+                data = data[np.newaxis, :, :]  # (1, nx, nt)
                 if "begin_time" in f["data"].attrs:
                     meta["begin_time"] = f["data"].attrs["begin_time"]
                 meta["dt_s"] = f["data"].attrs.get("dt_s", 0.01)
@@ -1822,9 +1752,9 @@ class DASDataset(Dataset):
         else:
             raise ValueError(f"Unsupported format: {self.format}")
 
-        # Normalize
-        data = data - torch.median(data, dim=2, keepdim=True)[0]
-        std = torch.std(data, dim=1, keepdim=True)
+        # Normalize — data is (1, nx, nt)
+        data = data - torch.median(data, dim=-2, keepdim=True)[0]  # common-mode rejection
+        std = torch.std(data, dim=-1, keepdim=True)  # per-channel std
         std[std == 0.0] = 1.0
         data = data / std
 
@@ -1857,27 +1787,7 @@ def create_train_dataset(
     enable_masking: bool = True,
     **kwargs,
 ) -> DASIterableDataset:
-    """Create a DAS training dataset with default augmentation.
-
-    Args:
-        data_path: Path to data files (local or GCS)
-        label_path: Path to label files (local or GCS)
-        label_list: List of label files or path to file containing list
-        noise_list: List of noise files for augmentation
-        nt: Target time samples
-        nx: Target spatial samples
-        phases: Phase types to use
-        transforms: Custom transform pipeline (overrides enable_* flags)
-        enable_stacking: Enable event stacking
-        enable_noise_stacking: Enable noise stacking
-        enable_resample_time: Enable time resampling
-        enable_resample_space: Enable space resampling
-        enable_masking: Enable masking augmentation
-        **kwargs: Additional arguments for DASIterableDataset
-
-    Returns:
-        DASIterableDataset instance
-    """
+    """Create a DAS training dataset with default augmentation."""
     if transforms is None:
         transforms = default_train_transforms(
             nt=nt, nx=nx,
@@ -1912,21 +1822,7 @@ def create_eval_dataset(
     highpass_filter: float | None = None,
     **kwargs,
 ) -> DASIterableDataset:
-    """Create a DAS evaluation dataset without augmentation.
-
-    Args:
-        data_path: Path to data files (local or GCS)
-        nt: Target time samples
-        nx: Target spatial samples
-        format: Data format (h5, npz, npy, segy)
-        system: DAS system type (optasense or None)
-        cut_patch: Whether to cut into patches
-        highpass_filter: Highpass filter frequency
-        **kwargs: Additional arguments
-
-    Returns:
-        DASIterableDataset instance
-    """
+    """Create a DAS evaluation dataset without augmentation."""
     return DASIterableDataset(
         data_path=data_path,
         format=format,
@@ -1962,13 +1858,13 @@ def plot_trace(
     """
     import matplotlib.pyplot as plt
 
-    nt = sample.waveform.shape[-2]
+    nt = sample.nt
     t = np.arange(nt)
-    waveform = sample.waveform[0, :, ch]
+    waveform = sample.waveform[0, ch, :]  # (nt,) — (nch, nx, nt)
     one_sec = int(1.0 / sample.dt_s)
 
-    p_times = [ti for c, ti in sample.p_picks if int(c) == ch]
-    s_times = [ti for c, ti in sample.s_picks if int(c) == ch]
+    p_times = [ti for tgt in sample.targets for c, ti in tgt.p_picks if int(c) == ch]
+    s_times = [ti for tgt in sample.targets for c, ti in tgt.s_picks if int(c) == ch]
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [2, 1, 1, 1]})
 
@@ -1999,11 +1895,11 @@ def plot_trace(
         inset.set_title(f"{label} zoom (t={pick_t:.0f})", fontsize=9)
         inset.tick_params(labelsize=7)
 
-    # [3] Phase labels + mask
+    # [3] Phase labels + mask — labels are (label_ch, nx, nt)
     ax = axes[2]
-    ax.plot(t, labels["phase_pick"][1, :, ch], label="P", color="red")
-    ax.plot(t, labels["phase_pick"][2, :, ch], label="S", color="blue")
-    ax.fill_between(t, labels["phase_mask"][0, :, ch], alpha=0.15, color="green", label="mask")
+    ax.plot(t, labels["phase_pick"][1, ch, :], label="P", color="red")
+    ax.plot(t, labels["phase_pick"][2, ch, :], label="S", color="blue")
+    ax.fill_between(t, labels["phase_mask"][0, ch, :], alpha=0.15, color="green", label="mask")
     ax.set_ylabel("Phase Labels")
     ax.set_ylim(-0.05, 1.1)
     ax.set_xlim(0, nt)
@@ -2011,16 +1907,16 @@ def plot_trace(
 
     # [4] Event center + event_time + masks
     ax = axes[3]
-    ax.plot(t, labels["event_center"][0, :, ch], label="Event Center", color="purple")
-    ax.fill_between(t, labels["event_center_mask"][0, :, ch], alpha=0.1, color="green", label="Center Mask")
-    ax.fill_between(t, labels["event_time_mask"][0, :, ch], alpha=0.2, color="green", label="Time Mask")
+    ax.plot(t, labels["event_center"][0, ch, :], label="Event Center", color="purple")
+    ax.fill_between(t, labels["event_center_mask"][0, ch, :], alpha=0.1, color="green", label="Center Mask")
+    ax.fill_between(t, labels["event_time_mask"][0, ch, :], alpha=0.2, color="green", label="Time Mask")
     ax.set_ylabel("Event")
     ax.set_xlabel("Time Sample")
     ax.set_xlim(0, nt)
     ax.legend(loc="upper right", fontsize=8)
     ax2 = ax.twinx()
-    event_time_ch = labels["event_time"][0, :, ch]
-    mask = labels["event_time_mask"][0, :, ch] > 0
+    event_time_ch = labels["event_time"][0, ch, :]
+    mask = labels["event_time_mask"][0, ch, :] > 0
     if mask.any():
         ax2.plot(t[mask], event_time_ch[mask], color="orange", linewidth=1.0, alpha=0.7)
         ax2.set_ylabel("Event Time", color="orange")
@@ -2042,89 +1938,97 @@ def plot_overview(sample: Sample, labels: dict[str, np.ndarray], title: str = ""
         [1,2] DAS waveform + P/S picks + event center picks + event mask
         [2,1] P/S labels + phase mask
         [2,2] Event time + event center + event mask
+
+    Data is (nch, nx, nt). Display as (nt, nx) — time on y-axis, channel on x-axis.
     """
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
     imshow_kwargs = dict(aspect="auto", interpolation="nearest")
 
-    # Data is (nch, nt, nx). Show as (nt, nx) — time on y-axis, channel on x-axis.
+    # Transpose (nx, nt) -> (nt, nx) for display: time on y-axis, channel on x-axis
+    waveform_display = sample.waveform[0].T  # (nt, nx)
+
     # [1,1] DAS waveform
     ax = axes[0, 0]
-    vmax = np.percentile(np.abs(sample.waveform[0]), 95)
-    ax.imshow(sample.waveform[0], cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
+    vmax = np.percentile(np.abs(waveform_display), 95)
+    ax.imshow(waveform_display, cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
     ax.set_title("DAS Waveform")
     ax.set_ylabel("Time Sample")
 
-    # [1,2] DAS waveform + P/S picks
+    # [1,2] DAS waveform + P/S picks — scatter(x=ch, y=t) on (nt, nx) display
     ax = axes[0, 1]
-    ax.imshow(sample.waveform[0], cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
-    if sample.p_picks:
-        p_ch, p_t = zip(*sample.p_picks)
+    ax.imshow(waveform_display, cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
+    all_p = [(ch, ti) for tgt in sample.targets for ch, ti in tgt.p_picks]
+    all_s = [(ch, ti) for tgt in sample.targets for ch, ti in tgt.s_picks]
+    if all_p:
+        p_ch, p_t = zip(*all_p)
         ax.scatter(p_ch, p_t, c="red", s=0.3, alpha=0.5, label="P")
-    if sample.s_picks:
-        s_ch, s_t = zip(*sample.s_picks)
+    if all_s:
+        s_ch, s_t = zip(*all_s)
         ax.scatter(s_ch, s_t, c="blue", s=0.3, alpha=0.5, label="S")
-    if sample.event_centers:
-        e_ch, e_t = zip(*sample.event_centers)
-        ax.scatter(e_ch, e_t, c="yellow", s=0.3, alpha=0.5, label="Event")
     ax.legend(loc="upper right", fontsize=8, markerscale=10)
     ax.set_title("Waveform + Picks")
 
-    # [2,1] P/S phase labels + phase mask
+    # [2,1] P/S phase labels + phase mask — transpose for display
     ax = axes[1, 0]
-    mask = labels["phase_mask"][0]  # (nt, nx)
+    mask = labels["phase_mask"][0].T  # (nt, nx)
+    p_disp = labels["phase_pick"][1].T  # (nt, nx)
+    s_disp = labels["phase_pick"][2].T  # (nt, nx)
     rgb = np.ones((*mask.shape, 3))  # white background
-    rgb[:, :, 1] = np.clip(1.0 - labels["phase_pick"][1] * 0.7, 0, 1)  # P -> red (reduce G)
-    rgb[:, :, 2] = np.clip(1.0 - labels["phase_pick"][1] * 0.7, 0, 1)  # P -> red (reduce B)
-    rgb[:, :, 0] = np.clip(rgb[:, :, 0] - labels["phase_pick"][2] * 0.7, 0, 1)  # S -> blue (reduce R)
-    rgb[:, :, 1] = np.clip(rgb[:, :, 1] - labels["phase_pick"][2] * 0.7, 0, 1)  # S -> blue (reduce G)
-    # Tint mask region green (darken non-green channels slightly)
+    rgb[:, :, 1] = np.clip(1.0 - p_disp * 0.7, 0, 1)  # P -> red
+    rgb[:, :, 2] = np.clip(1.0 - p_disp * 0.7, 0, 1)
+    rgb[:, :, 0] = np.clip(rgb[:, :, 0] - s_disp * 0.7, 0, 1)  # S -> blue
+    rgb[:, :, 1] = np.clip(rgb[:, :, 1] - s_disp * 0.7, 0, 1)
     rgb[:, :, 0] = np.where(mask > 0, rgb[:, :, 0] * 0.85, rgb[:, :, 0])
     rgb[:, :, 2] = np.where(mask > 0, rgb[:, :, 2] * 0.85, rgb[:, :, 2])
     ax.imshow(rgb, **imshow_kwargs)
-    # Overlay event center Gaussian as yellow
-    event_center = labels["event_center"][0]
-    event_rgba = np.zeros((*event_center.shape, 4))
-    event_rgba[:, :, 0] = 1.0  # yellow R
-    event_rgba[:, :, 1] = 1.0  # yellow G
-    event_rgba[:, :, 3] = event_center * 0.8  # alpha from Gaussian
+    # Overlay event center as yellow
+    ec_disp = labels["event_center"][0].T  # (nt, nx)
+    event_rgba = np.zeros((*ec_disp.shape, 4))
+    event_rgba[:, :, 0] = 1.0
+    event_rgba[:, :, 1] = 1.0
+    event_rgba[:, :, 3] = ec_disp * 0.8
     ax.imshow(event_rgba, **imshow_kwargs)
     ax.set_title("Phase Labels + Event Center")
     ax.set_ylabel("Time Sample")
     ax.set_xlabel("Channel")
 
-    # [2,2] Event time + event center + event mask
+    # [2,2] Event time + event center + event mask — transpose for display
     ax = axes[1, 1]
-    center_mask = labels["event_center_mask"][0]
-    time_mask = labels["event_time_mask"][0]
-    # FIXME: Recompute event_time for full time range for visualization only
+    center_mask_disp = labels["event_center_mask"][0].T  # (nt, nx)
+    time_mask_disp = labels["event_time_mask"][0].T  # (nt, nx)
+    # Recompute event_time for full range visualization
     vp, vs = 6.0, 6.0 / 1.73
-    ps_dict = dict(sample.ps_intervals)
-    _, nt_plot, nx_plot = sample.waveform.shape
+    nx_plot, nt_plot = sample.nx, sample.nt
     t = np.arange(nt_plot)
-    event_time_full = np.zeros((nt_plot, nx_plot), dtype=np.float32)
-    for ch_c, center in sample.event_centers:
-        ch = int(ch_c)
-        if 0 <= ch < nx_plot:
-            ps_int = ps_dict.get(ch, 0.0)
-            ps_seconds = ps_int * sample.dt_s
-            distance = ps_seconds * vp * vs / (vp - vs)
-            shift = distance * (1 / vp + 1 / vs) / (2 * sample.dt_s)
-            event_time_full[:, ch] = (t - center) + shift
-    # Event mask as green background (same tinting as [2,1])
+    event_time_full = np.zeros((nx_plot, nt_plot), dtype=np.float32)
+    ps_dict: dict[int, float] = {}
+    for tgt in sample.targets:
+        ps_dict.update({int(ch): d for ch, d in tgt.ps_intervals})
+    for tgt in sample.targets:
+        for ch_c, center in tgt.event_centers:
+            ch = int(ch_c)
+            if 0 <= ch < nx_plot:
+                ps_int = ps_dict.get(ch, 0.0)
+                ps_seconds = ps_int * sample.dt_s
+                distance = ps_seconds * vp * vs / (vp - vs)
+                shift = distance * (1 / vp + 1 / vs) / (2 * sample.dt_s)
+                event_time_full[ch, :] = (t - center) + shift
+    event_time_disp = event_time_full.T  # (nt, nx)
+    # Green background for center mask
     bg = np.ones((nt_plot, nx_plot, 3))
-    bg[:, :, 0] = np.where(center_mask > 0, 0.85, 1.0)
-    bg[:, :, 2] = np.where(center_mask > 0, 0.85, 1.0)
+    bg[:, :, 0] = np.where(center_mask_disp > 0, 0.85, 1.0)
+    bg[:, :, 2] = np.where(center_mask_disp > 0, 0.85, 1.0)
     ax.imshow(bg, **imshow_kwargs)
-    # Event time heatmap (centered at 0: white=0)
-    event_time_display = np.where(center_mask > 0, event_time_full, np.nan)
+    # Event time heatmap
+    event_time_display = np.where(center_mask_disp > 0, event_time_disp, np.nan)
     vabs = np.nanmax(np.abs(event_time_display)) or 1.0
     im = ax.imshow(event_time_display, cmap="seismic", vmin=-vabs, vmax=vabs, **imshow_kwargs)
-    # Overlay event_time_mask as green tint
+    # Time mask overlay
     mask_rgba = np.zeros((nt_plot, nx_plot, 4))
-    mask_rgba[:, :, 1] = 1.0  # green
-    mask_rgba[:, :, 3] = time_mask * 0.3  # alpha from mask
+    mask_rgba[:, :, 1] = 1.0
+    mask_rgba[:, :, 3] = time_mask_disp * 0.3
     ax.imshow(mask_rgba, **imshow_kwargs)
     fig.colorbar(im, ax=ax, shrink=0.8)
     ax.set_title("Event Time + Center")
@@ -2147,14 +2051,7 @@ def plot_demo(
     n_traces: int = 5,
     config: LabelConfig = LabelConfig(),
 ):
-    """Generate demo plots: overview, individual traces, and augmented overviews.
-
-    Output structure:
-        {output_dir}/{event_id}/overview.png           # raw data overview
-        {output_dir}/{event_id}/traces/000.png         # individual channel details
-        {output_dir}/{event_id}/augmented/000.png      # augmented overview #0
-        ...
-    """
+    """Generate demo plots: overview, individual traces, and augmented overviews."""
     event_dir = os.path.join(output_dir, event_id)
     trace_dir = os.path.join(event_dir, "traces")
     aug_dir = os.path.join(event_dir, "augmented")
@@ -2167,7 +2064,9 @@ def plot_demo(
     plot_overview(sample, raw_labels, title=event_id, save_path=os.path.join(event_dir, "overview.png"))
 
     # Individual trace details (channels with picks, evenly sampled)
-    labeled_chs = sorted({int(c) for c, _ in sample.p_picks} & {int(c) for c, _ in sample.s_picks})
+    all_p_chs = {int(c) for tgt in sample.targets for c, _ in tgt.p_picks}
+    all_s_chs = {int(c) for tgt in sample.targets for c, _ in tgt.s_picks}
+    labeled_chs = sorted(all_p_chs & all_s_chs)
     if labeled_chs:
         n = min(n_traces, len(labeled_chs))
         channels = [labeled_chs[i] for i in np.linspace(0, len(labeled_chs) - 1, n, dtype=int)]
@@ -2179,7 +2078,7 @@ def plot_demo(
             )
         print(f"  Saved {n} trace plots to {trace_dir}/")
 
-    # N augmented overviews (different seeds)
+    # N augmented overviews
     print(f"\nGenerating {n_augmented} augmented views...")
     seed_offset = 0
     for i in range(n_augmented):
@@ -2187,7 +2086,7 @@ def plot_demo(
             random.seed(seed)
             np.random.seed(seed)
             transformed = transforms(sample.copy())
-            if transformed.p_picks and transformed.s_picks:
+            if any(not t.is_empty for t in transformed.targets):
                 seed_offset = seed + 1
                 break
         aug_labels = generate_labels(transformed, config)
@@ -2224,10 +2123,14 @@ if __name__ == "__main__":
         print(f"No label file at {args.label_file}")
 
     sample = load_sample_from_h5(args.data_file, picks_df)
-    print(f"Waveform: {sample.waveform.shape}, P: {len(sample.p_picks)}, S: {len(sample.s_picks)}")
+    print(f"Waveform: {sample.waveform.shape}, targets: {len(sample.targets)}")
 
-    if sample.p_picks:
-        sample.snr, sample.amp_signal, sample.amp_noise = calc_snr(sample.waveform, sample.p_picks)
+    if sample.targets:
+        target = sample.targets[0]
+        if target.p_picks:
+            target.snr, target.amp_signal, target.amp_noise = calc_snr(
+                sample.waveform, target.p_picks
+            )
 
     transforms = default_train_transforms(
         nt=args.nt, nx=args.nx, enable_stacking=False, enable_noise_stacking=False,

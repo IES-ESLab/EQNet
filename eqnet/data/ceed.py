@@ -14,11 +14,11 @@ A modern, efficient dataset implementation for seismic phase picking following
 best practices from computer vision (torchvision, timm, albumentations).
 
 Design Principles:
-1. Transform-based augmentation operating on raw labels (phase indices)
-   before Gaussian label generation - similar to object detection transforms
-2. Compose pattern for chaining transforms
-3. Efficient stacking via pre-built indices and reservoir sampling
-4. Streaming support via HuggingFace datasets
+1. COCO-style Target annotations: each event is a separate Target object,
+   making multi-event stacking trivial and per-event metadata preserved
+2. Unified (nch, nx, nt) internal format: (3, nx, nt) for multi-station seismic
+3. Transform-based augmentation operating on raw picks before label generation
+4. Compose pattern for chaining transforms
 5. Clean separation: loading -> transforms -> label generation
 
 Example:
@@ -37,6 +37,7 @@ import json
 import os
 import random
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Sequence
 
@@ -68,81 +69,166 @@ class LabelConfig:
     vp_vs_ratio: float = 1.73  # Vp/Vs ratio
 
 
+# =============================================================================
+# Data Structures — COCO-style Target + Sample
+# =============================================================================
+
 @dataclass
-class Sample:
-    """A seismic event sample with waveform and phase annotations.
+class Target:
+    """Per-event annotation, following COCO/torchvision detection conventions.
 
-    This is the core data structure passed through transforms.
-    Waveform shape is (C, nx, nt) where C=3 (E/N/Z), nx=stations, nt=time.
-    Picks are stored as (station_idx, time_idx) tuples, matching DAS convention.
+    Each Target represents ONE seismic event's picks on the waveform.
+    A Sample can have multiple Targets (e.g. from event stacking).
+
+    Picks are (station_idx, time_sample) tuples where station_idx is the
+    index in the sorted station array (0 to nx-1).
     """
-    waveform: np.ndarray  # (C, nx, nt) — always 3D
-    p_picks: list[tuple[int, float]] = field(default_factory=list)  # (station_idx, time_idx)
+    p_picks: list[tuple[int, float]] = field(default_factory=list)
     s_picks: list[tuple[int, float]] = field(default_factory=list)
-    polarity: list[tuple[int, int, int]] = field(default_factory=list)  # (station_idx, time_idx, sign)
-    event_centers: list[tuple[int, float]] = field(default_factory=list)  # (station_idx, center_time)
-    ps_intervals: list[tuple[int, float]] = field(default_factory=list)  # (station_idx, S-P interval)
+    polarity: list[tuple[int, float, int]] = field(default_factory=list)  # (sta, time, sign)
+    event_centers: list[tuple[int, float]] = field(default_factory=list)  # (sta, center_time)
+    ps_intervals: list[tuple[int, float]] = field(default_factory=list)  # (sta, S-P interval)
 
-    # Per-station metadata (indexed by station_idx)
-    snr: list[float] = field(default_factory=list)
-    amp_signal: list[float] = field(default_factory=list)
-    amp_noise: list[float] = field(default_factory=list)
-    distances_km: list[float] = field(default_factory=list)
-    trace_ids: list[str] = field(default_factory=list)
-    sensors: list[str] = field(default_factory=list)
-    sampling_rate: float = DEFAULT_SAMPLING_RATE
+    # Per-event metadata
+    snr: float = 0.0
+    amp_signal: float = 0.0
+    amp_noise: float = 0.0
+    distance_km: float = 0.0
+    event_id: str = ""
 
-    @property
-    def nch(self) -> int:
-        """Number of components (3 for E/N/Z)."""
-        return self.waveform.shape[0]
-
-    @property
-    def nx(self) -> int:
-        """Number of stations/traces."""
-        return self.waveform.shape[1]
-
-    @property
-    def nt(self) -> int:
-        """Number of time samples."""
-        return self.waveform.shape[2]
-
-    def ensure_3d(self) -> "Sample":
-        """Ensure waveform is 3D (C, nx, nt). Converts (C, nt) → (C, 1, nt)."""
-        if self.waveform.ndim == 2:
-            self.waveform = self.waveform[:, np.newaxis, :]
-        return self
-
-    def copy(self) -> "Sample":
-        """Create a deep copy of the sample."""
-        return Sample(
-            waveform=self.waveform.copy(),
+    def copy(self) -> "Target":
+        return Target(
             p_picks=self.p_picks.copy(),
             s_picks=self.s_picks.copy(),
             polarity=self.polarity.copy(),
             event_centers=self.event_centers.copy(),
             ps_intervals=self.ps_intervals.copy(),
-            snr=self.snr.copy() if isinstance(self.snr, list) else [self.snr],
-            amp_signal=self.amp_signal.copy() if isinstance(self.amp_signal, list) else [self.amp_signal],
-            amp_noise=self.amp_noise.copy() if isinstance(self.amp_noise, list) else [self.amp_noise],
-            distances_km=self.distances_km.copy(),
+            snr=self.snr,
+            amp_signal=self.amp_signal,
+            amp_noise=self.amp_noise,
+            distance_km=self.distance_km,
+            event_id=self.event_id,
+        )
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.p_picks and not self.s_picks
+
+    def all_times(self) -> list[float]:
+        """All pick times (P + S)."""
+        return [t for _, t in self.p_picks] + [t for _, t in self.s_picks]
+
+    # -- Pick adjustment methods (in-place, return self for chaining) --
+
+    def crop_time(self, start: int, end: int) -> "Target":
+        """Keep picks in [start, end), shift to new origin."""
+        self.p_picks = [(s, t - start) for s, t in self.p_picks if start <= t < end]
+        self.s_picks = [(s, t - start) for s, t in self.s_picks if start <= t < end]
+        self.polarity = [(s, t - start, sign) for s, t, sign in self.polarity if start <= t < end]
+        ec, ps = [], []
+        for (s, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+            if start <= t < end:
+                ec.append((s, t - start))
+                ps.append((s, d))
+        self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+    def shift_time(self, shift: int, nt: int, wrap: bool = True) -> "Target":
+        """Shift all time indices. Wraps modulo nt or clips to [0, nt)."""
+        if wrap:
+            self.p_picks = [(s, (t + shift) % nt) for s, t in self.p_picks]
+            self.s_picks = [(s, (t + shift) % nt) for s, t in self.s_picks]
+            self.polarity = [(s, (t + shift) % nt, sign) for s, t, sign in self.polarity]
+            self.event_centers = [(s, (t + shift) % nt) for s, t in self.event_centers]
+            # ps_intervals unchanged by circular shift
+        else:
+            self.p_picks = [(s, t + shift) for s, t in self.p_picks if 0 <= t + shift < nt]
+            self.s_picks = [(s, t + shift) for s, t in self.s_picks if 0 <= t + shift < nt]
+            self.polarity = [(s, t + shift, sign) for s, t, sign in self.polarity if 0 <= t + shift < nt]
+            ec, ps = [], []
+            for (s, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+                if 0 <= t + shift < nt:
+                    ec.append((s, t + shift))
+                    ps.append((s, d))
+            self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+    def scale_time(self, factor: float, nt_new: int) -> "Target":
+        """Scale time indices by factor, drop picks outside [0, nt_new)."""
+        self.p_picks = [(s, t * factor) for s, t in self.p_picks if t * factor < nt_new]
+        self.s_picks = [(s, t * factor) for s, t in self.s_picks if t * factor < nt_new]
+        self.polarity = [(s, t * factor, sign) for s, t, sign in self.polarity if t * factor < nt_new]
+        ec, ps = [], []
+        for (s, t), (_, d) in zip(self.event_centers, self.ps_intervals):
+            if t * factor < nt_new:
+                ec.append((s, t * factor))
+                ps.append((s, d * factor))
+        self.event_centers, self.ps_intervals = ec, ps
+        return self
+
+    def flip_polarity_sign(self) -> "Target":
+        """Negate polarity signs (for waveform polarity flip)."""
+        self.polarity = [(s, t, -sign) for s, t, sign in self.polarity]
+        return self
+
+
+@dataclass
+class Sample:
+    """A seismic sample with waveform and per-event annotations.
+
+    Waveform shape: (nch, nx, nt) = (3, num_stations, num_time_samples).
+    Stations are sorted by distance for spatial coherence.
+
+    targets: list of Target, one per seismic event in the window.
+    """
+    waveform: np.ndarray  # (nch, nx, nt) — always 3D
+    targets: list[Target] = field(default_factory=list)
+
+    # Metadata
+    sampling_rate: float = DEFAULT_SAMPLING_RATE
+    trace_ids: list[str] = field(default_factory=list)
+    sensors: list[str] = field(default_factory=list)
+
+    @property
+    def nch(self) -> int:
+        return self.waveform.shape[0]
+
+    @property
+    def nx(self) -> int:
+        return self.waveform.shape[1]
+
+    @property
+    def nt(self) -> int:
+        return self.waveform.shape[2]
+
+    @property
+    def amp_signal(self) -> float:
+        """Weakest event signal (conservative for stacking ratio)."""
+        vals = [t.amp_signal for t in self.targets if t.amp_signal > 0]
+        return min(vals) if vals else 0.0
+
+    @property
+    def amp_noise(self) -> float:
+        """Worst-case noise level across events."""
+        vals = [t.amp_noise for t in self.targets if t.amp_noise > 0]
+        return max(vals) if vals else 0.0
+
+    def copy(self) -> "Sample":
+        return Sample(
+            waveform=self.waveform.copy(),
+            targets=[t.copy() for t in self.targets],
+            sampling_rate=self.sampling_rate,
             trace_ids=self.trace_ids.copy(),
             sensors=self.sensors.copy(),
-            sampling_rate=self.sampling_rate,
         )
 
 
 # =============================================================================
-# Transforms - Following CV Best Practices (torchvision/albumentations pattern)
+# Transforms — Following CV Best Practices (torchvision/albumentations pattern)
 # =============================================================================
 
 class Transform(ABC):
-    """Base class for all transforms.
-
-    Transforms operate on Sample objects, modifying both waveform and
-    phase indices. This is similar to how object detection transforms
-    operate on both images and bounding boxes.
-    """
+    """Base class for all transforms. Operates on Sample objects."""
 
     @abstractmethod
     def __call__(self, sample: Sample) -> Sample:
@@ -153,15 +239,7 @@ class Transform(ABC):
 
 
 class Compose(Transform):
-    """Compose multiple transforms together.
-
-    Example:
-        >>> transforms = Compose([
-        ...     RandomCrop(4096),
-        ...     FlipPolarity(p=0.5),
-        ...     Normalize(),
-        ... ])
-    """
+    """Compose multiple transforms together."""
 
     def __init__(self, transforms: Sequence[Transform]):
         self.transforms = transforms
@@ -180,8 +258,6 @@ class Compose(Transform):
 
 
 class Identity(Transform):
-    """Identity transform - returns sample unchanged."""
-
     def __call__(self, sample: Sample) -> Sample:
         return sample
 
@@ -191,10 +267,7 @@ class Identity(Transform):
 # -----------------------------------------------------------------------------
 
 class Normalize(Transform):
-    """Normalize waveform to zero mean and unit std.
-
-    Handles NaN values and zero-std edge cases.
-    """
+    """Normalize waveform to zero mean and unit std."""
 
     def __init__(self, eps: float = 1e-10):
         self.eps = eps
@@ -208,6 +281,9 @@ class Normalize(Transform):
         sample.waveform = data
         return sample
 
+    def __repr__(self) -> str:
+        return f"Normalize(eps={self.eps})"
+
 
 class HighpassFilter(Transform):
     """Apply highpass filter to waveform."""
@@ -216,13 +292,15 @@ class HighpassFilter(Transform):
         from scipy import signal
         self.freq = freq
         self.sampling_rate = sampling_rate
-        # Design filter once
         self.sos = signal.butter(4, freq, btype='high', fs=sampling_rate, output='sos')
 
     def __call__(self, sample: Sample) -> Sample:
         from scipy import signal
         sample.waveform = signal.sosfilt(self.sos, sample.waveform, axis=-1).astype(np.float32)
         return sample
+
+    def __repr__(self) -> str:
+        return f"HighpassFilter(freq={self.freq})"
 
 
 class Taper(Transform):
@@ -241,16 +319,16 @@ class Taper(Transform):
             sample.waveform = sample.waveform * taper
         return sample
 
+    def __repr__(self) -> str:
+        return f"Taper(max_percentage={self.max_percentage})"
+
 
 # -----------------------------------------------------------------------------
-# Temporal Transforms (modify both waveform and phase indices)
+# Temporal Transforms (modify both waveform and picks via Target methods)
 # -----------------------------------------------------------------------------
 
 class RandomCrop(Transform):
-    """Randomly crop waveform to fixed length, adjusting phase indices.
-
-    This is the seismic equivalent of RandomCrop in image augmentation.
-    Phases that fall outside the crop are removed.
+    """Randomly crop waveform to fixed length, adjusting picks.
 
     Args:
         length: Target length in samples
@@ -268,29 +346,24 @@ class RandomCrop(Transform):
         if nt <= self.length:
             return sample
 
-        # Find valid crop that contains phases
-        all_phases = sample.p_indices + sample.s_indices
+        all_times = [t for tgt in sample.targets for t in tgt.all_times()]
+
+        start = 0
         for _ in range(self.max_tries):
             start = random.randint(0, nt - self.length)
             end = start + self.length
-
-            # Count phases in crop
-            phases_in_crop = sum(1 for p in all_phases if start <= p < end)
-            if phases_in_crop >= self.min_phases:
+            if sum(1 for t in all_times if start <= t < end) >= self.min_phases:
                 break
 
-        # Apply crop
-        sample.waveform = sample.waveform[..., start:end]
-
-        # Adjust indices (remove out-of-bounds, shift remaining)
-        sample.p_indices = [p - start for p in sample.p_indices if start <= p < end]
-        sample.s_indices = [p - start for p in sample.s_indices if start <= p < end]
-        sample.polarity = [(p - start, s) for p, s in sample.polarity if start <= p < end]
-        keep = [i for i, p in enumerate(sample.event_center) if start <= p < end]
-        sample.event_center = [sample.event_center[i] - start for i in keep]
-        sample.ps_interval = [sample.ps_interval[i] for i in keep]
-
+        end = start + self.length
+        sample.waveform = sample.waveform[:, :, start:end]
+        for target in sample.targets:
+            target.crop_time(start, end)
+        sample.targets = [t for t in sample.targets if not t.is_empty]
         return sample
+
+    def __repr__(self) -> str:
+        return f"RandomCrop(length={self.length})"
 
 
 class CenterCrop(Transform):
@@ -306,20 +379,18 @@ class CenterCrop(Transform):
 
         start = (nt - self.length) // 2
         end = start + self.length
-
-        sample.waveform = sample.waveform[..., start:end]
-        sample.p_indices = [p - start for p in sample.p_indices if start <= p < end]
-        sample.s_indices = [p - start for p in sample.s_indices if start <= p < end]
-        sample.polarity = [(p - start, s) for p, s in sample.polarity if start <= p < end]
-        keep = [i for i, p in enumerate(sample.event_center) if start <= p < end]
-        sample.event_center = [sample.event_center[i] - start for i in keep]
-        sample.ps_interval = [sample.ps_interval[i] for i in keep]
-
+        sample.waveform = sample.waveform[:, :, start:end]
+        for target in sample.targets:
+            target.crop_time(start, end)
+        sample.targets = [t for t in sample.targets if not t.is_empty]
         return sample
+
+    def __repr__(self) -> str:
+        return f"CenterCrop(length={self.length})"
 
 
 class RandomShift(Transform):
-    """Randomly shift waveform and indices (circular or zero-pad).
+    """Randomly shift waveform and picks (circular or zero-pad).
 
     Args:
         max_shift: Maximum shift in samples
@@ -336,43 +407,33 @@ class RandomShift(Transform):
             return sample
 
         nt = sample.nt
+        wrap = self.mode == "circular"
 
-        if self.mode == "circular":
+        if wrap:
             sample.waveform = np.roll(sample.waveform, shift, axis=-1)
-            # Adjust indices with wrapping
-            sample.p_indices = [(p + shift) % nt for p in sample.p_indices]
-            sample.s_indices = [(p + shift) % nt for p in sample.s_indices]
-            sample.polarity = [((p + shift) % nt, s) for p, s in sample.polarity]
-            sample.event_center = [(p + shift) % nt for p in sample.event_center]
-            # ps_interval unchanged by circular shift
+        elif shift > 0:
+            sample.waveform = np.concatenate([
+                np.zeros_like(sample.waveform[:, :, :shift]),
+                sample.waveform[:, :, :-shift]
+            ], axis=-1)
         else:
-            # Zero-pad mode - remove phases that shift out of bounds
-            if shift > 0:
-                sample.waveform = np.concatenate([
-                    np.zeros_like(sample.waveform[..., :shift]),
-                    sample.waveform[..., :-shift]
-                ], axis=-1)
-            else:
-                sample.waveform = np.concatenate([
-                    sample.waveform[..., -shift:],
-                    np.zeros_like(sample.waveform[..., :(-shift)])
-                ], axis=-1)
+            sample.waveform = np.concatenate([
+                sample.waveform[:, :, -shift:],
+                np.zeros_like(sample.waveform[:, :, :(-shift)])
+            ], axis=-1)
 
-            sample.p_indices = [p + shift for p in sample.p_indices if 0 <= p + shift < nt]
-            sample.s_indices = [p + shift for p in sample.s_indices if 0 <= p + shift < nt]
-            sample.polarity = [(p + shift, s) for p, s in sample.polarity if 0 <= p + shift < nt]
-            keep = [i for i, p in enumerate(sample.event_center) if 0 <= p + shift < nt]
-            sample.event_center = [sample.event_center[i] + shift for i in keep]
-            sample.ps_interval = [sample.ps_interval[i] for i in keep]
-
+        for target in sample.targets:
+            target.shift_time(shift, nt, wrap=wrap)
+        if not wrap:
+            sample.targets = [t for t in sample.targets if not t.is_empty]
         return sample
+
+    def __repr__(self) -> str:
+        return f"RandomShift(max_shift={self.max_shift}, mode='{self.mode}')"
 
 
 class TimeStretch(Transform):
-    """Randomly stretch/compress time axis.
-
-    Similar to pitch shifting in audio or scaling in images.
-    Phase indices are scaled accordingly.
+    """Randomly stretch/compress time axis. Phase indices are scaled accordingly.
 
     Args:
         min_factor: Minimum stretch factor
@@ -390,22 +451,17 @@ class TimeStretch(Transform):
         if abs(factor - 1.0) < 1e-6:
             return sample
 
-        nt_orig = sample.nt
-        nt_new = int(nt_orig * factor)
-
-        # Resample waveform
-        zoom_factors = [1.0] * (sample.waveform.ndim - 1) + [factor]
+        nt_new = int(sample.nt * factor)
+        zoom_factors = [1.0, 1.0, factor]  # (nch, nx, nt)
         sample.waveform = ndimage.zoom(sample.waveform, zoom_factors, order=1).astype(np.float32)
 
-        # Scale indices
-        sample.p_indices = [int(p * factor) for p in sample.p_indices if int(p * factor) < nt_new]
-        sample.s_indices = [int(p * factor) for p in sample.s_indices if int(p * factor) < nt_new]
-        sample.polarity = [(int(p * factor), s) for p, s in sample.polarity if int(p * factor) < nt_new]
-        keep = [i for i, p in enumerate(sample.event_center) if p * factor < nt_new]
-        sample.event_center = [sample.event_center[i] * factor for i in keep]
-        sample.ps_interval = [sample.ps_interval[i] * factor for i in keep]
-
+        for target in sample.targets:
+            target.scale_time(factor, nt_new)
+        sample.targets = [t for t in sample.targets if not t.is_empty]
         return sample
+
+    def __repr__(self) -> str:
+        return f"TimeStretch(min_factor={self.min_factor}, max_factor={self.max_factor})"
 
 
 # -----------------------------------------------------------------------------
@@ -413,13 +469,7 @@ class TimeStretch(Transform):
 # -----------------------------------------------------------------------------
 
 class FlipPolarity(Transform):
-    """Randomly flip waveform polarity (multiply by -1).
-
-    Also negates polarity signs.
-
-    Args:
-        p: Probability of flipping
-    """
+    """Randomly flip waveform polarity (multiply by -1). Also negates polarity signs."""
 
     def __init__(self, p: float = 0.5):
         self.p = p
@@ -427,8 +477,12 @@ class FlipPolarity(Transform):
     def __call__(self, sample: Sample) -> Sample:
         if random.random() < self.p:
             sample.waveform = -sample.waveform
-            sample.polarity = [(idx, -s) for idx, s in sample.polarity]
+            for target in sample.targets:
+                target.flip_polarity_sign()
         return sample
+
+    def __repr__(self) -> str:
+        return f"FlipPolarity(p={self.p})"
 
 
 class RandomAmplitudeScale(Transform):
@@ -451,9 +505,13 @@ class RandomAmplitudeScale(Transform):
         else:
             scale = random.uniform(self.min_scale, self.max_scale)
         sample.waveform = sample.waveform * scale
-        sample.amp_signal *= scale
-        sample.amp_noise *= scale
+        for target in sample.targets:
+            target.amp_signal *= scale
+            target.amp_noise *= scale
         return sample
+
+    def __repr__(self) -> str:
+        return f"RandomAmplitudeScale(min_scale={self.min_scale}, max_scale={self.max_scale})"
 
 
 class DropChannel(Transform):
@@ -471,37 +529,38 @@ class DropChannel(Transform):
             return sample
 
         drop_z = False
-        # Choose a drop pattern (always drops something when applied)
         r = random.random()
         if r < 0.15:
-            sample.waveform[0] = 0  # Drop E
+            sample.waveform[0] = 0
         elif r < 0.30:
-            sample.waveform[1] = 0  # Drop N
+            sample.waveform[1] = 0
         elif r < 0.45:
-            sample.waveform[:2] = 0  # Drop E and N
+            sample.waveform[:2] = 0
         elif r < 0.60:
-            sample.waveform[2] = 0  # Drop Z only
+            sample.waveform[2] = 0
             drop_z = True
         elif r < 0.75:
-            sample.waveform[0] = 0  # Drop E
-            sample.waveform[2] = 0  # Drop Z
+            sample.waveform[0] = 0
+            sample.waveform[2] = 0
             drop_z = True
         elif r < 0.90:
-            sample.waveform[1] = 0  # Drop N
-            sample.waveform[2] = 0  # Drop Z
+            sample.waveform[1] = 0
+            sample.waveform[2] = 0
             drop_z = True
         else:
-            # Drop random single channel
             ch = random.randint(0, 2)
             sample.waveform[ch] = 0
             if ch == 2:
                 drop_z = True
 
-        # If Z channel is dropped, polarity is not reliable
         if drop_z:
-            sample.polarity = []
+            for target in sample.targets:
+                target.polarity = []
 
         return sample
+
+    def __repr__(self) -> str:
+        return f"DropChannel(p={self.p})"
 
 
 # -----------------------------------------------------------------------------
@@ -526,14 +585,16 @@ class AddGaussianNoise(Transform):
         sample.waveform = sample.waveform + noise
         return sample
 
+    def __repr__(self) -> str:
+        return f"AddGaussianNoise(snr_db_range={self.snr_db_range})"
+
 
 # -----------------------------------------------------------------------------
-# Stacking Transforms - Core Seismic Augmentation
+# Stacking Transforms — Core Seismic Augmentation
 # -----------------------------------------------------------------------------
 
-# Default velocity model (km/s)
-DEFAULT_VP = 6.0  # P-wave velocity
-DEFAULT_VS = 3.5  # S-wave velocity
+DEFAULT_VP = 6.0
+DEFAULT_VS = 3.5
 
 
 def predict_ps_times(
@@ -542,75 +603,14 @@ def predict_ps_times(
     vp: float = DEFAULT_VP,
     vs: float = DEFAULT_VS,
 ) -> tuple[float, float]:
-    """Predict P and S arrival times from distance using constant velocity model.
+    """Predict P and S arrival times (in samples) from distance."""
+    return distance_km / vp * sampling_rate, distance_km / vs * sampling_rate
 
-    Args:
-        distance_km: Event-station distance in km
-        sampling_rate: Samples per second
-        vp: P-wave velocity in km/s
-        vs: S-wave velocity in km/s
-
-    Returns:
-        (p_samples, s_samples): Predicted P and S travel times in samples
-    """
-    p_time_s = distance_km / vp
-    s_time_s = distance_km / vs
-    return p_time_s * sampling_rate, s_time_s * sampling_rate
-
-
-def get_event_window(
-    sample: Sample,
-    vp: float = DEFAULT_VP,
-    vs: float = DEFAULT_VS,
-) -> tuple[int, int] | None:
-    """Get event window (P to S) using picks or predicted times.
-
-    If both P and S picks exist, use them directly.
-    Otherwise, use distance and velocity model to predict.
-
-    Args:
-        sample: Sample with picks and/or distance
-        vp: P-wave velocity for prediction
-        vs: S-wave velocity for prediction
-
-    Returns:
-        (start, end) sample indices of event window, or None if cannot determine
-    """
-    # If we have both P and S, use them directly
-    if sample.p_indices and sample.s_indices:
-        p = min(sample.p_indices)
-        s = max(sample.s_indices)  # Use max S for window end
-        return (int(p), int(s)) if p < s else (int(s), int(p))
-
-    # If we have distance, predict P-S difference
-    if sample.distance_km > 0:
-        p_travel, s_travel = predict_ps_times(
-            sample.distance_km, sample.sampling_rate, vp, vs
-        )
-        ps_diff = s_travel - p_travel  # S-P time in samples
-
-        if sample.p_indices:
-            p = min(sample.p_indices)
-            return (int(p), int(p + ps_diff))
-        elif sample.s_indices:
-            s = min(sample.s_indices)
-            return (int(s - ps_diff), int(s))
-
-    return None
 
 class StackEvents(Transform):
     """Stack multiple events onto a single waveform (Mixup-inspired).
 
-    This is one of the most important augmentations for seismic data.
-    Similar to Mixup/CutMix in computer vision, but designed for seismic.
-
-    Uses predicted P-S times from distance and velocity model to determine
-    event windows, allowing stacking even when only P or S is available.
-
-    Overlap Policy (allow_overlap):
-        - "none": No picks can fall within another event's P-S window
-        - "partial": P picks cannot fall in P-S range, S picks can overlap
-        - "full": Allow any overlap (for training robustness)
+    Each stacked event becomes a separate Target in sample.targets.
 
     Args:
         max_events: Maximum number of additional events to stack
@@ -642,165 +642,131 @@ class StackEvents(Transform):
         self.allow_overlap = allow_overlap
         self.vp = vp
         self.vs = vs
-        self._sample_buffer: list[Sample] = []
         self._sample_fn: Callable[[], Sample | None] | None = None
 
     def set_sample_fn(self, fn: Callable[[], Sample | None]):
-        """Set function to get random samples for stacking."""
         self._sample_fn = fn
 
-    def set_sample_buffer(self, buffer: list[Sample]):
-        """Set buffer of samples for stacking."""
-        self._sample_buffer = buffer
-
-    def _get_random_sample(self) -> Sample | None:
-        """Get a random sample for stacking."""
-        if self._sample_fn is not None:
-            return self._sample_fn()
-        if self._sample_buffer:
-            return random.choice(self._sample_buffer).copy()
-        return None
-
-    def _get_event_windows(self, sample: Sample) -> list[tuple[int, int]]:
-        """Get all event windows (P to S ranges) for a sample."""
-        windows = []
-
-        # Get P-S difference from distance
-        if sample.distance_km > 0:
-            _, ps_diff = predict_ps_times(
-                sample.distance_km, sample.sampling_rate, self.vp, self.vs
-            )
-            ps_diff = ps_diff - predict_ps_times(
-                sample.distance_km, sample.sampling_rate, self.vp, self.vs
-            )[0]
+    def _get_target_windows(self, target: Target, sampling_rate: float) -> list[tuple[int, int]]:
+        """Get event windows (P to S) for a target."""
+        if target.distance_km > 0:
+            p_travel, s_travel = predict_ps_times(target.distance_km, sampling_rate, self.vp, self.vs)
+            ps_diff = s_travel - p_travel
         else:
-            ps_diff = 300  # Default ~3 seconds at 100Hz
+            ps_diff = 300
 
-        # Build windows from P picks
-        for p in sample.p_indices:
-            windows.append((int(p), int(p + ps_diff)))
-
-        # Add windows from S picks (if no corresponding P)
-        if len(sample.s_indices) > len(sample.p_indices):
-            for s in sample.s_indices[len(sample.p_indices):]:
-                windows.append((int(s - ps_diff), int(s)))
-
+        windows = []
+        for _, p_time in target.p_picks:
+            windows.append((int(p_time), int(p_time + ps_diff)))
+        if len(target.s_picks) > len(target.p_picks):
+            for _, s_time in target.s_picks[len(target.p_picks):]:
+                windows.append((int(s_time - ps_diff), int(s_time)))
         return windows
 
     def _check_overlap(
         self,
-        windows1: list[tuple[int, int]],
-        windows2_shifted: list[tuple[int, int]],
-        p1: list[int],
-        s1: list[int],
-        p2_shifted: list[int],
-        s2_shifted: list[int],
+        windows_existing: list[tuple[int, int]],
+        windows_new: list[tuple[int, int]],
+        picks_existing: list[float],
+        picks_new: list[float],
     ) -> bool:
-        """Check if stacking is valid based on overlap policy.
-
-        Args:
-            windows1: Event windows from sample1
-            windows2_shifted: Event windows from sample2 (shifted)
-            p1, s1: P and S picks from sample1
-            p2_shifted, s2_shifted: Shifted picks from sample2
-
-        Returns True if stacking is allowed.
-        """
+        """Check if stacking is valid based on overlap policy."""
         if self.allow_overlap == "full":
             return True
 
-        # Check if new P picks fall within existing windows
-        for p2 in p2_shifted:
-            for w1_start, w1_end in windows1:
-                if w1_start <= p2 <= w1_end:
-                    return False  # P pick in existing event window
+        # New picks must not fall in existing windows
+        if any(w0 <= t <= w1 for t in picks_new for w0, w1 in windows_existing):
+            return False
 
         if self.allow_overlap == "none":
-            # Also check S picks in existing windows
-            for s2 in s2_shifted:
-                for w1_start, w1_end in windows1:
-                    if w1_start <= s2 <= w1_end:
-                        return False
-
-            # Check reverse: existing picks in new windows
-            for p in p1:
-                for w2_start, w2_end in windows2_shifted:
-                    if w2_start <= p <= w2_end:
-                        return False
-            for s in s1:
-                for w2_start, w2_end in windows2_shifted:
-                    if w2_start <= s <= w2_end:
-                        return False
-
+            # Existing picks must not fall in new windows
+            if any(w0 <= t <= w1 for t in picks_existing for w0, w1 in windows_new):
+                return False
         return True
 
     def __call__(self, sample: Sample) -> Sample:
+        if self._sample_fn is None:
+            return sample
+
         n_events = random.randint(1, self.max_events)
 
-        # Get existing event windows
-        windows1 = self._get_event_windows(sample)
-
         for _ in range(n_events):
-            sample2 = self._get_random_sample()
-            if sample2 is None:
+            sample2 = self._sample_fn()
+            if sample2 is None or not sample2.targets:
+                continue
+            if sample2.nt != sample.nt:
                 continue
 
-            # Ensure same shape
-            if sample2.waveform.shape != sample.waveform.shape:
+            target2 = sample2.targets[0]
+            if target2.amp_signal == 0 or target2.amp_noise == 0:
                 continue
-
-            # Check SNR/amplitude compatibility
             if sample.amp_signal == 0 or sample.amp_noise == 0:
                 continue
-            if sample2.amp_signal == 0 or sample2.amp_noise == 0:
-                continue
 
-            # Get first arrival for alignment
-            first_arrival1 = min(sample.p_indices + sample.s_indices) if (sample.p_indices or sample.s_indices) else sample.nt // 2
-            first_arrival2 = min(sample2.p_indices + sample2.s_indices) if (sample2.p_indices or sample2.s_indices) else sample2.nt // 2
+            # Existing picks/windows
+            all_times_existing = [t for tgt in sample.targets for t in tgt.all_times()]
+            windows_existing = [
+                w for tgt in sample.targets
+                for w in self._get_target_windows(tgt, sample.sampling_rate)
+            ]
+
+            # Donor first arrival for alignment
+            times2 = target2.all_times()
+            first1 = min(all_times_existing) if all_times_existing else sample.nt // 2
+            first2 = min(times2) if times2 else sample2.nt // 2
 
             for _ in range(self.max_tries):
-                shift = random.randint(-self.max_shift, self.max_shift) + first_arrival1 - first_arrival2
+                shift = random.randint(-self.max_shift, self.max_shift) + int(first1 - first2)
                 nt = sample.nt
 
-                # Compute shifted indices
-                p2_shifted = [(p + shift) % nt for p in sample2.p_indices]
-                s2_shifted = [(s + shift) % nt for s in sample2.s_indices]
+                # Shifted donor picks and windows
+                p2_shifted = [(t + shift) % nt for _, t in target2.p_picks]
+                s2_shifted = [(t + shift) % nt for _, t in target2.s_picks]
+                windows2 = self._get_target_windows(target2, sample.sampling_rate)
+                windows2_shifted = [((w0 + shift) % nt, (w1 + shift) % nt) for w0, w1 in windows2]
 
-                # Get shifted windows
-                windows2 = self._get_event_windows(sample2)
-                windows2_shifted = [((w[0] + shift) % nt, (w[1] + shift) % nt) for w in windows2]
+                if not self._check_overlap(
+                    windows_existing, windows2_shifted,
+                    all_times_existing, p2_shifted + s2_shifted,
+                ):
+                    continue
 
-                if self._check_overlap(windows1, windows2_shifted, sample.p_indices, sample.s_indices, p2_shifted, s2_shifted):
-                    # Found non-overlapping position
-                    # Calculate amplitude ratio
-                    min_r = max(self.min_ratio, np.log10(sample.amp_noise * 2 / sample2.amp_signal + 1e-10))
-                    max_r = min(self.max_ratio, np.log10(sample.amp_signal / 2 / sample2.amp_noise + 1e-10))
-                    if min_r > max_r:
-                        continue
+                # Calculate amplitude ratio
+                min_r = max(self.min_ratio, np.log10(sample.amp_noise * 2 / target2.amp_signal + 1e-10))
+                max_r = min(self.max_ratio, np.log10(sample.amp_signal / 2 / target2.amp_noise + 1e-10))
+                if min_r > max_r:
+                    continue
 
-                    ratio = 10 ** random.uniform(min_r, max_r)
-                    flip = random.choice([-1.0, 1.0])
+                ratio = 10 ** random.uniform(min_r, max_r)
+                flip = random.choice([-1.0, 1.0])
 
-                    # Stack waveforms
-                    sample.waveform = sample.waveform + np.roll(sample2.waveform, shift, axis=-1) * ratio * flip
+                # Stack waveforms — pad smaller nx to match larger
+                donor = np.roll(sample2.waveform, shift, axis=-1) * ratio * flip
+                nx1, nx2 = sample.nx, sample2.nx
+                if nx1 < nx2:
+                    pad = np.zeros((sample.nch, nx2 - nx1, sample.nt), dtype=sample.waveform.dtype)
+                    sample.waveform = np.concatenate([sample.waveform, pad], axis=1)
+                elif nx2 < nx1:
+                    pad = np.zeros((sample2.nch, nx1 - nx2, sample2.nt), dtype=donor.dtype)
+                    donor = np.concatenate([donor, pad], axis=1)
+                sample.waveform = sample.waveform + donor
 
-                    # Merge phase indices
-                    nt = sample.nt
-                    sample.p_indices += [(p + shift) % nt for p in sample2.p_indices]
-                    sample.s_indices += [(p + shift) % nt for p in sample2.s_indices]
-
-                    # Handle polarity with flip (negate sign if waveform flipped)
-                    sign_flip = 1 if flip > 0 else -1
-                    sample.polarity += [((p + shift) % nt, s * sign_flip) for p, s in sample2.polarity]
-
-                    sample.event_center += [(p + shift) % nt for p in sample2.event_center]
-                    sample.ps_interval += sample2.ps_interval.copy()
-
-                    # Update SNR estimates
-                    sample.amp_noise = max(sample.amp_noise, sample2.amp_noise * ratio)
-                    sample.amp_signal = min(sample.amp_signal, sample2.amp_signal * ratio)
-                    break
+                # Create shifted target and append
+                sign_flip = 1 if flip > 0 else -1
+                new_target = Target(
+                    p_picks=[(s, (t + shift) % nt) for s, t in target2.p_picks],
+                    s_picks=[(s, (t + shift) % nt) for s, t in target2.s_picks],
+                    polarity=[(s, (t + shift) % nt, sign * sign_flip) for s, t, sign in target2.polarity],
+                    event_centers=[(s, (t + shift) % nt) for s, t in target2.event_centers],
+                    ps_intervals=target2.ps_intervals.copy(),
+                    snr=target2.snr,
+                    amp_signal=target2.amp_signal * ratio,
+                    amp_noise=target2.amp_noise * ratio,
+                    distance_km=target2.distance_km,
+                    event_id=target2.event_id,
+                )
+                sample.targets.append(new_target)
+                break
 
         return sample
 
@@ -809,213 +775,204 @@ class StackEvents(Transform):
 
 
 class StackNoise(Transform):
-    """Stack noise from another sample onto the waveform.
+    """Stack noise onto the waveform.
 
-    Extracts noise segment (before first arrival) from a random sample
-    and adds it to the current waveform.
+    Supports two noise sources (tried in order):
+    1. Dedicated noise files via set_noise_fn
+    2. Pre-arrival extraction from other samples via set_sample_fn
 
     Args:
         max_ratio: Maximum noise amplitude ratio relative to signal
+        p: Probability of applying
     """
 
-    def __init__(self, max_ratio: float = 2.0):
+    def __init__(self, max_ratio: float = 2.0, p: float = 0.5):
         self.max_ratio = max_ratio
+        self.p = p
+        self._noise_fn: Callable[[], np.ndarray | None] | None = None
         self._sample_fn: Callable[[], Sample | None] | None = None
 
+    def set_noise_fn(self, fn: Callable[[], np.ndarray | None]):
+        """Set function to get random noise arrays (e.g., from dedicated noise files)."""
+        self._noise_fn = fn
+
     def set_sample_fn(self, fn: Callable[[], Sample | None]):
-        """Set function to get random samples for noise extraction."""
+        """Set function to get random samples (for pre-arrival noise extraction)."""
         self._sample_fn = fn
 
-    def _get_noise(self, sample: Sample, length: int) -> np.ndarray | None:
-        """Extract noise segment from sample."""
-        first_arrival = min(sample.p_indices + sample.s_indices) if (sample.p_indices or sample.s_indices) else 0
-
-        if first_arrival < length + 10:
+    def _extract_head_noise(self, donor: Sample, length: int) -> np.ndarray | None:
+        """Extract noise from the beginning of the donor waveform, before first pick."""
+        nt = donor.waveform.shape[-1]
+        if nt < length:
             return None
+        all_times = [t for tgt in donor.targets for t in tgt.all_times()]
+        first_pick = int(min(all_times)) if all_times else nt
+        if first_pick < length + 100:  # margin for label Gaussian tail
+            return None
+        return donor.waveform[..., :length]
 
-        # Extract noise from before first arrival
-        for _ in range(10):
-            shift = random.randint(10 - first_arrival, 0)
-            noise_segment = np.roll(sample.waveform, shift, axis=-1)[..., -length:]
-
-            # Check this is actually noise (no phases)
-            shifted_arrivals = [p + shift for p in sample.p_indices + sample.s_indices]
-            if not any(-length <= p < 0 for p in shifted_arrivals):
-                return noise_segment
+    def _get_noise(self, sample: Sample) -> np.ndarray | None:
+        """Get noise: dedicated files first, then head extraction."""
+        if self._noise_fn is not None:
+            noise = self._noise_fn()
+            if noise is not None:
+                return noise
+        if self._sample_fn is not None:
+            donor = self._sample_fn()
+            if donor is not None:
+                return self._extract_head_noise(donor, sample.nt)
         return None
 
     def __call__(self, sample: Sample) -> Sample:
-        if self._sample_fn is None:
+        if random.random() > self.p or sample.amp_signal == 0:
             return sample
-
-        noise_sample = self._sample_fn()
-        if noise_sample is None:
+        noise = self._get_noise(sample)
+        if noise is None or noise.shape != sample.waveform.shape:
             return sample
-
-        noise = self._get_noise(noise_sample, sample.nt)
-        if noise is None:
-            return sample
-
-        if sample.amp_signal == 0:
-            return sample
-
-        ratio = random.uniform(0, self.max_ratio) * sample.amp_signal
         noise_std = np.std(noise)
-        if noise_std > 0:
-            noise = noise / noise_std * ratio
-            sample.waveform = sample.waveform + noise
-
+        if noise_std <= 0:
+            return sample
+        ratio = random.uniform(0, self.max_ratio) * sample.amp_signal
+        sample.waveform = sample.waveform + noise / noise_std * ratio
         return sample
 
     def __repr__(self) -> str:
-        return f"StackNoise(max_ratio={self.max_ratio})"
+        return f"StackNoise(max_ratio={self.max_ratio}, p={self.p})"
 
 
 # =============================================================================
 # Label Generation
 # =============================================================================
 
-def generate_gaussian_label(
-    indices: list[int | float],
+def generate_gaussian_1d(
+    time_idx: float,
     length: int,
-    width: int = 60,
+    width: int,
     threshold: float = 0.1,
 ) -> np.ndarray:
-    """Generate Gaussian labels from phase indices.
-
-    Args:
-        indices: List of phase arrival indices
-        length: Output array length
-        width: Gaussian width (samples)
-        threshold: Values below this are zeroed
-
-    Returns:
-        Label array of shape (length,)
-    """
-    label = np.zeros(length, dtype=np.float32)
-    sigma = width / 6  # width is ~6 sigma
-
+    """Generate a single Gaussian peak centered at time_idx."""
+    sigma = width / 6
     t = np.arange(length)
-    for idx in indices:
-        gaussian = np.exp(-((t - idx) ** 2) / (2 * sigma ** 2))
-        gaussian[gaussian < threshold] = 0.0
-        label += gaussian
-
-    return label
-
-
-def generate_phase_labels(
-    sample: Sample,
-    config: LabelConfig = LabelConfig(),
-) -> dict[str, np.ndarray]:
-    """Generate phase picking labels.
-
-    Returns:
-        - phase_pick: (3, nt) - [noise, P, S]
-        - phase_mask: (nt,) - mask around picks
-    """
-    nt = sample.nt
-    p_label = generate_gaussian_label(sample.p_indices, nt, config.phase_width, config.gaussian_threshold)
-    s_label = generate_gaussian_label(sample.s_indices, nt, config.phase_width, config.gaussian_threshold)
-    noise_label = np.maximum(0, 1.0 - p_label - s_label)
-    phase_pick = np.stack([noise_label, p_label, s_label], axis=0)
-
-    # Phase mask: entire trace if both P and S, narrow window if only one
-    mask_width = int(config.phase_width * config.mask_width_factor)
-    phase_mask = np.zeros(nt, dtype=np.float32)
-    if sample.p_indices and sample.s_indices:
-        phase_mask[:] = 1.0
-    else:
-        for idx in sample.p_indices + sample.s_indices:
-            start = max(0, int(idx) - mask_width)
-            end = min(nt, int(idx) + mask_width)
-            phase_mask[start:end] = 1.0
-
-    return {"phase_pick": phase_pick, "phase_mask": phase_mask}
-
-
-def generate_polarity_labels(
-    sample: Sample,
-    config: LabelConfig = LabelConfig(),
-) -> dict[str, np.ndarray]:
-    """Generate polarity labels.
-
-    Raw label in [-1, 1], then scaled: output = raw * scale + shift.
-    Default maps [-1,1] to [0,1] (0=down, 0.5=unknown, 1=up).
-
-    Returns:
-        - polarity: (nt,) - polarity label
-        - polarity_mask: (nt,) - mask for polarity loss
-    """
-    nt = sample.nt
-    mask_width = int(config.phase_width * config.mask_width_factor)
-    polarity_raw = np.zeros(nt, dtype=np.float32)
-    polarity_mask = np.zeros(nt, dtype=np.float32)
-    for idx, sign in sample.polarity:
-        gaussian = generate_gaussian_label([idx], nt, config.polarity_width, config.gaussian_threshold)
-        polarity_raw += sign * gaussian
-        start = max(0, int(idx) - mask_width)
-        end = min(nt, int(idx) + mask_width)
-        polarity_mask[start:end] = 1.0
-    polarity = polarity_raw * config.polarity_scale + config.polarity_shift
-
-    return {"polarity": polarity, "polarity_mask": polarity_mask}
-
-
-def generate_event_labels(
-    sample: Sample,
-    config: LabelConfig = LabelConfig(),
-) -> dict[str, np.ndarray]:
-    """Generate event detection and timing labels.
-
-    Returns:
-        - event_center: (nt,) - Gaussian at event center locations
-        - event_time: (nt,) - time regression target (with physics-based shift)
-        - event_center_mask: (nt,) - entire trace if events exist
-        - event_time_mask: (nt,) - narrow window around event centers
-    """
-    nt = sample.nt
-    event_center = generate_gaussian_label(sample.event_center, nt, config.event_width, 0.05)
-    event_time = np.zeros(nt, dtype=np.float32)
-    event_center_mask = np.ones(nt, dtype=np.float32) if sample.event_center else np.zeros(nt, dtype=np.float32)
-    event_time_mask = np.zeros(nt, dtype=np.float32)
-
-    vp = config.vp
-    vs = vp / config.vp_vs_ratio
-    dt_s = 1.0 / sample.sampling_rate
-    event_mask_width = int(config.event_width * config.mask_width_factor)
-    t = np.arange(nt)
-    for center, ps_int in zip(sample.event_center, sample.ps_interval):
-        ps_seconds = ps_int * dt_s
-        distance = ps_seconds * vp * vs / (vp - vs)
-        center_travel = distance * (1 / vp + 1 / vs) / 2
-        shift = center_travel / dt_s  # in samples
-
-        start = max(0, int(center) - event_mask_width)
-        end = min(nt, int(center) + event_mask_width)
-        event_time_mask[start:end] = 1.0
-        event_time[start:end] = (t[start:end] - center) + shift
-
-    return {
-        "event_center": event_center,
-        "event_time": event_time,
-        "event_center_mask": event_center_mask,
-        "event_time_mask": event_time_mask,
-    }
+    gaussian = np.exp(-((t - time_idx) ** 2) / (2 * sigma ** 2))
+    gaussian[gaussian < threshold] = 0.0
+    return gaussian
 
 
 def generate_labels(
     sample: Sample,
     config: LabelConfig = LabelConfig(),
 ) -> dict[str, np.ndarray]:
-    """Generate all labels from a Sample.
+    """Generate all labels from Sample.targets.
 
-    Combines phase, polarity, and event labels.
+    Iterates over all targets (events) in the sample, accumulating
+    Gaussian labels. Naturally handles multi-event windows from stacking.
+
+    Returns:
+        All arrays have shape (label_ch, nx, nt) matching the unified format.
+        - phase_pick: (3, nx, nt) — [noise, P, S]
+        - phase_mask: (1, nx, nt)
+        - polarity: (1, nx, nt)
+        - polarity_mask: (1, nx, nt)
+        - event_center: (1, nx, nt)
+        - event_time: (1, nx, nt)
+        - event_center_mask: (1, nx, nt)
+        - event_time_mask: (1, nx, nt)
     """
-    labels = generate_phase_labels(sample, config)
-    labels.update(generate_polarity_labels(sample, config))
-    labels.update(generate_event_labels(sample, config))
-    return labels
+    nx, nt = sample.nx, sample.nt
+    sigma_phase = config.phase_width / 6
+    sigma_pol = config.polarity_width / 6
+    sigma_event = config.event_width / 6
+    mask_w = int(config.phase_width * config.mask_width_factor)
+    event_mask_w = int(config.event_width * config.mask_width_factor)
+    t = np.arange(nt)
+
+    p_label = np.zeros((nx, nt), dtype=np.float32)
+    s_label = np.zeros((nx, nt), dtype=np.float32)
+    polarity_raw = np.zeros((nx, nt), dtype=np.float32)
+    polarity_mask = np.zeros((nx, nt), dtype=np.float32)
+    event_center_label = np.zeros((nx, nt), dtype=np.float32)
+    event_time_label = np.zeros((nx, nt), dtype=np.float32)
+    event_center_mask = np.zeros((nx, nt), dtype=np.float32)
+    event_time_mask = np.zeros((nx, nt), dtype=np.float32)
+    phase_mask = np.zeros((nx, nt), dtype=np.float32)
+
+    has_p = np.zeros(nx, dtype=bool)
+    has_s = np.zeros(nx, dtype=bool)
+
+    vp = config.vp
+    vs = vp / config.vp_vs_ratio
+    dt_s = 1.0 / sample.sampling_rate
+
+    picks_per_station: dict[int, list[float]] = {}
+
+    def add_phase_picks(picks, label, has_flag):
+        for sta, ti in picks:
+            sta = int(sta)
+            if 0 <= sta < nx:
+                g = np.exp(-((t - ti) ** 2) / (2 * sigma_phase ** 2))
+                g[g < config.gaussian_threshold] = 0.0
+                label[sta] += g
+                has_flag[sta] = True
+                picks_per_station.setdefault(sta, []).append(ti)
+
+    for target in sample.targets:
+        add_phase_picks(target.p_picks, p_label, has_p)
+        add_phase_picks(target.s_picks, s_label, has_s)
+
+        # Polarity labels
+        for sta, ti, sign in target.polarity:
+            sta = int(sta)
+            if 0 <= sta < nx:
+                g = np.exp(-((t - ti) ** 2) / (2 * sigma_pol ** 2))
+                g[g < config.gaussian_threshold] = 0.0
+                polarity_raw[sta] += sign * g
+                t0 = max(0, int(ti) - mask_w)
+                t1 = min(nt, int(ti) + mask_w)
+                polarity_mask[sta, t0:t1] = 1.0
+
+        # Event labels
+        for (sta, center), (_, ps_int) in zip(target.event_centers, target.ps_intervals):
+            sta = int(sta)
+            if 0 <= sta < nx:
+                g = np.exp(-((t - center) ** 2) / (2 * sigma_event ** 2))
+                g[g < 0.05] = 0.0
+                event_center_label[sta] += g
+
+                ps_seconds = ps_int * dt_s
+                distance = ps_seconds * vp * vs / (vp - vs)
+                center_travel = distance * (1 / vp + 1 / vs) / 2
+                shift = center_travel / dt_s
+
+                event_center_mask[sta, :] = 1.0
+                t0 = max(0, int(center) - event_mask_w)
+                t1 = min(nt, int(center) + event_mask_w)
+                event_time_mask[sta, t0:t1] = 1.0
+                event_time_label[sta, t0:t1] = (t[t0:t1] - center) + shift
+
+    # Phase mask: full trace if both P and S present, narrow window otherwise
+    for sta in picks_per_station:
+        if has_p[sta] and has_s[sta]:
+            phase_mask[sta, :] = 1.0
+        else:
+            for ti in picks_per_station[sta]:
+                t0 = max(0, int(ti) - mask_w)
+                t1 = min(nt, int(ti) + mask_w)
+                phase_mask[sta, t0:t1] = 1.0
+
+    noise_label = np.maximum(0, 1.0 - p_label - s_label)
+    polarity_label = polarity_raw * config.polarity_scale + config.polarity_shift
+
+    # All outputs: (label_ch, nx, nt)
+    return {
+        "phase_pick": np.stack([noise_label, p_label, s_label], axis=0),  # (3, nx, nt)
+        "phase_mask": phase_mask[np.newaxis],  # (1, nx, nt)
+        "polarity": polarity_label[np.newaxis],  # (1, nx, nt)
+        "polarity_mask": polarity_mask[np.newaxis],  # (1, nx, nt)
+        "event_center": event_center_label[np.newaxis],  # (1, nx, nt)
+        "event_time": event_time_label[np.newaxis],  # (1, nx, nt)
+        "event_center_mask": event_center_mask[np.newaxis],  # (1, nx, nt)
+        "event_time_mask": event_time_mask[np.newaxis],  # (1, nx, nt)
+    }
 
 
 # =============================================================================
@@ -1027,23 +984,13 @@ def default_train_transforms(
     enable_stacking: bool = True,
     enable_noise_stacking: bool = True,
 ) -> Compose:
-    """Default transforms for training.
-
-    Args:
-        crop_length: Length to crop waveforms to
-        enable_stacking: Enable event stacking augmentation
-        enable_noise_stacking: Enable noise stacking augmentation
-    """
-    transforms = [
-        Normalize(),
-    ]
+    """Default transforms for training."""
+    transforms = [Normalize()]
 
     if enable_stacking:
         transforms.append(StackEvents(max_events=2, max_shift=4096))
 
-    transforms.extend([
-        RandomCrop(crop_length),
-    ])
+    transforms.append(RandomCrop(crop_length))
 
     if enable_noise_stacking:
         transforms.append(StackNoise(max_ratio=2.0))
@@ -1052,9 +999,8 @@ def default_train_transforms(
         FlipPolarity(p=0.5),
         RandomAmplitudeScale(min_scale=0.5, max_scale=2.0),
         DropChannel(p=0.1),
-        Normalize(),  # Final normalization
+        Normalize(),
     ])
-
     return Compose(transforms)
 
 
@@ -1068,7 +1014,7 @@ def default_eval_transforms(crop_length: int = 4096) -> Compose:
 
 
 def minimal_transforms() -> Compose:
-    """Minimal transforms - just normalize."""
+    """Minimal transforms — just normalize."""
     return Compose([Normalize()])
 
 
@@ -1094,11 +1040,10 @@ def load_quakeflow_dataset(
     """Load QuakeFlow dataset from GCS.
 
     Args:
-        region: "SC" (Southern California) or "NC" (Northern California).
-                Can be comma-separated for multiple regions, e.g., "NC,SC".
-        years: List of years to load, e.g., [2025, 2026]. None = all available.
-        days: List of days to load, e.g., [1, 2, 3]. None = all days.
-        streaming: If True, stream data without downloading everything first.
+        region: "SC" or "NC". Comma-separated for multiple regions.
+        years: List of years to load. None = all available.
+        days: List of days to load. None = all days.
+        streaming: If True, stream without downloading.
 
     Returns:
         HuggingFace Dataset object
@@ -1106,8 +1051,6 @@ def load_quakeflow_dataset(
     from datasets import load_dataset
 
     storage_options = get_gcs_storage_options()
-
-    # Handle comma-separated regions
     regions = [r.strip() for r in region.split(",")]
 
     patterns = []
@@ -1123,63 +1066,121 @@ def load_quakeflow_dataset(
             )
 
     pattern = patterns if len(patterns) > 1 else patterns[0]
-
     dataset = load_dataset(
-        "parquet",
-        data_files=pattern,
-        streaming=streaming,
-        storage_options=storage_options,
+        "parquet", data_files=pattern, streaming=streaming, storage_options=storage_options,
     )
-
     return dataset["train"]
 
 
-def record_to_sample(record: dict) -> Sample:
-    """Convert a HuggingFace dataset record to a Sample."""
-    waveform = np.array(record["waveform"], dtype=np.float32)
-    if waveform.ndim == 1:
-        waveform = waveform.reshape(3, -1)
+def calc_snr(
+    waveform: np.ndarray,
+    p_picks: list[tuple[int, float]],
+    noise_window: int = 300,
+    signal_window: int = 300,
+    gap_window: int = 50,
+) -> tuple[float, float, float]:
+    """Calculate SNR from waveform and P picks.
 
-    # Extract phase indices
-    p_indices = []
-    s_indices = []
-    polarity = []
+    Args:
+        waveform: (nch, nx, nt)
+        p_picks: [(station_idx, time_idx), ...]
+    """
+    nch, nx, nt = waveform.shape
+    snrs, signals, noises = [], [], []
+    for sta, t in p_picks:
+        sta, t = int(sta), int(t)
+        if 0 <= sta < nx and gap_window < t < nt - gap_window:
+            for c in range(nch):
+                noise = np.std(waveform[c, sta, max(0, t - noise_window):t - gap_window])
+                signal = np.std(waveform[c, sta, t + gap_window:t + signal_window])
+                if noise > 0 and signal > 0:
+                    snrs.append(signal / noise)
+                    signals.append(signal)
+                    noises.append(noise)
 
-    if record.get("p_phase_index") is not None:
-        p_indices = [int(record["p_phase_index"])]
-    if record.get("s_phase_index") is not None:
-        s_indices = [int(record["s_phase_index"])]
+    if not snrs:
+        return 0.0, 0.0, 0.0
+    idx = np.argmax(snrs)
+    return snrs[idx], signals[idx], noises[idx]
 
-    # Handle polarity if available
-    if record.get("p_phase_polarity") == "U" and p_indices:
-        polarity = [(p_indices[0], 1)]
-    elif record.get("p_phase_polarity") == "D" and p_indices:
-        polarity = [(p_indices[0], -1)]
 
-    # Compute event center (midpoint between P and S) and ps_interval
-    event_center = []
-    ps_interval = []
-    if p_indices and s_indices:
-        event_center = [(p_indices[0] + s_indices[0]) / 2]
-        ps_interval = [s_indices[0] - p_indices[0]]
+def records_to_sample(records: list[dict]) -> Sample:
+    """Convert HuggingFace records for one event into a multi-station Sample.
 
-    # Calculate SNR and get distance
-    snr = record.get("snr", 0.0) or 0.0
-    distance_km = record.get("distance_km", 0.0) or 0.0
+    All records must belong to the same event. Stations are sorted by distance
+    to give spatial coherence along the nx axis.
+
+    Args:
+        records: List of HF records (one per station, same event)
+
+    Returns:
+        Sample with waveform shape (3, nx, nt) where nx = len(records)
+    """
+    # Sort by distance for spatial coherence
+    records = sorted(records, key=lambda r: r.get("distance_km", 0.0) or 0.0)
+
+    waveforms = []
+    p_picks, s_picks, polarity_picks = [], [], []
+    event_centers, ps_intervals = [], []
+    trace_ids, sensors = [], []
+    event_id = records[0].get("event_id", "")
+
+    for sta_idx, record in enumerate(records):
+        w = np.array(record["waveform"], dtype=np.float32)
+        if w.ndim == 1:
+            w = w.reshape(3, -1)
+        waveforms.append(w)  # (3, nt)
+
+        p_idx = record.get("p_phase_index")
+        s_idx = record.get("s_phase_index")
+
+        if p_idx is not None:
+            p_picks.append((sta_idx, int(p_idx)))
+        if s_idx is not None:
+            s_picks.append((sta_idx, int(s_idx)))
+
+        pol = record.get("p_phase_polarity")
+        if pol == "U" and p_idx is not None:
+            polarity_picks.append((sta_idx, int(p_idx), 1))
+        elif pol == "D" and p_idx is not None:
+            polarity_picks.append((sta_idx, int(p_idx), -1))
+
+        if p_idx is not None and s_idx is not None:
+            center = (int(p_idx) + int(s_idx)) / 2
+            ps_int = int(s_idx) - int(p_idx)
+            event_centers.append((sta_idx, center))
+            ps_intervals.append((sta_idx, ps_int))
+
+        net = record.get("network", "")
+        sta = record.get("station", "")
+        trace_ids.append(f"{event_id}/{net}.{sta}")
+        sensors.append(record.get("instrument", ""))
+
+    waveform = np.stack(waveforms, axis=1)  # (3, nx, nt)
+
+    distance_km = records[0].get("distance_km", 0.0) or 0.0
+    target = Target(
+        p_picks=p_picks,
+        s_picks=s_picks,
+        polarity=polarity_picks,
+        event_centers=event_centers,
+        ps_intervals=ps_intervals,
+        distance_km=distance_km,
+        event_id=event_id,
+    )
 
     return Sample(
         waveform=waveform,
-        p_indices=p_indices,
-        s_indices=s_indices,
-        polarity=polarity,
-        event_center=event_center,
-        ps_interval=ps_interval,
-        snr=snr,
-        distance_km=distance_km,
-        trace_id=f"{record.get('event_id', '')}/{record.get('network', '')}.{record.get('station', '')}",
-        sensor=record.get("instrument", ""),
+        targets=[target] if not target.is_empty else [],
         sampling_rate=DEFAULT_SAMPLING_RATE,
+        trace_ids=trace_ids,
+        sensors=sensors,
     )
+
+
+def record_to_sample(record: dict) -> Sample:
+    """Convert a single HF record to a Sample. Thin wrapper around records_to_sample."""
+    return records_to_sample([record])
 
 
 # =============================================================================
@@ -1188,28 +1189,24 @@ def record_to_sample(record: dict) -> Sample:
 
 class SampleBuffer:
     """Efficient buffer for random sample access during stacking.
-
     Uses reservoir sampling for streaming datasets.
     """
 
     def __init__(self, max_size: int = 1000):
         self.max_size = max_size
         self.buffer: list[Sample] = []
-        self.count = 0  # Total samples seen (for reservoir sampling)
+        self.count = 0
 
     def add(self, sample: Sample):
-        """Add a sample to the buffer."""
         if len(self.buffer) < self.max_size:
             self.buffer.append(sample.copy())
         else:
-            # Reservoir sampling
             idx = random.randint(0, self.count)
             if idx < self.max_size:
                 self.buffer[idx] = sample.copy()
         self.count += 1
 
     def get_random(self) -> Sample | None:
-        """Get a random sample from the buffer."""
         if not self.buffer:
             return None
         return random.choice(self.buffer).copy()
@@ -1218,20 +1215,72 @@ class SampleBuffer:
         return len(self.buffer)
 
 
-class CEEDDataset(Dataset):
-    """California Earthquake Event Dataset - Map-style Dataset.
+def _pad_crop_nx(tensors: dict[str, torch.Tensor], target_nx: int, training: bool = True) -> dict[str, torch.Tensor]:
+    """Pad or crop all tensors along the nx (axis=1) dimension to target_nx."""
+    result = {}
+    for key, val in tensors.items():
+        if not isinstance(val, torch.Tensor):
+            result[key] = val
+            continue
+        if val.ndim < 2:
+            result[key] = val
+            continue
+        nx = val.shape[-2]
+        if nx == target_nx:
+            result[key] = val
+        elif nx < target_nx:
+            pad_size = target_nx - nx
+            # Pad along nx dimension (second-to-last): F.pad takes (last_dim_right, last_dim_left, ...)
+            result[key] = torch.nn.functional.pad(val, (0, 0, 0, pad_size))
+        else:
+            # Crop
+            if training:
+                start = random.randint(0, nx - target_nx)
+            else:
+                start = (nx - target_nx) // 2
+            result[key] = val[..., start:start + target_nx, :]
+    return result
 
-    For use with DataLoader when data fits in memory or is pre-downloaded.
+
+def _to_output(
+    sample: Sample,
+    label_config: LabelConfig,
+    event_feature_scale: int,
+    target_nx: int | None = None,
+    training: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Convert transformed Sample to output dict with labels."""
+    labels = generate_labels(sample, label_config)
+    s = event_feature_scale
+    out = {
+        "data": torch.nan_to_num(torch.from_numpy(sample.waveform).float()),
+        "phase_pick": torch.from_numpy(labels["phase_pick"]).float(),
+        "phase_mask": torch.from_numpy(labels["phase_mask"]).float(),
+        "polarity": torch.from_numpy(labels["polarity"]).float(),
+        "polarity_mask": torch.from_numpy(labels["polarity_mask"]).float(),
+        "event_center": torch.from_numpy(labels["event_center"]).float()[:, :, ::s],
+        "event_time": torch.from_numpy(labels["event_time"]).float()[:, :, ::s],
+        "event_center_mask": torch.from_numpy(labels["event_center_mask"]).float()[:, :, ::s],
+        "event_time_mask": torch.from_numpy(labels["event_time_mask"]).float()[:, :, ::s],
+    }
+    if target_nx is not None:
+        out = _pad_crop_nx(out, target_nx, training=training)
+    return out
+
+
+class CEEDDataset(Dataset):
+    """California Earthquake Event Dataset — Map-style Dataset.
 
     Args:
         region: "SC" or "NC"
         years: List of years to load
         days: List of days to load
-        transforms: Transform pipeline to apply
+        transforms: Transform pipeline
         label_config: Configuration for label generation
         min_snr: Minimum SNR to include sample
         buffer_size: Size of sample buffer for stacking
-        preload: If True, load all data into memory
+        target_nx: If set, pad/crop nx dimension to this size for batching
+        event_feature_scale: Downsampling factor for event labels along time
     """
 
     def __init__(
@@ -1243,118 +1292,74 @@ class CEEDDataset(Dataset):
         label_config: LabelConfig = LabelConfig(),
         min_snr: float = 0.0,
         buffer_size: int = 1000,
+        target_nx: int | None = None,
+        event_feature_scale: int = 16,
         preload: bool = False,
     ):
         self.transforms = transforms or minimal_transforms()
         self.label_config = label_config
         self.min_snr = min_snr
+        self.target_nx = target_nx
+        self.event_feature_scale = event_feature_scale
 
-        # Load dataset
         hf_dataset = load_quakeflow_dataset(region, years, days, streaming=False)
 
-        # Convert to samples and calculate SNR
-        self.samples: list[Sample] = []
+        # Group records by event_id → multi-station Samples
+        records_by_event: dict[str, list] = defaultdict(list)
         for record in hf_dataset:
-            sample = record_to_sample(record)
-            if not sample.p_indices or not sample.s_indices:
+            eid = record.get("event_id", "")
+            if eid:
+                records_by_event[eid].append(record)
+
+        self.samples: list[Sample] = []
+        for eid, event_records in records_by_event.items():
+            sample = records_to_sample(event_records)
+            target = sample.targets[0] if sample.targets else None
+            if target is None or not target.p_picks or not target.s_picks:
                 continue
 
-            # Calculate SNR during loading (required for stacking)
-            sample.snr, sample.amp_signal, sample.amp_noise = self._calc_snr(sample)
-
-            if sample.snr >= min_snr and sample.snr > 0:
+            target.snr, target.amp_signal, target.amp_noise = calc_snr(
+                sample.waveform, target.p_picks,
+            )
+            if target.snr >= min_snr and target.snr > 0:
                 self.samples.append(sample)
 
-        # Setup sample buffer for stacking transforms
         self.sample_buffer = SampleBuffer(buffer_size)
-        for sample in random.sample(self.samples, min(buffer_size, len(self.samples))):
-            self.sample_buffer.add(sample)
+        for s in random.sample(self.samples, min(buffer_size, len(self.samples))):
+            self.sample_buffer.add(s)
 
-        # Connect stacking transforms to buffer
         self._setup_stacking_transforms()
-
         print(f"CEEDDataset: loaded {len(self.samples)} samples")
 
     def _setup_stacking_transforms(self):
-        """Connect stacking transforms to sample buffer."""
         if isinstance(self.transforms, Compose):
             for t in self.transforms.transforms:
                 if isinstance(t, (StackEvents, StackNoise)):
-                    t.set_sample_fn(self._get_random_sample)
-
-    def _get_random_sample(self) -> Sample | None:
-        """Get random sample for stacking."""
-        return self.sample_buffer.get_random()
+                    t.set_sample_fn(self.sample_buffer.get_random)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.samples[idx].copy()
-
-        # Apply transforms
         sample = self.transforms(sample)
-
-        # Generate labels
-        labels = generate_labels(sample, self.label_config)
-
-        # Convert to tensors
-        return {
-            "data": torch.from_numpy(sample.waveform[:, np.newaxis, :]).float(),
-            "phase_pick": torch.from_numpy(labels["phase_pick"][:, np.newaxis, :]).float(),
-            "phase_mask": torch.from_numpy(labels["phase_mask"][np.newaxis, np.newaxis, :]).float(),
-            "polarity": torch.from_numpy(labels["polarity"][np.newaxis, np.newaxis, :]).float(),
-            "polarity_mask": torch.from_numpy(labels["polarity_mask"][np.newaxis, np.newaxis, :]).float(),
-            "event_center": torch.from_numpy(labels["event_center"][np.newaxis, np.newaxis, :]).float(),
-            "event_time": torch.from_numpy(labels["event_time"][np.newaxis, np.newaxis, :]).float(),
-            "event_center_mask": torch.from_numpy(labels["event_center_mask"][np.newaxis, np.newaxis, :]).float(),
-            "event_time_mask": torch.from_numpy(labels["event_time_mask"][np.newaxis, np.newaxis, :]).float(),
-        }
-
-    def _calc_snr(
-        self,
-        sample: Sample,
-        noise_window: int = 300,
-        signal_window: int = 300,
-        gap_window: int = 50,
-    ) -> tuple[float, float, float]:
-        """Calculate SNR from waveform."""
-        waveform = sample.waveform
-        picks = sample.p_indices
-
-        snrs, signals, noises = [], [], []
-        for i in range(waveform.shape[0]):
-            for j in picks:
-                if gap_window < j < waveform.shape[-1] - gap_window:
-                    noise = np.std(waveform[i, max(0, j - noise_window):j - gap_window])
-                    signal = np.std(waveform[i, j + gap_window:j + signal_window])
-                    if noise > 0 and signal > 0:
-                        snrs.append(signal / noise)
-                        signals.append(signal)
-                        noises.append(noise)
-
-        if not snrs:
-            return 0.0, 0.0, 0.0
-
-        idx = np.argmax(snrs)
-        return snrs[idx], signals[idx], noises[idx]
+        return _to_output(sample, self.label_config, self.event_feature_scale, self.target_nx, training=True)
 
 
 class CEEDIterableDataset(IterableDataset):
-    """California Earthquake Event Dataset - Iterable/Streaming Dataset.
-
-    For use with DataLoader when streaming data from GCS.
-    Supports distributed training via worker_init_fn.
+    """California Earthquake Event Dataset — Iterable/Streaming Dataset.
 
     Args:
         region: "SC" or "NC"
         years: List of years to load
         days: List of days to load
-        transforms: Transform pipeline to apply
+        transforms: Transform pipeline
         label_config: Configuration for label generation
         min_snr: Minimum SNR to include sample
         buffer_size: Size of sample buffer for stacking
         shuffle_buffer_size: Size of shuffle buffer
+        target_nx: If set, pad/crop nx dimension to this size for batching
+        event_feature_scale: Downsampling factor for event labels along time
     """
 
     def __init__(
@@ -1367,6 +1372,8 @@ class CEEDIterableDataset(IterableDataset):
         min_snr: float = 0.0,
         buffer_size: int = 1000,
         shuffle_buffer_size: int = 1000,
+        target_nx: int | None = None,
+        event_feature_scale: int = 16,
     ):
         self.region = region
         self.years = years
@@ -1375,106 +1382,86 @@ class CEEDIterableDataset(IterableDataset):
         self.label_config = label_config
         self.min_snr = min_snr
         self.buffer_size = buffer_size
+        self.event_feature_scale = event_feature_scale
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.target_nx = target_nx
+
+    def _emit_event(self, event_records: list[dict], sample_buffer: SampleBuffer) -> Sample | None:
+        """Convert buffered records for one event into a validated Sample."""
+        sample = records_to_sample(event_records)
+        target = sample.targets[0] if sample.targets else None
+        if target is None or not target.p_picks or not target.s_picks:
+            return None
+        target.snr, target.amp_signal, target.amp_noise = calc_snr(
+            sample.waveform, target.p_picks,
+        )
+        if target.snr < self.min_snr or target.snr == 0:
+            return None
+        sample_buffer.add(sample)
+        return sample
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        # Get worker info for distributed
         worker_info = torch.utils.data.get_worker_info()
 
-        # Load streaming dataset
         hf_dataset = load_quakeflow_dataset(
             self.region, self.years, self.days, streaming=True
         )
 
-        # Setup sample buffer
         sample_buffer = SampleBuffer(self.buffer_size)
 
-        # Connect stacking transforms
         if isinstance(self.transforms, Compose):
             for t in self.transforms.transforms:
                 if isinstance(t, (StackEvents, StackNoise)):
                     t.set_sample_fn(sample_buffer.get_random)
 
-        # Shuffle buffer for randomization
         shuffle_buffer: list[Sample] = []
 
+        # Buffer records by event_id, emit when event changes
+        current_event_id = None
+        current_event_records: list[dict] = []
+        event_count = 0
+
         for i, record in enumerate(hf_dataset):
-            # Skip samples for other workers
-            if worker_info is not None and i % worker_info.num_workers != worker_info.id:
+            eid = record.get("event_id", "")
+            if not eid:
                 continue
 
-            sample = record_to_sample(record)
+            if eid != current_event_id:
+                # Emit previous event
+                if current_event_records:
+                    # Distribute events across workers
+                    if worker_info is None or event_count % worker_info.num_workers == worker_info.id:
+                        sample = self._emit_event(current_event_records, sample_buffer)
+                        if sample is not None:
+                            shuffle_buffer.append(sample)
+                    event_count += 1
 
-            # Filter by SNR and phase presence
-            if sample.snr < self.min_snr or not sample.p_indices or not sample.s_indices:
-                continue
+                    if len(shuffle_buffer) >= self.shuffle_buffer_size:
+                        random.shuffle(shuffle_buffer)
+                        for s in shuffle_buffer:
+                            yield self._process_sample(s.copy())
+                        shuffle_buffer.clear()
 
-            # Calculate amp for stacking
-            sample.snr, sample.amp_signal, sample.amp_noise = self._calc_snr(sample)
-            if sample.snr == 0:
-                continue
+                current_event_id = eid
+                current_event_records = []
 
-            # Add to buffer for stacking
-            sample_buffer.add(sample)
+            current_event_records.append(record)
 
-            # Add to shuffle buffer and yield when full
-            shuffle_buffer.append(sample)
-            if len(shuffle_buffer) >= self.shuffle_buffer_size:
-                random.shuffle(shuffle_buffer)
-                for s in shuffle_buffer:
-                    yield self._process_sample(s.copy())
-                shuffle_buffer.clear()
+        # Emit last event
+        if current_event_records:
+            if worker_info is None or event_count % worker_info.num_workers == worker_info.id:
+                sample = self._emit_event(current_event_records, sample_buffer)
+                if sample is not None:
+                    shuffle_buffer.append(sample)
 
-        # Yield remaining samples in buffer
         if shuffle_buffer:
             random.shuffle(shuffle_buffer)
             for s in shuffle_buffer:
                 yield self._process_sample(s.copy())
 
     def _process_sample(self, sample: Sample) -> dict[str, torch.Tensor]:
-        """Apply transforms and generate labels."""
         sample = self.transforms(sample)
-        labels = generate_labels(sample, self.label_config)
-
-        return {
-            "data": torch.from_numpy(sample.waveform[:, np.newaxis, :]).float(),
-            "phase_pick": torch.from_numpy(labels["phase_pick"][:, np.newaxis, :]).float(),
-            "phase_mask": torch.from_numpy(labels["phase_mask"][np.newaxis, np.newaxis, :]).float(),
-            "polarity": torch.from_numpy(labels["polarity"][np.newaxis, np.newaxis, :]).float(),
-            "polarity_mask": torch.from_numpy(labels["polarity_mask"][np.newaxis, np.newaxis, :]).float(),
-            "event_center": torch.from_numpy(labels["event_center"][np.newaxis, np.newaxis, :]).float(),
-            "event_time": torch.from_numpy(labels["event_time"][np.newaxis, np.newaxis, :]).float(),
-            "event_center_mask": torch.from_numpy(labels["event_center_mask"][np.newaxis, np.newaxis, :]).float(),
-            "event_time_mask": torch.from_numpy(labels["event_time_mask"][np.newaxis, np.newaxis, :]).float(),
-        }
-
-    def _calc_snr(
-        self,
-        sample: Sample,
-        noise_window: int = 300,
-        signal_window: int = 300,
-        gap_window: int = 50,
-    ) -> tuple[float, float, float]:
-        """Calculate SNR from waveform."""
-        waveform = sample.waveform
-        picks = sample.p_indices
-
-        snrs, signals, noises = [], [], []
-        for i in range(waveform.shape[0]):
-            for j in picks:
-                if gap_window < j < waveform.shape[-1] - gap_window:
-                    noise = np.std(waveform[i, max(0, j - noise_window):j - gap_window])
-                    signal = np.std(waveform[i, j + gap_window:j + signal_window])
-                    if noise > 0 and signal > 0:
-                        snrs.append(signal / noise)
-                        signals.append(signal)
-                        noises.append(noise)
-
-        if not snrs:
-            return 0.0, 0.0, 0.0
-
-        idx = np.argmax(snrs)
-        return snrs[idx], signals[idx], noises[idx]
+        return _to_output(sample, self.label_config, self.event_feature_scale, self.target_nx, training=True)
 
 
 # =============================================================================
@@ -1489,36 +1476,16 @@ def create_train_dataset(
     streaming: bool = False,
     **kwargs,
 ) -> Dataset | IterableDataset:
-    """Create a training dataset with default augmentation.
-
-    Args:
-        region: "SC" or "NC"
-        years: Years to load
-        days: Days to load
-        crop_length: Length to crop waveforms
-        streaming: Use streaming dataset
-        **kwargs: Additional arguments to dataset class
-
-    Returns:
-        Dataset instance
-    """
+    """Create a training dataset with default augmentation."""
     transforms = default_train_transforms(crop_length=crop_length)
 
     if streaming:
         return CEEDIterableDataset(
-            region=region,
-            years=years,
-            days=days,
-            transforms=transforms,
-            **kwargs,
+            region=region, years=years, days=days, transforms=transforms, **kwargs,
         )
     else:
         return CEEDDataset(
-            region=region,
-            years=years,
-            days=days,
-            transforms=transforms,
-            **kwargs,
+            region=region, years=years, days=days, transforms=transforms, **kwargs,
         )
 
 
@@ -1530,50 +1497,31 @@ def create_eval_dataset(
     streaming: bool = False,
     **kwargs,
 ) -> Dataset | IterableDataset:
-    """Create an evaluation dataset without augmentation.
-
-    Args:
-        region: "SC" or "NC"
-        years: Years to load
-        days: Days to load
-        crop_length: Length to crop waveforms
-        streaming: Use streaming dataset
-        **kwargs: Additional arguments to dataset class
-
-    Returns:
-        Dataset instance
-    """
+    """Create an evaluation dataset without augmentation."""
     transforms = default_eval_transforms(crop_length=crop_length)
 
     if streaming:
         return CEEDIterableDataset(
-            region=region,
-            years=years,
-            days=days,
-            transforms=transforms,
-            **kwargs,
+            region=region, years=years, days=days, transforms=transforms, **kwargs,
         )
     else:
         return CEEDDataset(
-            region=region,
-            years=years,
-            days=days,
-            transforms=transforms,
-            **kwargs,
+            region=region, years=years, days=days, transforms=transforms, **kwargs,
         )
 
 
 # =============================================================================
-# Main - Demo and Testing
+# Plotting
 # =============================================================================
 
 def plot_trace(
     sample: Sample,
     labels: dict[str, np.ndarray],
+    sta: int = 0,
     title: str = "",
     save_path: str = "ceed_trace.png",
 ):
-    """Plot a single seismic trace with labels (5-panel vertical stack).
+    """Plot a single station from a multi-station Sample with labels (5-panel vertical stack).
 
     Layout:
         [1] Waveform (E/N/Z components) with P/S pick lines
@@ -1586,29 +1534,32 @@ def plot_trace(
 
     nt = sample.nt
     t = np.arange(nt)
-    waveform_z = sample.waveform[2]  # Z component for zoom views
+    waveform_z = sample.waveform[2, sta]  # Z component at station sta
     one_sec = int(sample.sampling_rate)
+
+    p_times = [ti for tgt in sample.targets for s, ti in tgt.p_picks if int(s) == sta]
+    s_times = [ti for tgt in sample.targets for s, ti in tgt.s_picks if int(s) == sta]
 
     fig, axes = plt.subplots(5, 1, figsize=(12, 10), gridspec_kw={"height_ratios": [2, 1, 1, 1, 1]})
 
     # [1] Waveform
     ax = axes[0]
     for i, name in enumerate(["E", "N", "Z"]):
-        ax.plot(t, sample.waveform[i] / 3 + i, label=name, alpha=0.7, linewidth=0.5)
-    if sample.p_indices:
-        ax.axvline(sample.p_indices[0], color="red", alpha=0.5, linewidth=0.8)
-    if sample.s_indices:
-        ax.axvline(sample.s_indices[0], color="blue", alpha=0.5, linewidth=0.8)
+        ax.plot(t, sample.waveform[i, sta] / 3 + i, label=name, alpha=0.7, linewidth=0.5)
+    for pt in p_times:
+        ax.axvline(pt, color="red", alpha=0.5, linewidth=0.8)
+    for st in s_times:
+        ax.axvline(st, color="blue", alpha=0.5, linewidth=0.8)
     ax.set_ylabel("Waveform")
     ax.set_xlim(0, nt)
     ax.legend(loc="upper right", fontsize=8)
 
-    # [2] P/S zoom-in (side by side)
+    # [2] P/S zoom-in
     ax = axes[1]
     ax.set_axis_off()
     for pick_t, color, label, x_pos in [
-        (sample.p_indices[0] if sample.p_indices else None, "red", "P", 0.0),
-        (sample.s_indices[0] if sample.s_indices else None, "blue", "S", 0.52),
+        (p_times[0] if p_times else None, "red", "P", 0.0),
+        (s_times[0] if s_times else None, "blue", "S", 0.52),
     ]:
         if pick_t is None:
             continue
@@ -1620,11 +1571,11 @@ def plot_trace(
         inset.set_title(f"{label} zoom (t={pick_t:.0f})", fontsize=9)
         inset.tick_params(labelsize=7)
 
-    # [3] Phase labels + mask
+    # [3] Phase labels + mask — labels are (label_ch, nx, nt)
     ax = axes[2]
-    ax.plot(t, labels["phase_pick"][1], label="P", color="red")
-    ax.plot(t, labels["phase_pick"][2], label="S", color="blue")
-    ax.fill_between(t, labels["phase_mask"], alpha=0.15, color="green", label="mask")
+    ax.plot(t, labels["phase_pick"][1, sta], label="P", color="red")
+    ax.plot(t, labels["phase_pick"][2, sta], label="S", color="blue")
+    ax.fill_between(t, labels["phase_mask"][0, sta], alpha=0.15, color="green", label="mask")
     ax.set_ylabel("Phase Labels")
     ax.set_ylim(-0.05, 1.1)
     ax.set_xlim(0, nt)
@@ -1632,8 +1583,8 @@ def plot_trace(
 
     # [4] Polarity + mask
     ax = axes[3]
-    ax.plot(t, labels["polarity"], label="Polarity", color="green")
-    ax.fill_between(t, labels["polarity_mask"], alpha=0.15, color="green")
+    ax.plot(t, labels["polarity"][0, sta], label="Polarity", color="green")
+    ax.fill_between(t, labels["polarity_mask"][0, sta], alpha=0.15, color="green")
     ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
     ax.set_ylabel("Polarity")
     ax.set_ylim(-0.05, 1.1)
@@ -1642,19 +1593,19 @@ def plot_trace(
 
     # [5] Event center + event_time + masks
     ax = axes[4]
-    ax.plot(t, labels["event_center"], label="Event Center", color="purple")
-    ax.fill_between(t, labels["event_center_mask"], alpha=0.1, color="green", label="Center Mask")
-    ax.fill_between(t, labels["event_time_mask"], alpha=0.2, color="green", label="Time Mask")
+    ax.plot(t, labels["event_center"][0, sta], label="Event Center", color="purple")
+    ax.fill_between(t, labels["event_center_mask"][0, sta], alpha=0.1, color="green", label="Center Mask")
+    ax.fill_between(t, labels["event_time_mask"][0, sta], alpha=0.2, color="green", label="Time Mask")
     ax.set_ylabel("Event")
     ax.set_xlabel("Time Sample")
     ax.set_xlim(0, nt)
     ax.legend(loc="upper right", fontsize=8)
     ax2 = ax.twinx()
-    mask = labels["event_time_mask"] > 0
+    mask = labels["event_time_mask"][0, sta] > 0
     if mask.any():
-        ax2.plot(t[mask], labels["event_time"][mask], color="orange", linewidth=1.0, alpha=0.7)
+        ax2.plot(t[mask], labels["event_time"][0, sta][mask], color="orange", linewidth=1.0, alpha=0.7)
         ax2.set_ylabel("Event Time", color="orange")
-        ax2.set_ylim(min(0, labels["event_time"][mask].min()), None)
+        ax2.set_ylim(min(0, labels["event_time"][0, sta][mask].min()), None)
     ax2.tick_params(axis="y", labelcolor="orange")
 
     if title:
@@ -1665,14 +1616,14 @@ def plot_trace(
 
 
 def plot_overview(
-    samples: list[Sample],
+    sample: Sample,
     config: LabelConfig = LabelConfig(),
     title: str = "",
     save_path: str = "ceed_overview.png",
 ):
     """Plot multi-station view of one event in a 2x2 grid.
 
-    Stations are sorted by distance and arranged along the x-axis.
+    Sample has waveform (3, nx, nt). Stations already sorted by distance.
 
     Layout:
         [1,1] Waveform (Z component)
@@ -1682,65 +1633,63 @@ def plot_overview(
     """
     import matplotlib.pyplot as plt
 
-    # Sort by distance
-    samples = sorted(samples, key=lambda s: s.distance_km)
+    labels = generate_labels(sample, config)
+    ns = sample.nx
+    nt = sample.nt
 
-    all_labels = [generate_labels(s, config) for s in samples]
-    ns = len(samples)
-    nt = samples[0].nt
+    # Data is (nch, nx, nt). For display: transpose to (nt, nx)
+    waveform_z = sample.waveform[2]  # (nx, nt)
 
-    # Assemble 2D arrays (nt, ns)
-    waveform_z = np.stack([s.waveform[2] for s in samples], axis=1)  # Z component
-    phase_pick = np.stack([l["phase_pick"] for l in all_labels], axis=2)  # (3, nt, ns)
-    phase_mask = np.stack([l["phase_mask"] for l in all_labels], axis=1)  # (nt, ns)
-    event_center = np.stack([l["event_center"] for l in all_labels], axis=1)  # (nt, ns)
-    event_center_mask = np.stack([l["event_center_mask"] for l in all_labels], axis=1)
-    event_time_mask = np.stack([l["event_time_mask"] for l in all_labels], axis=1)
+    # Labels: (label_ch, nx, nt) → transpose to (nt, nx) for display
+    p_disp = labels["phase_pick"][1].T  # (nt, nx)
+    s_disp = labels["phase_pick"][2].T  # (nt, nx)
+    phase_mask = labels["phase_mask"][0].T  # (nt, nx)
+    event_center = labels["event_center"][0].T  # (nt, nx)
+    event_center_mask = labels["event_center_mask"][0].T  # (nt, nx)
+    event_time_mask = labels["event_time_mask"][0].T  # (nt, nx)
 
-    # FIXME: Recompute event_time for full trace (not just mask window) for visualization only
     vp, vs = config.vp, config.vp / config.vp_vs_ratio
     t = np.arange(nt)
-    event_time_arr = np.zeros((nt, ns), dtype=np.float32)
-    for i, s in enumerate(samples):
-        for center, ps_int in zip(s.event_center, s.ps_interval):
-            dt_s = 1.0 / s.sampling_rate
-            ps_seconds = ps_int * dt_s
-            distance = ps_seconds * vp * vs / (vp - vs)
-            shift = distance * (1 / vp + 1 / vs) / (2 * dt_s)
-            event_time_arr[:, i] = (t - center) + shift
+    dt_s = 1.0 / sample.sampling_rate
+    event_time_arr = np.zeros((ns, nt), dtype=np.float32)
+    for tgt in sample.targets:
+        for (sta, center), (_, ps_int) in zip(tgt.event_centers, tgt.ps_intervals):
+            sta = int(sta)
+            if 0 <= sta < ns:
+                ps_seconds = ps_int * dt_s
+                distance = ps_seconds * vp * vs / (vp - vs)
+                shift = distance * (1 / vp + 1 / vs) / (2 * dt_s)
+                event_time_arr[sta, :] = (t - center) + shift
+    event_time_disp = event_time_arr.T  # (nt, nx)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
     imshow_kwargs = dict(aspect="auto", interpolation="nearest")
 
-    # Normalize each trace and compute scale for wiggle plot
-    norm_z = waveform_z / (np.max(np.abs(waveform_z), axis=0, keepdims=True) + 1e-10)
-    scale = 0.5  # half-width of each wiggle in station units
+    # Normalize Z for wiggle display
+    norm_z = waveform_z / (np.max(np.abs(waveform_z), axis=1, keepdims=True) + 1e-10)  # (nx, nt)
+    scale = 0.5
 
-    # [1,1] Waveform (Z component) - wiggle traces
+    # [1,1] Waveform (Z) — wiggle traces
     ax = axes[0, 0]
     for i in range(ns):
-        ax.plot(norm_z[:, i] * scale + i, np.arange(nt), "k", linewidth=0.3)
+        ax.plot(norm_z[i] * scale + i, np.arange(nt), "k", linewidth=0.3)
     ax.set_xlim(-1, ns)
     ax.set_ylim(nt, 0)
     ax.set_title("Waveform (Z)")
     ax.set_ylabel("Time Sample")
 
-    # [1,2] Waveform + picks - wiggle traces with scatter
+    # [1,2] Waveform + picks
     ax = axes[0, 1]
     for i in range(ns):
-        ax.plot(norm_z[:, i] * scale + i, np.arange(nt), "k", linewidth=0.3)
-    hw = 0.4  # half-width of horizontal tick
-    for i, s in enumerate(samples):
-        for idx in s.p_indices:
-            ax.plot([i - hw, i + hw], [idx, idx], c="red", linewidth=0.8, alpha=0.7, zorder=5)
-        for idx in s.s_indices:
-            ax.plot([i - hw, i + hw], [idx, idx], c="blue", linewidth=0.8, alpha=0.7, zorder=5)
-        for c in s.event_center:
-            ax.plot([i - hw, i + hw], [c, c], c="yellow", linewidth=0.8, alpha=0.7, zorder=5)
-    # Manual legend
+        ax.plot(norm_z[i] * scale + i, np.arange(nt), "k", linewidth=0.3)
+    hw = 0.4
+    for tgt in sample.targets:
+        for sta, idx in tgt.p_picks:
+            ax.plot([int(sta) - hw, int(sta) + hw], [idx, idx], c="red", linewidth=0.8, alpha=0.7, zorder=5)
+        for sta, idx in tgt.s_picks:
+            ax.plot([int(sta) - hw, int(sta) + hw], [idx, idx], c="blue", linewidth=0.8, alpha=0.7, zorder=5)
     ax.plot([], [], c="red", linewidth=1.5, label="P")
     ax.plot([], [], c="blue", linewidth=1.5, label="S")
-    ax.plot([], [], c="yellow", linewidth=1.5, label="Event")
     ax.legend(loc="upper right", fontsize=8, markerscale=2)
     ax.set_xlim(-1, ns)
     ax.set_ylim(nt, 0)
@@ -1749,14 +1698,13 @@ def plot_overview(
     # [2,1] Phase labels + event center + phase mask
     ax = axes[1, 0]
     rgb = np.ones((nt, ns, 3))
-    rgb[:, :, 1] = np.clip(1.0 - phase_pick[1] * 0.9, 0, 1)
-    rgb[:, :, 2] = np.clip(1.0 - phase_pick[1] * 0.9, 0, 1)
-    rgb[:, :, 0] = np.clip(rgb[:, :, 0] - phase_pick[2] * 0.9, 0, 1)
-    rgb[:, :, 1] = np.clip(rgb[:, :, 1] - phase_pick[2] * 0.9, 0, 1)
+    rgb[:, :, 1] = np.clip(1.0 - p_disp * 0.9, 0, 1)
+    rgb[:, :, 2] = np.clip(1.0 - p_disp * 0.9, 0, 1)
+    rgb[:, :, 0] = np.clip(rgb[:, :, 0] - s_disp * 0.9, 0, 1)
+    rgb[:, :, 1] = np.clip(rgb[:, :, 1] - s_disp * 0.9, 0, 1)
     rgb[:, :, 0] = np.where(phase_mask > 0, rgb[:, :, 0] * 0.85, rgb[:, :, 0])
     rgb[:, :, 2] = np.where(phase_mask > 0, rgb[:, :, 2] * 0.85, rgb[:, :, 2])
     ax.imshow(rgb, **imshow_kwargs)
-    # Event center Gaussian as yellow overlay
     event_rgba = np.zeros((nt, ns, 4))
     event_rgba[:, :, 0] = 1.0
     event_rgba[:, :, 1] = 1.0
@@ -1768,16 +1716,15 @@ def plot_overview(
 
     # [2,2] Event time + center + event mask
     ax = axes[1, 1]
-    # Green background for center mask
     bg = np.ones((nt, ns, 3))
     bg[:, :, 0] = np.where(event_center_mask > 0, 0.85, 1.0)
     bg[:, :, 2] = np.where(event_center_mask > 0, 0.85, 1.0)
     ax.imshow(bg, **imshow_kwargs)
-    # Event time heatmap (centered at 0: white=0)
-    event_time_display = np.where(event_center_mask > 0, event_time_arr, np.nan)
-    vabs = np.nanmax(np.abs(event_time_display)) or 1.0
+    event_time_display = np.where(event_center_mask > 0, event_time_disp, np.nan)
+    with np.errstate(all="ignore"):
+        vabs = np.nanmax(np.abs(event_time_display)) or 1.0
+    vabs = vabs if np.isfinite(vabs) else 1.0
     im = ax.imshow(event_time_display, cmap="seismic", vmin=-vabs, vmax=vabs, **imshow_kwargs)
-    # Time mask overlay
     mask_rgba = np.zeros((nt, ns, 4))
     mask_rgba[:, :, 1] = 1.0
     mask_rgba[:, :, 3] = event_time_mask * 0.3
@@ -1794,100 +1741,76 @@ def plot_overview(
 
 
 def plot_demo(
-    samples: list[Sample],
+    sample: Sample,
     transforms: Compose,
     output_dir: str = "figures",
     event_id: str = "ceed_event",
     n_augmented: int = 5,
     n_traces: int = 5,
     config: LabelConfig = LabelConfig(),
-    same_seed_per_event: bool = True,
 ):
-    """Generate demo plots: overview, individual traces, and augmented overviews.
-
-    Output structure:
-        {output_dir}/{event_id}/overview.png           # raw data overview
-        {output_dir}/{event_id}/traces/000.png         # individual station details
-        {output_dir}/{event_id}/augmented/000.png      # augmented overview #0
-        ...
-    """
+    """Generate demo plots: overview, individual traces, and augmented overviews."""
     event_dir = os.path.join(output_dir, event_id)
     trace_dir = os.path.join(event_dir, "traces")
     aug_dir = os.path.join(event_dir, "augmented")
     os.makedirs(trace_dir, exist_ok=True)
     os.makedirs(aug_dir, exist_ok=True)
 
-    # Raw overview
-    ns = len(samples)
-    print(f"\nRaw data: {ns} stations, nt={samples[0].nt}")
-    plot_overview(samples, config, title=event_id, save_path=os.path.join(event_dir, "overview.png"))
+    print(f"\nRaw data: {sample.waveform.shape}")
+    plot_overview(sample, config, title=event_id, save_path=os.path.join(event_dir, "overview.png"))
 
-    # Individual trace details (stations with picks, evenly sampled)
-    labeled_indices = [i for i, s in enumerate(samples) if s.p_indices and s.s_indices]
-    if labeled_indices:
-        n = min(n_traces, len(labeled_indices))
-        indices = [labeled_indices[i] for i in np.linspace(0, len(labeled_indices) - 1, n, dtype=int)]
-        for j, idx in enumerate(indices):
-            s = samples[idx]
-            trace_labels = generate_labels(s, config)
-            trace_id = s.trace_id or f"station_{idx}"
+    # Find stations with both P and S picks for trace plots
+    labeled_stations = set()
+    for tgt in sample.targets:
+        p_stas = {int(s) for s, _ in tgt.p_picks}
+        s_stas = {int(s) for s, _ in tgt.s_picks}
+        labeled_stations |= (p_stas & s_stas)
+    labeled_stations = sorted(labeled_stations)
+
+    if labeled_stations:
+        raw_labels = generate_labels(sample, config)
+        n = min(n_traces, len(labeled_stations))
+        stations = [labeled_stations[i] for i in np.linspace(0, len(labeled_stations) - 1, n, dtype=int)]
+        for j, sta in enumerate(stations):
+            trace_id = sample.trace_ids[sta] if sta < len(sample.trace_ids) else f"station_{sta}"
             plot_trace(
-                s, trace_labels,
+                sample, raw_labels, sta=sta,
                 title=f"{event_id} | {trace_id}",
                 save_path=os.path.join(trace_dir, f"{j:03d}.png"),
             )
         print(f"  Saved {n} trace plots to {trace_dir}/")
 
-    # N augmented overviews (different seeds)
-    print(f"\nGenerating {n_augmented} augmented views (same_seed_per_event={same_seed_per_event})...")
+    print(f"\nGenerating {n_augmented} augmented views...")
     seed_offset = 0
     for i in range(n_augmented):
-        aug_samples = []
-        if same_seed_per_event:
-            # Same seed for all stations — consistent augmentation across event
-            for seed in range(seed_offset, seed_offset + 100):
-                random.seed(seed)
-                np.random.seed(seed)
-                aug = transforms(samples[0].copy())
-                if aug.p_indices and aug.s_indices:
-                    break
-            seed_offset = seed + 1
-            for s in samples:
-                random.seed(seed)
-                np.random.seed(seed)
-                aug_samples.append(transforms(s.copy()))
-        else:
-            # Different seed per station
-            for s in samples:
-                for seed in range(seed_offset, seed_offset + 100):
-                    random.seed(seed)
-                    np.random.seed(seed)
-                    aug = transforms(s.copy())
-                    if aug.p_indices and aug.s_indices:
-                        break
-                aug_samples.append(aug)
-            seed_offset = seed + 1
+        for seed in range(seed_offset, seed_offset + 100):
+            random.seed(seed)
+            np.random.seed(seed)
+            aug = transforms(sample.copy())
+            if any(not t.is_empty for t in aug.targets):
+                seed_offset = seed + 1
+                break
         plot_overview(
-            aug_samples, config,
+            aug, config,
             title=f"{event_id} | augmented #{i}",
             save_path=os.path.join(aug_dir, f"{i:03d}.png"),
         )
     print(f"  Saved {n_augmented} augmented overviews to {aug_dir}/")
 
 
-if __name__ == "__main__":
-    from collections import defaultdict
+# =============================================================================
+# Main — Demo and Testing
+# =============================================================================
 
+if __name__ == "__main__":
     print("=" * 60)
     print("CEED Dataset Demo")
     print("=" * 60)
 
-    # Stream real data from GCS
     print("\nLoading data (streaming from GCS)...")
     try:
         ds = load_quakeflow_dataset(region="SC", years=[2025], days=[9], streaming=True)
 
-        # Collect records by event_id, find one with many stations
         records_by_event = defaultdict(list)
         for i, record in enumerate(ds):
             records_by_event[record["event_id"]].append(record)
@@ -1898,13 +1821,11 @@ if __name__ == "__main__":
         event_records = records_by_event[best_event]
         print(f"Event {best_event}: {len(event_records)} stations")
 
-        samples = [record_to_sample(r) for r in event_records]
-        transforms = default_train_transforms(crop_length=4096, enable_stacking=False)
+        sample = records_to_sample(event_records)
+        print(f"Waveform: {sample.waveform.shape}, targets: {len(sample.targets)}")
 
-        plot_demo(
-            samples, transforms,
-            event_id=best_event, n_augmented=5,
-        )
+        transforms = default_train_transforms(crop_length=4096, enable_stacking=False)
+        plot_demo(sample, transforms, event_id=best_event, n_augmented=5)
 
     except Exception as e:
         import traceback
