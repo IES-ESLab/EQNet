@@ -368,10 +368,9 @@ def main(args):
             cut_patch=args.cut_patch,
             highpass_filter=args.highpass_filter,
             resample_time=args.resample_time,
-            resample_space=args.resample_space,
             skip_existing=args.skip_existing,
             pick_path=pick_path,
-            subdir_level=args.subdir_level,
+            folder_depth=args.subdir_level,
             rank=rank,
             world_size=world_size,
         )

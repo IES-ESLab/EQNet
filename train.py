@@ -34,7 +34,8 @@ try:
 except ImportError:
     wandb = None
 from eqnet.data import SeismicTraceIterableDataset, CEEDDataset, CEEDIterableDataset, DASIterableDataset
-from eqnet.data.ceed import default_train_transforms, default_eval_transforms
+from eqnet.data.ceed import default_train_transforms as ceed_train_transforms, default_eval_transforms as ceed_eval_transforms
+from eqnet.data.das import default_train_transforms as das_train_transforms, default_eval_transforms as das_eval_transforms
 from eqnet.models.unet import moving_normalize
 
 # DAS model names for dataset selection
@@ -324,7 +325,7 @@ def create_dataset(args, training: bool = True, rank: int = 0, world_size: int =
 
     # CEED dataset (seismic, 3-component)
     if dataset_type == "ceed":
-        transforms = default_train_transforms(crop_length=4096) if training else default_eval_transforms(crop_length=4096)
+        transforms = ceed_train_transforms(crop_length=4096) if training else ceed_eval_transforms(crop_length=4096)
         if args.streaming:
             return CEEDIterableDataset(
                 region=args.ceed_region,
@@ -346,6 +347,18 @@ def create_dataset(args, training: bool = True, rank: int = 0, world_size: int =
 
     # DAS dataset (single-channel strain rate)
     if dataset_type == "das":
+        if training:
+            transforms = das_train_transforms(
+                nt=args.nt, nx=args.nx,
+                enable_stacking=args.stack_event,
+                enable_noise_stacking=args.stack_noise,
+                enable_resample_time=args.resample_time,
+                enable_resample_space=args.resample_space,
+                enable_masking=args.masking,
+            )
+        else:
+            transforms = das_eval_transforms()
+
         return DASIterableDataset(
             data_path=args.data_path if training else (args.test_data_path or args.data_path),
             data_list=args.data_list if training else args.test_data_list,
@@ -357,11 +370,7 @@ def create_dataset(args, training: bool = True, rank: int = 0, world_size: int =
             nx=args.nx,
             format=args.format,
             training=training,
-            stack_noise=args.stack_noise if training else False,
-            stack_event=args.stack_event if training else False,
-            resample_space=args.resample_space if training else False,
-            resample_time=args.resample_time if training else False,
-            masking=args.masking if training else False,
+            transforms=transforms,
             rank=rank,
             world_size=world_size,
         )
