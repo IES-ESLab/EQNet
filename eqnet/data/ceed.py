@@ -563,6 +563,33 @@ class DropChannel(Transform):
         return f"DropChannel(p={self.p})"
 
 
+class RandomGain(Transform):
+    """Apply independent random gain to each station.
+
+    Forces the model to learn waveform shape rather than absolute amplitude,
+    simulating real-world variation in instrument response and site amplification.
+
+    Args:
+        min_gain: Minimum per-station gain factor
+        max_gain: Maximum per-station gain factor
+    """
+
+    def __init__(self, min_gain: float = 0.5, max_gain: float = 2.0):
+        self.min_gain = min_gain
+        self.max_gain = max_gain
+
+    def __call__(self, sample: Sample) -> Sample:
+        log_min = np.log10(self.min_gain)
+        log_max = np.log10(self.max_gain)
+        gains = 10 ** np.random.uniform(log_min, log_max, size=sample.nx)
+        # gains shape: (nx,) → broadcast over (nch, nx, nt)
+        sample.waveform = sample.waveform * gains[np.newaxis, :, np.newaxis].astype(np.float32)
+        return sample
+
+    def __repr__(self) -> str:
+        return f"RandomGain(min_gain={self.min_gain}, max_gain={self.max_gain})"
+
+
 # -----------------------------------------------------------------------------
 # Noise Augmentation
 # -----------------------------------------------------------------------------
@@ -587,6 +614,103 @@ class AddGaussianNoise(Transform):
 
     def __repr__(self) -> str:
         return f"AddGaussianNoise(snr_db_range={self.snr_db_range})"
+
+
+class ColoredNoise(Transform):
+    """Add colored (1/f^alpha) noise to waveform.
+
+    More realistic than white Gaussian noise. Seismic noise is spectrally
+    colored — dominated by microseisms (0.1-1 Hz) and cultural noise (1-10 Hz).
+
+    Args:
+        snr_db_range: Range of SNR in dB (min, max)
+        alpha_range: Range of spectral exponent (0=white, 1=pink, 2=brown)
+        p: Probability of applying
+    """
+
+    def __init__(
+        self,
+        snr_db_range: tuple[float, float] = (5, 30),
+        alpha_range: tuple[float, float] = (0.5, 2.0),
+        p: float = 0.5,
+    ):
+        self.snr_db_range = snr_db_range
+        self.alpha_range = alpha_range
+        self.p = p
+
+    def __call__(self, sample: Sample) -> Sample:
+        if random.random() > self.p:
+            return sample
+
+        alpha = random.uniform(*self.alpha_range)
+        nt = sample.nt
+        white = np.random.randn(*sample.waveform.shape).astype(np.float32)
+
+        # Shape spectrum: multiply FFT by f^(-alpha/2)
+        freqs = np.fft.rfftfreq(nt)
+        freqs[0] = 1.0  # avoid division by zero at DC
+        spectrum = np.fft.rfft(white, axis=-1)
+        spectrum *= (freqs ** (-alpha / 2)).astype(np.float32)
+        noise = np.fft.irfft(spectrum, n=nt, axis=-1).astype(np.float32)
+
+        # Scale to target SNR
+        snr_db = random.uniform(*self.snr_db_range)
+        signal_power = np.mean(sample.waveform ** 2)
+        if signal_power > 0:
+            noise_power = signal_power / (10 ** (snr_db / 10))
+            current_power = np.mean(noise ** 2)
+            if current_power > 0:
+                noise *= np.sqrt(noise_power / current_power)
+                sample.waveform = sample.waveform + noise
+
+        return sample
+
+    def __repr__(self) -> str:
+        return f"ColoredNoise(snr_db_range={self.snr_db_range}, alpha_range={self.alpha_range})"
+
+
+class RandomBandpass(Transform):
+    """Apply bandpass filter with random corner frequencies.
+
+    Simulates different preprocessing choices and instrument responses.
+    Makes the model robust to varying frequency content.
+
+    Args:
+        low_range: Range for low corner frequency (Hz)
+        high_range: Range for high corner frequency (Hz)
+        sampling_rate: Sampling rate (Hz)
+        p: Probability of applying
+    """
+
+    def __init__(
+        self,
+        low_range: tuple[float, float] = (0.1, 2.0),
+        high_range: tuple[float, float] = (10.0, 45.0),
+        sampling_rate: float = DEFAULT_SAMPLING_RATE,
+        p: float = 0.3,
+    ):
+        self.low_range = low_range
+        self.high_range = high_range
+        self.sampling_rate = sampling_rate
+        self.p = p
+
+    def __call__(self, sample: Sample) -> Sample:
+        if random.random() > self.p:
+            return sample
+
+        from scipy import signal
+
+        low = random.uniform(*self.low_range)
+        high = random.uniform(*self.high_range)
+        if low >= high or high >= self.sampling_rate / 2:
+            return sample
+
+        sos = signal.butter(2, [low, high], btype='band', fs=self.sampling_rate, output='sos')
+        sample.waveform = signal.sosfiltfilt(sos, sample.waveform, axis=-1).astype(np.float32)
+        return sample
+
+    def __repr__(self) -> str:
+        return f"RandomBandpass(low_range={self.low_range}, high_range={self.high_range})"
 
 
 # -----------------------------------------------------------------------------
@@ -996,9 +1120,12 @@ def default_train_transforms(
         transforms.append(StackNoise(max_ratio=2.0))
 
     transforms.extend([
+        ColoredNoise(snr_db_range=(5, 30), p=0.5),
         FlipPolarity(p=0.5),
         RandomAmplitudeScale(min_scale=0.5, max_scale=2.0),
+        RandomGain(min_gain=0.5, max_gain=2.0),
         DropChannel(p=0.1),
+        RandomBandpass(p=0.3),
         Normalize(),
     ])
     return Compose(transforms)
