@@ -123,6 +123,8 @@ def train_one_epoch(
     last_batch, last_output = None, None
 
     for i, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+        if args.iters_per_epoch and i >= args.iters_per_epoch:
+            break
         optimizer.zero_grad()
 
         with ctx:
@@ -275,10 +277,9 @@ def plot_results(batch, output, args, epoch, prefix=""):
             )
         elif args.model == "phasenet_das_plus":
             event_center = torch.sigmoid(output["event_center"]).cpu().float() if "event_center" in output else None
-            event_time = output["event_time"].cpu().float() if "event_time" in output else None
             eqnet_utils.plot_phasenet_das_plus_train(
-                batch, phase, polarity=None, event_center=event_center,
-                event_time=event_time, epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
+                batch, phase, event_center=event_center,
+                epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
             )
         # Seismic models with polarity
         elif args.model in ("phasenet_plus", "phasenet_tf_plus"):
@@ -325,24 +326,36 @@ def create_dataset(args, training: bool = True, rank: int = 0, world_size: int =
 
     # CEED dataset (seismic, 3-component)
     if dataset_type == "ceed":
-        transforms = ceed_train_transforms(crop_length=4096) if training else ceed_eval_transforms(crop_length=4096)
-        if args.streaming:
+        transforms = ceed_train_transforms(crop_length=4096, augment=not args.no_augment) if training else ceed_eval_transforms(crop_length=4096)
+        # group_by controls data reading: "station" (nx=1) or "event" (nx=N)
+        # target_nx only used with group_by="event" for consistent batching
+        group_by = "station" if args.nx == 1 else "event"
+        target_nx = args.nx if group_by == "event" else None
+        overfit = args.overfit if training else None
+        if args.streaming or overfit:
             return CEEDIterableDataset(
                 region=args.ceed_region,
                 years=args.ceed_years,
                 days=args.ceed_days,
+                data_files=args.ceed_data_files,
                 transforms=transforms,
                 min_snr=args.min_snr,
                 buffer_size=args.buffer_size,
                 shuffle_buffer_size=args.buffer_size,
+                group_by=group_by,
+                target_nx=target_nx,
+                overfit=overfit,
             )
         else:
             return CEEDDataset(
                 region=args.ceed_region,
                 years=args.ceed_years,
                 days=args.ceed_days,
+                data_files=args.ceed_data_files,
                 transforms=transforms,
                 min_snr=args.min_snr,
+                group_by=group_by,
+                target_nx=target_nx,
             )
 
     # DAS dataset (single-channel strain rate)
@@ -355,6 +368,7 @@ def create_dataset(args, training: bool = True, rank: int = 0, world_size: int =
                 enable_resample_time=args.resample_time,
                 enable_resample_space=args.resample_space,
                 enable_masking=args.masking,
+                augment=not args.no_augment,
             )
         else:
             transforms = das_eval_transforms()
@@ -368,9 +382,12 @@ def create_dataset(args, training: bool = True, rank: int = 0, world_size: int =
             phases=args.phases,
             nt=args.nt,
             nx=args.nx,
+            min_nt=min(args.nt, 256),
+            min_nx=min(args.nx, 256),
             format=args.format,
             training=training,
             transforms=transforms,
+            overfit=args.overfit if training else None,
             rank=rank,
             world_size=world_size,
         )
@@ -460,7 +477,11 @@ def main(args):
     ) if dataset_test else None
 
     # Build model
-    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone)
+    model_kwargs = {
+        "log_scale": args.log_scale,
+        "moving_norm": (1024, 256) if args.moving_norm else None,
+    }
+    model = eqnet.models.__dict__[args.model].build_model(backbone=args.backbone, **model_kwargs)
     logger.info(f"Model:\n{model}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     model.to(device)
@@ -491,6 +512,9 @@ def main(args):
 
     try:
         iters_per_epoch = max(1, len(data_loader))
+        # Allow --iters-per-epoch to override (useful for debugging)
+        if args.iters_per_epoch:
+            iters_per_epoch = args.iters_per_epoch
     except TypeError:
         # IterableDataset doesn't have __len__, use fallback
         iters_per_epoch = args.iters_per_epoch
@@ -534,20 +558,17 @@ def main(args):
     best_loss = float("inf")
 
     # Get dataset sizes (handle IterableDataset which has no len)
-    # Use iters_per_epoch if specified (useful for debugging/limiting iterations)
-    try:
-        dataset_size = len(dataset)
-        # Allow iters_per_epoch to override for debugging
-        if args.iters_per_epoch and args.iters_per_epoch * args.batch_size < dataset_size:
-            dataset_size = args.iters_per_epoch * args.batch_size
-    except TypeError:
+    if args.iters_per_epoch:
         dataset_size = args.iters_per_epoch * args.batch_size
+    else:
+        try:
+            dataset_size = len(dataset)
+        except TypeError:
+            dataset_size = 1000 * args.batch_size  # fallback
     try:
         dataset_test_size = len(dataset_test) if dataset_test else 0
-        if args.iters_per_epoch and args.iters_per_epoch * args.batch_size < dataset_test_size:
-            dataset_test_size = args.iters_per_epoch * args.batch_size
     except TypeError:
-        dataset_test_size = args.iters_per_epoch * args.batch_size
+        dataset_test_size = args.iters_per_epoch * args.batch_size if args.iters_per_epoch else 0
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed and hasattr(data_loader.sampler, "set_epoch"):
@@ -626,6 +647,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--ceed-region", default="SC", type=str)
     parser.add_argument("--ceed-years", nargs="+", type=int, default=None)
     parser.add_argument("--ceed-days", nargs="+", type=int, default=None)
+    parser.add_argument("--ceed-data-files", nargs="+", default=None, help="Local parquet files (overrides region/years/days)")
     parser.add_argument("--min-snr", type=float, default=0.0)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--iters-per-epoch", type=int, default=1000, help="Iterations per epoch for streaming datasets")
@@ -683,6 +705,10 @@ def get_args_parser(add_help=True):
     parser.add_argument("--use-deterministic-algorithms", action="store_true")
 
     # Augmentation
+    parser.add_argument("--no-augment", action="store_true", help="Disable all augmentations (for overfit testing)")
+    parser.add_argument("--overfit", default=None, choices=["fixed", "random"], help="Overfit mode: 'fixed' (same crop every step) or 'random' (different crops of cached data)")
+    parser.add_argument("--log-scale", action="store_true", help="Enable log transform in model")
+    parser.add_argument("--moving-norm", action="store_true", help="Enable moving normalization in model")
     parser.add_argument("--stack-noise", action="store_true")
     parser.add_argument("--stack-event", action="store_true")
     parser.add_argument("--flip-polarity", action="store_true")

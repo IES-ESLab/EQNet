@@ -830,9 +830,7 @@ class Unet(nn.Module):
 
         final_conv_dim_in = init_dim if final_resnet_block else final_conv_dim
 
-        self.final_conv = nn.Conv2d(final_conv_dim_in, self.phase_channels, final_conv_kernel_size, padding = final_conv_kernel_size // 2)
-
-        zero_init_(self.final_conv)
+        self.phase_head = nn.Conv2d(final_conv_dim_in, self.phase_channels, final_conv_kernel_size, padding = final_conv_kernel_size // 2)
 
         # store for domain-specific layers
         self.dims = dims
@@ -855,10 +853,16 @@ class Unet(nn.Module):
             ])
             # Merge with phase features (from decoder output, same dim as dims[0])
             self.polarity_merge = MergeBranch(dims[0] * 2, dims[0])
-            self.polarity_final = nn.Sequential(
+            self.polarity_head = nn.Sequential(
                 resnet_klass(init_dim, init_dim),
                 nn.Conv2d(init_dim, self.polarity_channels, final_conv_kernel_size, padding=final_conv_kernel_size // 2),
             )
+
+        # Zero-init all output heads for stable training
+        for name in ['phase_head', 'polarity_head']:
+            head = getattr(self, name, None)
+            if head is not None:
+                zero_init_(head[-1] if isinstance(head, nn.Sequential) else head)
 
         # Event/Prompt - always outputs at /16 scale (upsample if deeper)
         if self.add_event or self.add_prompt:
@@ -987,7 +991,7 @@ class Unet(nn.Module):
             x_polarity = resnet_block(x_polarity)
         x_polarity = attn_block(x_polarity)
         x_polarity = self.polarity_merge(x_polarity, x_phase)
-        return self.polarity_final(x_polarity)
+        return self.polarity_head(x_polarity)
 
     def _forward_event(self, x_scaled):
         """Event detection from scaled feature."""
@@ -1080,7 +1084,7 @@ class Unet(nn.Module):
         if exists(self.final_res_block):
             x = self.final_res_block(x)
 
-        out_phase = self.final_conv(x)
+        out_phase = self.phase_head(x)
 
         # build output dict
         out = {"phase": out_phase}

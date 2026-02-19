@@ -185,24 +185,6 @@ class MergeBranch(nn.Module):
     def forward(self, x1, x2):
         return self.conv(torch.cat((x1, x2), dim=1))
 
-def resize_image_to(
-    image,
-    target_image_size,
-    clamp_range = None,
-    mode = 'nearest'
-):
-    orig_image_size = image.shape[-1]
-
-    if orig_image_size == target_image_size:
-        return image
-
-    out = F.interpolate(image, target_image_size, mode = mode)
-
-    if exists(clamp_range):
-        out = out.clamp(*clamp_range)
-
-    return out
-
 # norms and residuals
 
 class ChanRMSNorm(nn.Module):
@@ -340,12 +322,13 @@ class Attention(nn.Module):
 
 # decoder
 
-def Upsample(dim, dim_out = None, stride = (1, 2)):
+def Upsample(dim, dim_out = None, stride = (1, 2), kernel_size = (1, 3)):
     dim_out = default(dim_out, dim)
+    padding = (kernel_size[0] // 2, kernel_size[1] // 2)
 
     return nn.Sequential(
         nn.Upsample(scale_factor = stride, mode = 'nearest'),
-        nn.Conv2d(dim, dim_out, 3, padding = 1)
+        nn.Conv2d(dim, dim_out, kernel_size, padding = padding)
     )
 
 class PixelShuffleUpsample(nn.Module):
@@ -422,6 +405,7 @@ class LinearAttention(nn.Module):
         dim_head = 32,
         heads = 8,
         dropout = 0.05,
+        kernel_size = (1, 3),
         **kwargs
     ):
         super().__init__()
@@ -431,23 +415,24 @@ class LinearAttention(nn.Module):
         self.norm = ChanLayerNorm(dim)
 
         self.nonlin = nn.SiLU()
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2)
 
         self.to_q = nn.Sequential(
             nn.Dropout(dropout),
             nn.Conv2d(dim, inner_dim, 1, bias = False),
-            nn.Conv2d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+            nn.Conv2d(inner_dim, inner_dim, kernel_size, bias = False, padding = padding, groups = inner_dim)
         )
 
         self.to_k = nn.Sequential(
             nn.Dropout(dropout),
             nn.Conv2d(dim, inner_dim, 1, bias = False),
-            nn.Conv2d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+            nn.Conv2d(inner_dim, inner_dim, kernel_size, bias = False, padding = padding, groups = inner_dim)
         )
 
         self.to_v = nn.Sequential(
             nn.Dropout(dropout),
             nn.Conv2d(dim, inner_dim, 1, bias = False),
-            nn.Conv2d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+            nn.Conv2d(inner_dim, inner_dim, kernel_size, bias = False, padding = padding, groups = inner_dim)
         )
 
         self.to_out = nn.Sequential(
@@ -535,6 +520,7 @@ class LinearAttentionTransformerBlock(nn.Module):
         heads = 8,
         dim_head = 32,
         ff_mult = 2,
+        kernel_size = (1, 3),
         **kwargs
     ):
         super().__init__()
@@ -542,7 +528,7 @@ class LinearAttentionTransformerBlock(nn.Module):
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                LinearAttention(dim = dim, heads = heads, dim_head = dim_head),
+                LinearAttention(dim = dim, heads = heads, dim_head = dim_head, kernel_size = kernel_size),
                 ChanFeedForward(dim = dim, mult = ff_mult)
             ]))
 
@@ -556,31 +542,32 @@ class CrossEmbedLayer(nn.Module):
     def __init__(
         self,
         dim_in,
-        kernel_sizes,
+        time_kernel_sizes,
+        space_kernel_sizes = None,
         dim_out = None,
         stride = (1, 2)
     ):
         super().__init__()
         stride = (stride, stride) if isinstance(stride, int) else stride
-        # Scale kernel sizes proportionally if stride > 2 (original design assumes stride=2)
-        scale_ratio = max(1, stride[1] // 2)
-        kernel_sizes = tuple(k * scale_ratio for k in kernel_sizes)
-        # kernel_sizes are for temporal dim only (width), height kernel is always 1
-        assert all([*map(lambda t: (t % 2) == (stride[1] % 2), kernel_sizes)])
+
+        time_kernels = sorted(time_kernel_sizes)
+        space_kernels = sorted(space_kernel_sizes) if space_kernel_sizes else [1] * len(time_kernels)
+        assert len(time_kernels) == len(space_kernels)
+
+        assert all(t % 2 == stride[1] % 2 for t in time_kernels)
+        assert all(s % 2 == stride[0] % 2 for s in space_kernels)
         dim_out = default(dim_out, dim_in)
 
-        kernel_sizes = sorted(kernel_sizes)
-        num_scales = len(kernel_sizes)
+        num_scales = len(time_kernels)
 
         # calculate the dimension at each scale
         dim_scales = [int(dim_out / (2 ** i)) for i in range(1, num_scales)]
         dim_scales = [*dim_scales, dim_out - sum(dim_scales)]
 
         self.convs = nn.ModuleList([])
-        for kernel, dim_scale in zip(kernel_sizes, dim_scales):
-            # kernel is temporal width, use (1, kernel) for 2D conv
-            kernel_2d = (1, kernel)
-            padding = (0, (kernel - stride[1]) // 2)
+        for tk, sk, dim_scale in zip(time_kernels, space_kernels, dim_scales):
+            kernel_2d = (sk, tk)
+            padding = ((sk - stride[0]) // 2, (tk - stride[1]) // 2)
             self.convs.append(nn.Conv2d(dim_in, dim_scale, kernel_2d, stride=stride, padding=padding))
 
     def forward(self, x):
@@ -594,7 +581,8 @@ class UpsampleCombiner(nn.Module):
         *,
         enabled = False,
         dim_ins = tuple(),
-        dim_outs = tuple()
+        dim_outs = tuple(),
+        kernel_size = (1, 7)
     ):
         super().__init__()
         dim_outs = cast_tuple(dim_outs, len(dim_ins))
@@ -606,7 +594,7 @@ class UpsampleCombiner(nn.Module):
             self.dim_out = dim
             return
 
-        self.fmap_convs = nn.ModuleList([Block(dim_in, dim_out) for dim_in, dim_out in zip(dim_ins, dim_outs)])
+        self.fmap_convs = nn.ModuleList([Block(dim_in, dim_out, kernel_size=kernel_size) for dim_in, dim_out in zip(dim_ins, dim_outs)])
         self.dim_out = dim + (sum(dim_outs) if len(dim_outs) > 0 else 0)
 
     def forward(self, x, fmaps = None):
@@ -625,32 +613,36 @@ class Unet(nn.Module):
     def __init__(
         self,
         *,
-        dim,
+        dim = 16,
         num_resnet_blocks = 1,
         dim_mults = (1, 2, 4, 8),
         channels = 3,
         phase_channels = None,
         polarity_channels = 1,
         event_channels = 1,
-        attn_dim_head = 64,
-        attn_heads = 8,
+        attn_dim_head = 32,
+        attn_heads = 4,
         ff_mult = 2,
-        layer_attns = True,
+        layer_attns = False,
         layer_attns_depth = 1,
         layer_mid_attns_depth = 1,
         attend_at_middle = True,
         use_linear_attn = False,
         init_dim = None,
-        init_conv_kernel_size = 7,
-        init_cross_embed = True,
-        init_cross_embed_kernel_sizes = (3, 7, 15),
+        init_conv_time_kernel = 7,
+        init_conv_space_kernel = 1,
+        init_cross_embed = False,
+        init_cross_embed_time_kernel_sizes = (3, 7, 15),
+        init_cross_embed_space_kernel_sizes = None,
         cross_embed_downsample = False,
-        cross_embed_downsample_kernel_sizes = (2, 4),
+        cross_embed_downsample_time_kernel_sizes = (4, 8),
+        cross_embed_downsample_space_kernel_sizes = None,
         dropout = 0.,
-        memory_efficient = False,
+        memory_efficient = True,
         scale_skip_connection = True,
         final_resnet_block = True,
-        final_conv_kernel_size = 3,
+        final_conv_time_kernel = 3,
+        final_conv_space_kernel = 1,
         combine_upsample_fmaps = False,
         pixel_shuffle_upsample = True,
         # stride and kernel per dimension (space=station/height, time=samples/width, freq=STFT frequency)
@@ -675,6 +667,10 @@ class Unet(nn.Module):
         # derive composite tuples from per-dimension settings
         stride = (space_stride, time_stride)
         kernel_size = (space_kernel, time_kernel)
+        init_conv_kernel_size = (init_conv_space_kernel, init_conv_time_kernel)
+        init_conv_padding = (init_conv_space_kernel // 2, init_conv_time_kernel // 2)
+        final_conv_kernel_size = (final_conv_space_kernel, final_conv_time_kernel)
+        final_conv_padding = (final_conv_space_kernel // 2, final_conv_time_kernel // 2)
 
         # domain-specific settings
         self.moving_norm = moving_norm
@@ -700,7 +696,7 @@ class Unet(nn.Module):
 
         # initial convolution
 
-        self.init_conv = CrossEmbedLayer(channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv2d(channels, init_dim, init_conv_kernel_size, padding = init_conv_kernel_size // 2)
+        self.init_conv = CrossEmbedLayer(channels, dim_out = init_dim, time_kernel_sizes = init_cross_embed_time_kernel_sizes, space_kernel_sizes = init_cross_embed_space_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv2d(channels, init_dim, init_conv_kernel_size, padding = init_conv_padding)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -729,7 +725,7 @@ class Unet(nn.Module):
         downsample_klass = partial(Downsample, stride = stride)
 
         if cross_embed_downsample:
-            downsample_klass = partial(CrossEmbedLayer, kernel_sizes = cross_embed_downsample_kernel_sizes, stride = stride)
+            downsample_klass = partial(CrossEmbedLayer, time_kernel_sizes = cross_embed_downsample_time_kernel_sizes, space_kernel_sizes = cross_embed_downsample_space_kernel_sizes, stride = stride)
 
         # initial resnet block (for memory efficient unet)
 
@@ -771,13 +767,13 @@ class Unet(nn.Module):
 
             post_downsample = None
             if not memory_efficient:
-                post_downsample = downsample_klass(current_dim, dim_out=dim_out) if not is_last else Parallel(nn.Conv2d(dim_in, dim_out, 3, padding = 1), nn.Conv2d(dim_in, dim_out, 1))
+                post_downsample = downsample_klass(current_dim, dim_out=dim_out) if not is_last else Parallel(nn.Conv2d(dim_in, dim_out, kernel_size, padding=(kernel_size[0]//2, kernel_size[1]//2)), nn.Conv2d(dim_in, dim_out, 1))
 
             self.downs.append(nn.ModuleList([
                 pre_downsample,
                 resnet_klass(current_dim, current_dim),
                 nn.ModuleList([resnet_klass(current_dim, current_dim) for _ in range(layer_num_resnet_blocks)]),
-                transformer_block_klass(dim = current_dim, depth = layer_attn_depth, ff_mult = ff_mult, **attn_kwargs),
+                transformer_block_klass(dim = current_dim, depth = layer_attn_depth, ff_mult = ff_mult, kernel_size = kernel_size, **attn_kwargs),
                 post_downsample
             ]))
 
@@ -791,7 +787,7 @@ class Unet(nn.Module):
 
         # upsample klass
 
-        upsample_klass = partial(Upsample, stride = stride) if not pixel_shuffle_upsample else partial(PixelShuffleUpsample, stride = stride)
+        upsample_klass = partial(Upsample, stride = stride, kernel_size = kernel_size) if not pixel_shuffle_upsample else partial(PixelShuffleUpsample, stride = stride)
 
         # upsampling layers
 
@@ -807,7 +803,7 @@ class Unet(nn.Module):
             self.ups.append(nn.ModuleList([
                 resnet_klass(dim_out + skip_connect_dim, dim_out),
                 nn.ModuleList([resnet_klass(dim_out + skip_connect_dim, dim_out) for _ in range(layer_num_resnet_blocks)]),
-                transformer_block_klass(dim = dim_out, depth = layer_attn_depth, ff_mult = ff_mult, **attn_kwargs),
+                transformer_block_klass(dim = dim_out, depth = layer_attn_depth, ff_mult = ff_mult, kernel_size = kernel_size, **attn_kwargs),
                 upsample_klass(dim_out, dim_in) if not is_last or memory_efficient else Identity()
             ]))
 
@@ -819,7 +815,8 @@ class Unet(nn.Module):
             dim = upsample_out_dim,
             enabled = combine_upsample_fmaps,
             dim_ins = upsample_fmap_dims,
-            dim_outs = upsample_out_dim
+            dim_outs = upsample_out_dim,
+            kernel_size = kernel_size
         )
 
         # final optional resnet block and convolution out
@@ -830,9 +827,7 @@ class Unet(nn.Module):
 
         final_conv_dim_in = init_dim if final_resnet_block else final_conv_dim
 
-        self.final_conv = nn.Conv2d(final_conv_dim_in, self.phase_channels, final_conv_kernel_size, padding = final_conv_kernel_size // 2)
-
-        zero_init_(self.final_conv)
+        self.phase_head = nn.Conv2d(final_conv_dim_in, self.phase_channels, final_conv_kernel_size, padding = final_conv_padding)
 
         # store for domain-specific layers
         self.dims = dims
@@ -846,18 +841,18 @@ class Unet(nn.Module):
             layer_num_resnet_blocks = num_resnet_blocks[0]
             layer_use_linear_attn = use_linear_attn[0]
 
-            self.polarity_init = nn.Conv2d(1, init_dim, init_conv_kernel_size, padding=init_conv_kernel_size // 2)
+            self.polarity_init = nn.Conv2d(1, init_dim, init_conv_kernel_size, padding=init_conv_padding)
             self.polarity_init_resnet = resnet_klass(init_dim, init_dim) if memory_efficient else None
             self.polarity_encoder = nn.ModuleList([
                 resnet_klass(init_dim, init_dim),
                 nn.ModuleList([resnet_klass(init_dim, init_dim) for _ in range(layer_num_resnet_blocks)]),
-                LinearAttentionTransformerBlock(dim=init_dim, depth=1, ff_mult=ff_mult, **attn_kwargs) if layer_use_linear_attn else Identity(),
+                LinearAttentionTransformerBlock(dim=init_dim, depth=1, ff_mult=ff_mult, kernel_size=kernel_size, **attn_kwargs) if layer_use_linear_attn else Identity(),
             ])
-            # Merge with phase features (from decoder output, same dim as dims[0])
-            self.polarity_merge = MergeBranch(dims[0] * 2, dims[0])
-            self.polarity_final = nn.Sequential(
+            # Merge with phase features (from decoder output)
+            self.polarity_merge = MergeBranch(init_dim + final_conv_dim_in, init_dim)
+            self.polarity_head = nn.Sequential(
                 resnet_klass(init_dim, init_dim),
-                nn.Conv2d(init_dim, self.polarity_channels, final_conv_kernel_size, padding=final_conv_kernel_size // 2),
+                nn.Conv2d(init_dim, self.polarity_channels, final_conv_kernel_size, padding=final_conv_padding),
             )
 
         # Event/Prompt - always outputs at /16 scale (upsample if deeper)
@@ -869,11 +864,21 @@ class Unet(nn.Module):
             self.event_scale_layers = nn.ModuleList([upsample_klass(mid_dim, mid_dim) for _ in range(num_upsamples)])
 
         if self.add_event:
-            self.event_block = resnet_klass(mid_dim, mid_dim)
-            self.event_final = nn.Sequential(
+            # Separate heads for detection vs regression (CenterNet-style)
+            self.event_center_head = nn.Sequential(
                 resnet_klass(mid_dim, mid_dim),
-                nn.Conv2d(mid_dim, self.event_channels, final_conv_kernel_size, padding=final_conv_kernel_size // 2),
+                nn.Conv2d(mid_dim, self.event_channels, final_conv_kernel_size, padding=final_conv_padding),
             )
+            self.event_time_head = nn.Sequential(
+                resnet_klass(mid_dim, mid_dim),
+                nn.Conv2d(mid_dim, self.event_channels, final_conv_kernel_size, padding=final_conv_padding),
+            )
+
+        # # Zero-init all output heads for stable training
+        # for name in ['phase_head', 'polarity_head', 'event_center_head', 'event_time_head']:
+        #     head = getattr(self, name, None)
+        #     if head is not None:
+        #         zero_init_(head[-1] if isinstance(head, nn.Sequential) else head)
 
         # STFT encoder - mirrors main encoder structure but starts from stage 1
         # STFT hop_length=time_stride means output already has 1/time_stride temporal resolution
@@ -928,7 +933,7 @@ class Unet(nn.Module):
                     pre_downsample,
                     stft_resnet_klass(current_stft_dim, current_stft_dim),
                     nn.ModuleList([stft_resnet_klass(current_stft_dim, current_stft_dim) for _ in range(layer_num_resnet_blocks)]),
-                    transformer_block_klass(dim=current_stft_dim, depth=layer_attn_depth, ff_mult=ff_mult, **attn_kwargs),
+                    transformer_block_klass(dim=current_stft_dim, depth=layer_attn_depth, ff_mult=ff_mult, kernel_size=stft_kernel_size, **attn_kwargs),
                     post_downsample,
                     MergeFrequency(stage_n_freq),
                     MergeBranch(current_stft_dim + current_main_dim, current_main_dim),
@@ -987,16 +992,19 @@ class Unet(nn.Module):
             x_polarity = resnet_block(x_polarity)
         x_polarity = attn_block(x_polarity)
         x_polarity = self.polarity_merge(x_polarity, x_phase)
-        return self.polarity_final(x_polarity)
+        return self.polarity_head(x_polarity)
 
     def _forward_event(self, x_scaled):
-        """Event detection from scaled feature."""
-        x_event = self.event_block(x_scaled)
-        return self.event_final(x_event)
+        """Event detection + time regression from scaled feature."""
+        return {
+            "center": self.event_center_head(x_scaled),
+            "time": self.event_time_head(x_scaled),
+        }
 
     def forward(self, x):
         # apply moving normalization
-        x = moving_normalize(x, filter=self.moving_norm[0], stride=self.moving_norm[1])
+        if self.moving_norm:
+            x = moving_normalize(x, filter=self.moving_norm[0], stride=self.moving_norm[1])
         if self.log_scale:
             x = log_transform(x)
 
@@ -1080,14 +1088,16 @@ class Unet(nn.Module):
         if exists(self.final_res_block):
             x = self.final_res_block(x)
 
-        out_phase = self.final_conv(x)
+        out_phase = self.phase_head(x)
 
         # build output dict
         out = {"phase": out_phase}
         if self.add_polarity:
             out["polarity"] = self._forward_polarity(x_polarity, x)
         if self.add_event:
-            out["event"] = self._forward_event(x_scaled)
+            event_out = self._forward_event(x_scaled)
+            out["event_center"] = event_out["center"]
+            out["event_time"] = event_out["time"]
         if self.add_prompt:
             out["prompt"] = out_prompt
         if sgram is not None:
@@ -1128,9 +1138,7 @@ class SRUnet256(Unet):
             layer_attns = False,
             attn_heads = 8,
             ff_mult = 2,
-            memory_efficient = True,
-            final_resnet_block=False,
-            combine_upsample_fmaps = True
+            memory_efficient = True
         )
         super().__init__(*args, **{**default_kwargs, **kwargs})
 

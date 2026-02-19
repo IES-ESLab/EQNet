@@ -242,7 +242,7 @@ class Compose(Transform):
     """Compose multiple transforms together."""
 
     def __init__(self, transforms: Sequence[Transform]):
-        self.transforms = transforms
+        self.transforms = list(transforms)
 
     def __call__(self, sample: Sample) -> Sample:
         for t in self.transforms:
@@ -262,27 +262,40 @@ class Identity(Transform):
         return sample
 
 
+
 # -----------------------------------------------------------------------------
 # Basic Waveform Transforms
 # -----------------------------------------------------------------------------
 
 class Normalize(Transform):
-    """Normalize waveform to zero mean and unit std."""
+    """Normalize waveform to zero mean and unit std.
 
-    def __init__(self, eps: float = 1e-10):
+    Args:
+        mode: "global" for global normalization, "channel" for per-channel
+        eps: Small value for numerical stability
+    """
+
+    def __init__(self, mode: str = "global", eps: float = 1e-10):
+        self.mode = mode
         self.eps = eps
 
     def __call__(self, sample: Sample) -> Sample:
         data = np.nan_to_num(sample.waveform)
         data = data - data.mean(axis=-1, keepdims=True)
-        std = data.std()
-        if std > self.eps:
-            data = data / std
-        sample.waveform = data
+
+        if self.mode == "global":
+            std = data.std()
+        else:
+            std = data.std(axis=-1, keepdims=True)
+
+        if np.any(std > self.eps):
+            data = data / np.maximum(std, self.eps)
+
+        sample.waveform = data.astype(np.float32)
         return sample
 
     def __repr__(self) -> str:
-        return f"Normalize(eps={self.eps})"
+        return f"Normalize(mode='{self.mode}')"
 
 
 class HighpassFilter(Transform):
@@ -517,9 +530,22 @@ class RandomAmplitudeScale(Transform):
 class DropChannel(Transform):
     """Randomly drop (zero out) channels.
 
+    Channels: 0=E, 1=N, 2=Z. Dropping Z clears polarity labels since
+    polarity is measured on the vertical component.
+
     Args:
         p: Probability of applying the transform
     """
+
+    # (channels_to_drop, drops_z) — equally weighted
+    _DROP_PATTERNS = [
+        ([0],    False),  # drop E
+        ([1],    False),  # drop N
+        ([0, 1], False),  # drop E+N
+        ([2],    True),   # drop Z
+        ([0, 2], True),   # drop E+Z
+        ([1, 2], True),   # drop N+Z
+    ]
 
     def __init__(self, p: float = 0.1):
         self.p = p
@@ -528,32 +554,11 @@ class DropChannel(Transform):
         if random.random() > self.p:
             return sample
 
-        drop_z = False
-        r = random.random()
-        if r < 0.15:
-            sample.waveform[0] = 0
-        elif r < 0.30:
-            sample.waveform[1] = 0
-        elif r < 0.45:
-            sample.waveform[:2] = 0
-        elif r < 0.60:
-            sample.waveform[2] = 0
-            drop_z = True
-        elif r < 0.75:
-            sample.waveform[0] = 0
-            sample.waveform[2] = 0
-            drop_z = True
-        elif r < 0.90:
-            sample.waveform[1] = 0
-            sample.waveform[2] = 0
-            drop_z = True
-        else:
-            ch = random.randint(0, 2)
+        channels, drops_z = random.choice(self._DROP_PATTERNS)
+        for ch in channels:
             sample.waveform[ch] = 0
-            if ch == 2:
-                drop_z = True
 
-        if drop_z:
+        if drops_z:
             for target in sample.targets:
                 target.polarity = []
 
@@ -1107,8 +1112,15 @@ def default_train_transforms(
     crop_length: int = 4096,
     enable_stacking: bool = True,
     enable_noise_stacking: bool = True,
+    augment: bool = True,
 ) -> Compose:
-    """Default transforms for training."""
+    """Default transforms for training.
+
+    When augment=False, only Normalize + RandomCrop are applied (for overfit testing).
+    """
+    if not augment:
+        return Compose([Normalize(), RandomCrop(crop_length), Normalize()])
+
     transforms = [Normalize()]
 
     if enable_stacking:
@@ -1162,20 +1174,28 @@ def load_quakeflow_dataset(
     region: str = "SC",
     years: list[int] | None = None,
     days: list[int] | None = None,
+    data_files: list[str] | None = None,
     streaming: bool = False,
 ):
-    """Load QuakeFlow dataset from GCS.
+    """Load QuakeFlow dataset from GCS or local files.
 
     Args:
         region: "SC" or "NC". Comma-separated for multiple regions.
         years: List of years to load. None = all available.
         days: List of days to load. None = all days.
+        data_files: Explicit parquet file paths (local or GCS). Overrides region/years/days.
         streaming: If True, stream without downloading.
 
     Returns:
         HuggingFace Dataset object
     """
     from datasets import load_dataset
+
+    if data_files is not None:
+        # Local or explicit paths — no GCS credentials needed
+        pattern = data_files if len(data_files) > 1 else data_files[0]
+        dataset = load_dataset("parquet", data_files=pattern, streaming=streaming)
+        return dataset["train"]
 
     storage_options = get_gcs_storage_options()
     regions = [r.strip() for r in region.split(",")]
@@ -1369,6 +1389,18 @@ def _pad_crop_nx(tensors: dict[str, torch.Tensor], target_nx: int, training: boo
     return result
 
 
+
+def _validate_sample(sample: Sample, min_snr: float = 0.0) -> bool:
+    """Check that sample has valid P+S picks and meets minimum SNR."""
+    target = sample.targets[0] if sample.targets else None
+    if target is None or not target.p_picks or not target.s_picks:
+        return False
+    target.snr, target.amp_signal, target.amp_noise = calc_snr(
+        sample.waveform, target.p_picks,
+    )
+    return target.snr >= min_snr and target.snr > 0
+
+
 def _to_output(
     sample: Sample,
     label_config: LabelConfig,
@@ -1402,11 +1434,14 @@ class CEEDDataset(Dataset):
         region: "SC" or "NC"
         years: List of years to load
         days: List of days to load
+        data_files: Explicit parquet paths (overrides region/years/days)
         transforms: Transform pipeline
         label_config: Configuration for label generation
         min_snr: Minimum SNR to include sample
         buffer_size: Size of sample buffer for stacking
-        target_nx: If set, pad/crop nx dimension to this size for batching
+        group_by: How to group records — "event" for multi-station (nx=N),
+            "station" for single-station (nx=1)
+        target_nx: When group_by="event", pad/crop nx to this size for batching
         event_feature_scale: Downsampling factor for event labels along time
     """
 
@@ -1415,48 +1450,47 @@ class CEEDDataset(Dataset):
         region: str = "SC",
         years: list[int] | None = None,
         days: list[int] | None = None,
+        data_files: list[str] | None = None,
         transforms: Transform | None = None,
         label_config: LabelConfig = LabelConfig(),
         min_snr: float = 0.0,
         buffer_size: int = 1000,
+        group_by: str = "station",
         target_nx: int | None = None,
         event_feature_scale: int = 16,
-        preload: bool = False,
     ):
         self.transforms = transforms or minimal_transforms()
         self.label_config = label_config
         self.min_snr = min_snr
-        self.target_nx = target_nx
+        self.group_by = group_by
+        self.target_nx = target_nx if group_by == "event" else None
         self.event_feature_scale = event_feature_scale
 
-        hf_dataset = load_quakeflow_dataset(region, years, days, streaming=False)
-
-        # Group records by event_id → multi-station Samples
-        records_by_event: dict[str, list] = defaultdict(list)
-        for record in hf_dataset:
-            eid = record.get("event_id", "")
-            if eid:
-                records_by_event[eid].append(record)
+        hf_dataset = load_quakeflow_dataset(region, years, days, data_files=data_files, streaming=False)
 
         self.samples: list[Sample] = []
-        for eid, event_records in records_by_event.items():
-            sample = records_to_sample(event_records)
-            target = sample.targets[0] if sample.targets else None
-            if target is None or not target.p_picks or not target.s_picks:
-                continue
-
-            target.snr, target.amp_signal, target.amp_noise = calc_snr(
-                sample.waveform, target.p_picks,
-            )
-            if target.snr >= min_snr and target.snr > 0:
-                self.samples.append(sample)
+        if group_by == "station":
+            for record in hf_dataset:
+                sample = record_to_sample(record)
+                if _validate_sample(sample, min_snr):
+                    self.samples.append(sample)
+        else:
+            records_by_event: dict[str, list] = defaultdict(list)
+            for record in hf_dataset:
+                eid = record.get("event_id", "")
+                if eid:
+                    records_by_event[eid].append(record)
+            for event_records in records_by_event.values():
+                sample = records_to_sample(event_records)
+                if _validate_sample(sample, min_snr):
+                    self.samples.append(sample)
 
         self.sample_buffer = SampleBuffer(buffer_size)
         for s in random.sample(self.samples, min(buffer_size, len(self.samples))):
             self.sample_buffer.add(s)
 
         self._setup_stacking_transforms()
-        print(f"CEEDDataset: loaded {len(self.samples)} samples")
+        print(f"CEEDDataset ({group_by}): loaded {len(self.samples)} samples")
 
     def _setup_stacking_transforms(self):
         if isinstance(self.transforms, Compose):
@@ -1480,12 +1514,15 @@ class CEEDIterableDataset(IterableDataset):
         region: "SC" or "NC"
         years: List of years to load
         days: List of days to load
+        data_files: Explicit parquet paths (overrides region/years/days)
         transforms: Transform pipeline
         label_config: Configuration for label generation
         min_snr: Minimum SNR to include sample
         buffer_size: Size of sample buffer for stacking
         shuffle_buffer_size: Size of shuffle buffer
-        target_nx: If set, pad/crop nx dimension to this size for batching
+        group_by: How to group records — "event" for multi-station (nx=N),
+            "station" for single-station (nx=1)
+        target_nx: When group_by="event", pad/crop nx to this size for batching
         event_feature_scale: Downsampling factor for event labels along time
     """
 
@@ -1494,79 +1531,168 @@ class CEEDIterableDataset(IterableDataset):
         region: str = "SC",
         years: list[int] | None = None,
         days: list[int] | None = None,
+        data_files: list[str] | None = None,
         transforms: Transform | None = None,
         label_config: LabelConfig = LabelConfig(),
         min_snr: float = 0.0,
         buffer_size: int = 1000,
         shuffle_buffer_size: int = 1000,
+        group_by: str = "station",
         target_nx: int | None = None,
         event_feature_scale: int = 16,
+        # Overfit mode: "fixed" (same crop), "random" (different crops), or None
+        overfit: str | None = None,
     ):
         self.region = region
         self.years = years
         self.days = days
+        self.data_files = data_files
         self.transforms = transforms or minimal_transforms()
         self.label_config = label_config
         self.min_snr = min_snr
         self.buffer_size = buffer_size
         self.event_feature_scale = event_feature_scale
         self.shuffle_buffer_size = shuffle_buffer_size
-        self.target_nx = target_nx
+        self.group_by = group_by
+        self.target_nx = target_nx if group_by == "event" else None
+        self.overfit = overfit
 
-    def _emit_event(self, event_records: list[dict], sample_buffer: SampleBuffer) -> Sample | None:
-        """Convert buffered records for one event into a validated Sample."""
-        sample = records_to_sample(event_records)
-        target = sample.targets[0] if sample.targets else None
-        if target is None or not target.p_picks or not target.s_picks:
-            return None
-        target.snr, target.amp_signal, target.amp_noise = calc_snr(
-            sample.waveform, target.p_picks,
-        )
-        if target.snr < self.min_snr or target.snr == 0:
+    def _emit_and_buffer(self, sample: Sample, sample_buffer: SampleBuffer) -> Sample | None:
+        if not _validate_sample(sample, self.min_snr):
             return None
         sample_buffer.add(sample)
         return sample
 
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        worker_info = torch.utils.data.get_worker_info()
-
+    def _init_iter(self):
+        """Set up shared iteration state."""
         hf_dataset = load_quakeflow_dataset(
-            self.region, self.years, self.days, streaming=True
+            self.region, self.years, self.days,
+            data_files=self.data_files, streaming=self.data_files is None,
         )
-
         sample_buffer = SampleBuffer(self.buffer_size)
-
         if isinstance(self.transforms, Compose):
             for t in self.transforms.transforms:
                 if isinstance(t, (StackEvents, StackNoise)):
                     t.set_sample_fn(sample_buffer.get_random)
+        worker_info = torch.utils.data.get_worker_info()
+        return hf_dataset, sample_buffer, worker_info
 
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        if self.overfit:
+            yield from self._iter_overfit()
+            return
+        hf_dataset, sample_buffer, worker_info = self._init_iter()
+        if self.group_by == "station":
+            yield from self._iter_by_station(hf_dataset, sample_buffer, worker_info)
+        else:
+            yield from self._iter_by_event(hf_dataset, sample_buffer, worker_info)
+
+    def _iter_overfit(self) -> Iterator[dict[str, torch.Tensor]]:
+        """Overfit mode: load all samples once, then replay forever.
+
+        Caches are stored as instance attributes so they persist across
+        __iter__ calls (each epoch creates a new generator).
+
+        overfit="fixed":  cache output after transforms — same crop every step.
+        overfit="random": cache raw samples, re-apply transforms — different crops.
+        """
+        # Load samples once (first call only)
+        if not hasattr(self, "_overfit_samples"):
+            hf_dataset, sample_buffer, _ = self._init_iter()
+            self._overfit_samples = []
+            if self.group_by == "station":
+                for record in hf_dataset:
+                    if not record.get("event_id"):
+                        continue
+                    sample = record_to_sample(record)
+                    if _validate_sample(sample, self.min_snr):
+                        sample_buffer.add(sample)
+                        self._overfit_samples.append(sample)
+            else:
+                records_by_event: dict[str, list] = defaultdict(list)
+                for record in hf_dataset:
+                    eid = record.get("event_id", "")
+                    if eid:
+                        records_by_event[eid].append(record)
+                for event_records in records_by_event.values():
+                    sample = records_to_sample(event_records)
+                    if _validate_sample(sample, self.min_snr):
+                        sample_buffer.add(sample)
+                        self._overfit_samples.append(sample)
+
+            print(f"Overfit mode ({self.overfit}): cached {len(self._overfit_samples)} samples")
+
+            if self.overfit == "fixed":
+                self._overfit_outputs = []
+                for s in self._overfit_samples:
+                    s = self.transforms(s.copy())
+                    self._overfit_outputs.append(_to_output(s, self.label_config, self.event_feature_scale, self.target_nx, training=True))
+
+        if self.overfit == "fixed":
+            while True:
+                for output in self._overfit_outputs:
+                    yield output
+        else:
+            while True:
+                for sample in self._overfit_samples:
+                    s = self.transforms(sample.copy())
+                    yield _to_output(s, self.label_config, self.event_feature_scale, self.target_nx, training=True)
+
+    def _flush_and_yield(self, shuffle_buffer: list[Sample]) -> Iterator[dict[str, torch.Tensor]]:
+        """Transform, convert to output, and yield all samples in buffer."""
+        random.shuffle(shuffle_buffer)
+        for s in shuffle_buffer:
+            s = self.transforms(s.copy())
+            yield _to_output(s, self.label_config, self.event_feature_scale, self.target_nx, training=True)
+
+    def _iter_by_station(self, hf_dataset, sample_buffer, worker_info):
+        """Each record → single-station Sample (nx=1). No grouping needed."""
         shuffle_buffer: list[Sample] = []
+        count = 0
 
-        # Buffer records by event_id, emit when event changes
+        for record in hf_dataset:
+            if not record.get("event_id"):
+                continue
+            if worker_info is not None and count % worker_info.num_workers != worker_info.id:
+                count += 1
+                continue
+            count += 1
+
+            sample = self._emit_and_buffer(record_to_sample(record), sample_buffer)
+            if sample is not None:
+                shuffle_buffer.append(sample)
+
+            if len(shuffle_buffer) >= self.shuffle_buffer_size:
+                yield from self._flush_and_yield(shuffle_buffer)
+                shuffle_buffer.clear()
+
+        if shuffle_buffer:
+            yield from self._flush_and_yield(shuffle_buffer)
+
+    def _iter_by_event(self, hf_dataset, sample_buffer, worker_info):
+        """Group records by event_id → multi-station Sample (nx=N)."""
+        shuffle_buffer: list[Sample] = []
+        count = 0
         current_event_id = None
         current_event_records: list[dict] = []
-        event_count = 0
 
-        for i, record in enumerate(hf_dataset):
+        for record in hf_dataset:
             eid = record.get("event_id", "")
             if not eid:
                 continue
 
             if eid != current_event_id:
-                # Emit previous event
                 if current_event_records:
-                    # Distribute events across workers
-                    if worker_info is None or event_count % worker_info.num_workers == worker_info.id:
-                        sample = self._emit_event(current_event_records, sample_buffer)
+                    if worker_info is None or count % worker_info.num_workers == worker_info.id:
+                        sample = self._emit_and_buffer(
+                            records_to_sample(current_event_records), sample_buffer
+                        )
                         if sample is not None:
                             shuffle_buffer.append(sample)
-                    event_count += 1
+                    count += 1
 
                     if len(shuffle_buffer) >= self.shuffle_buffer_size:
-                        random.shuffle(shuffle_buffer)
-                        for s in shuffle_buffer:
-                            yield self._process_sample(s.copy())
+                        yield from self._flush_and_yield(shuffle_buffer)
                         shuffle_buffer.clear()
 
                 current_event_id = eid
@@ -1576,19 +1702,15 @@ class CEEDIterableDataset(IterableDataset):
 
         # Emit last event
         if current_event_records:
-            if worker_info is None or event_count % worker_info.num_workers == worker_info.id:
-                sample = self._emit_event(current_event_records, sample_buffer)
+            if worker_info is None or count % worker_info.num_workers == worker_info.id:
+                sample = self._emit_and_buffer(
+                    records_to_sample(current_event_records), sample_buffer
+                )
                 if sample is not None:
                     shuffle_buffer.append(sample)
 
         if shuffle_buffer:
-            random.shuffle(shuffle_buffer)
-            for s in shuffle_buffer:
-                yield self._process_sample(s.copy())
-
-    def _process_sample(self, sample: Sample) -> dict[str, torch.Tensor]:
-        sample = self.transforms(sample)
-        return _to_output(sample, self.label_config, self.event_feature_scale, self.target_nx, training=True)
+            yield from self._flush_and_yield(shuffle_buffer)
 
 
 # =============================================================================
@@ -1599,6 +1721,7 @@ def create_train_dataset(
     region: str = "SC",
     years: list[int] | None = None,
     days: list[int] | None = None,
+    data_files: list[str] | None = None,
     crop_length: int = 4096,
     streaming: bool = False,
     **kwargs,
@@ -1608,11 +1731,13 @@ def create_train_dataset(
 
     if streaming:
         return CEEDIterableDataset(
-            region=region, years=years, days=days, transforms=transforms, **kwargs,
+            region=region, years=years, days=days, data_files=data_files,
+            transforms=transforms, **kwargs,
         )
     else:
         return CEEDDataset(
-            region=region, years=years, days=days, transforms=transforms, **kwargs,
+            region=region, years=years, days=days, data_files=data_files,
+            transforms=transforms, **kwargs,
         )
 
 
@@ -1620,6 +1745,7 @@ def create_eval_dataset(
     region: str = "SC",
     years: list[int] | None = None,
     days: list[int] | None = None,
+    data_files: list[str] | None = None,
     crop_length: int = 4096,
     streaming: bool = False,
     **kwargs,
@@ -1629,11 +1755,13 @@ def create_eval_dataset(
 
     if streaming:
         return CEEDIterableDataset(
-            region=region, years=years, days=days, transforms=transforms, **kwargs,
+            region=region, years=years, days=days, data_files=data_files,
+            transforms=transforms, **kwargs,
         )
     else:
         return CEEDDataset(
-            region=region, years=years, days=days, transforms=transforms, **kwargs,
+            region=region, years=years, days=days, data_files=data_files,
+            transforms=transforms, **kwargs,
         )
 
 

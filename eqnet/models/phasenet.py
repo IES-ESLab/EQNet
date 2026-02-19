@@ -23,21 +23,15 @@ from .unet import Unet
 # Minimal Seismic UNet Configuration
 # =============================================================================
 
-# Default config for seismic data (3, 1, nt) - memory efficient
+# Seismic config: single station, 3-channel (ENZ), 1D temporal
+# channels/phase_channels match Unet defaults but kept explicit for clarity
 SEISMIC_UNET_CONFIG = dict(
-    dim=32,
-    dim_mults=(1, 2, 4, 8),
-    num_resnet_blocks=1,
-    attn_heads=4,
-    attn_dim_head=32,
-    layer_attns=False,  # disable attention for efficiency
-    memory_efficient=True,
-    init_cross_embed=False,  # simpler init conv
-    final_resnet_block=False,  # skip final resnet for efficiency
-    space_stride=1,  # no spatial downsampling (single station)
-    time_stride=4,  # temporal downsampling
-    space_kernel=1,
-    time_kernel=7,
+    dim=16,
+    channels=3,
+    phase_channels=3,
+    # pre-configured for add_stft=True (100Hz seismic: 33 -> 16 freq bins)
+    stft_n_fft=33,
+    stft_dim_divisor=2,
 )
 
 
@@ -291,8 +285,6 @@ class PhaseNet(nn.Module):
         # Build backbone with seismic-optimized defaults
         backbone_kwargs = {
             **SEISMIC_UNET_CONFIG,  # minimal seismic defaults
-            "channels": 3,
-            "phase_channels": 3,
             "log_scale": log_scale,
             "add_stft": add_stft,
             "add_polarity": add_polarity,
@@ -307,7 +299,7 @@ class PhaseNet(nn.Module):
             raise ValueError(f"Unknown backbone: {backbone}. Use 'unet'.")
 
         # Compute embed_dim from dim_mults
-        dim = backbone_kwargs.get("dim", 32)
+        dim = backbone_kwargs.get("dim", 16)
         dim_mults = backbone_kwargs.get("dim_mults", (1, 2, 4, 8))
         embed_dim = dim * dim_mults[-1]  # mid_dim for prompt
 
@@ -347,6 +339,8 @@ class PhaseNet(nn.Module):
         # Move to device
         if phase_pick is not None:
             phase_pick = phase_pick.to(self.device)
+        if phase_mask is not None:
+            phase_mask = phase_mask.to(self.device)
         if polarity is not None:
             polarity = polarity.to(self.device)
         if polarity_mask is not None:
@@ -366,7 +360,7 @@ class PhaseNet(nn.Module):
         output = {"loss": 0.0}
 
         # Phase picking
-        phase_logits, loss_phase = self.phase_head(features["phase"], phase_pick)
+        phase_logits, loss_phase = self.phase_head(features["phase"], phase_pick, phase_mask)
         output["phase"] = phase_logits
         if loss_phase is not None:
             output["loss_phase"] = loss_phase
@@ -386,19 +380,19 @@ class PhaseNet(nn.Module):
         if self.add_stft and "spectrogram" in features:
             output["spectrogram"] = features["spectrogram"]
 
-        # Event detection
-        if self.add_event and "event" in features:
+        # Event detection (separate heads for center detection vs time regression)
+        if self.add_event and "event_center" in features:
             event_logits, loss_event_center = self.event_head.forward_center(
-                features["event"], event_center, event_center_mask
+                features["event_center"], event_center, event_center_mask
             )
             output["event_center"] = event_logits
             if loss_event_center is not None:
                 output["loss_event_center"] = loss_event_center * self.event_center_loss_weight
                 output["loss"] = output["loss"] + loss_event_center * self.event_center_loss_weight
 
-            # Event time regression (reuse event features, scaled)
+            # Event time regression (separate head, scaled)
             event_time_pred, loss_event_time = self.event_head.forward_time(
-                features["event"] * 1000.0, event_time, event_time_mask
+                features["event_time"] * 1000.0, event_time, event_time_mask
             )
             output["event_time"] = event_time_pred
             if loss_event_time is not None:

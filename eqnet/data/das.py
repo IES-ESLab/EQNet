@@ -292,21 +292,6 @@ class Identity(Transform):
         return sample
 
 
-class RandomApply(Transform):
-    """Randomly apply a transform with given probability."""
-
-    def __init__(self, transform: Transform, p: float = 0.5):
-        self.transform = transform
-        self.p = p
-
-    def __call__(self, sample: Sample) -> Sample:
-        if random.random() < self.p:
-            return self.transform(sample)
-        return sample
-
-    def __repr__(self) -> str:
-        return f"RandomApply({self.transform}, p={self.p})"
-
 
 # -----------------------------------------------------------------------------
 # Basic Waveform Transforms
@@ -344,28 +329,35 @@ class Normalize(Transform):
 
 
 class MedianFilter(Transform):
-    """Remove median along spatial axis (common-mode rejection)."""
+    """Remove median along spatial axis (common-mode rejection).
+
+    Args:
+        p: Probability of applying
+    """
+
+    def __init__(self, p: float = 1.0):
+        self.p = p
 
     def __call__(self, sample: Sample) -> Sample:
+        if random.random() > self.p:
+            return sample
         sample.waveform = sample.waveform - np.median(sample.waveform, axis=-2, keepdims=True)
         return sample
 
     def __repr__(self) -> str:
-        return "MedianFilter()"
+        return f"MedianFilter(p={self.p})"
 
 
 class HighpassFilter(Transform):
     """Apply highpass filter to waveform."""
 
     def __init__(self, freq: float = 1.0, sampling_rate: float = DEFAULT_SAMPLING_RATE):
-        from scipy import signal
         self.freq = freq
         self.sampling_rate = sampling_rate
-        self.b, self.a = signal.butter(2, freq, "hp", fs=sampling_rate)
+        self.sos = scipy.signal.butter(4, freq, btype='high', fs=sampling_rate, output='sos')
 
     def __call__(self, sample: Sample) -> Sample:
-        from scipy import signal
-        sample.waveform = signal.filtfilt(self.b, self.a, sample.waveform, axis=-1).astype(np.float32)
+        sample.waveform = scipy.signal.sosfilt(self.sos, sample.waveform, axis=-1).astype(np.float32)
         return sample
 
     def __repr__(self) -> str:
@@ -380,19 +372,17 @@ class RandomCrop(Transform):
     """Randomly crop waveform to fixed size, adjusting picks via Target.crop().
 
     If the data is smaller than the target size, it is padded with reflection.
+    When picks exist, a random pick is chosen and the crop window is constrained
+    to include it, guaranteeing every crop contains at least one pick.
 
     Args:
         nt: Target time samples
         nx: Target spatial samples
-        min_label_sum: Minimum sum of phase labels to accept crop
-        max_tries: Maximum attempts to find valid crop
     """
 
-    def __init__(self, nt: int = 3072, nx: int = 5120, min_label_sum: float = 0.0, max_tries: int = 100):
+    def __init__(self, nt: int = 3072, nx: int = 5120):
         self.nt = nt
         self.nx = nx
-        self.min_label_sum = min_label_sum
-        self.max_tries = max_tries
 
     def _pad_if_needed(self, sample: Sample) -> Sample:
         """Pad waveform with reflection if smaller than target."""
@@ -418,31 +408,28 @@ class RandomCrop(Transform):
         if nt_orig <= self.nt and nx_orig <= self.nx:
             return sample
 
-        best_t0, best_x0 = 0, 0
-        best_sum = 0
+        all_picks = [
+            (ch, t) for target in sample.targets
+            for ch, t in target.p_picks + target.s_picks
+        ]
 
-        for _ in range(self.max_tries):
-            t0 = random.randint(0, max(0, nt_orig - self.nt))
+        if all_picks:
+            ch_ref, t_ref = random.choice(all_picks)
+            ch_ref, t_ref = int(ch_ref), int(t_ref)
+            x0_lo = max(0, ch_ref - self.nx + 1)
+            x0_hi = min(nx_orig - self.nx, ch_ref)
+            t0_lo = max(0, t_ref - self.nt + 1)
+            t0_hi = min(nt_orig - self.nt, t_ref)
+            x0 = random.randint(x0_lo, max(x0_lo, x0_hi))
+            t0 = random.randint(t0_lo, max(t0_lo, t0_hi))
+        else:
             x0 = random.randint(0, max(0, nx_orig - self.nx))
+            t0 = random.randint(0, max(0, nt_orig - self.nt))
 
-            pick_sum = sum(
-                1 for target in sample.targets
-                for ch, t in target.p_picks + target.s_picks
-                if x0 <= ch < x0 + self.nx and t0 <= t < t0 + self.nt
-            )
-
-            if pick_sum > best_sum:
-                best_sum = pick_sum
-                best_t0, best_x0 = t0, x0
-
-            if pick_sum >= self.min_label_sum:
-                break
-
-        # Apply crop: waveform is (nch, nx, nt)
-        sample.waveform = sample.waveform[:, best_x0:best_x0 + self.nx, best_t0:best_t0 + self.nt].copy()
+        sample.waveform = sample.waveform[:, x0:x0 + self.nx, t0:t0 + self.nt].copy()
 
         for target in sample.targets:
-            target.crop(best_t0, self.nt, best_x0, self.nx)
+            target.crop(t0, self.nt, x0, self.nx)
         sample.targets = [t for t in sample.targets if not t.is_empty]
 
         return sample
@@ -941,8 +928,15 @@ def default_train_transforms(
     enable_resample_time: bool = False,
     enable_resample_space: bool = False,
     enable_masking: bool = True,
+    augment: bool = True,
 ) -> Compose:
-    """Default transforms for DAS training."""
+    """Default transforms for DAS training.
+
+    When augment=False, only Normalize + RandomCrop are applied (for overfit testing).
+    """
+    if not augment:
+        return Compose([Normalize(), RandomCrop(nt=nt, nx=nx), Normalize()])
+
     transforms = [Normalize()]
 
     if enable_resample_time:
@@ -969,7 +963,7 @@ def default_train_transforms(
 
     transforms.extend([
         RandomBandpass(p=0.3),
-        RandomApply(MedianFilter(), p=0.5),
+        MedianFilter(p=0.5),
         Normalize(),  # Final normalization
     ])
 
@@ -1114,7 +1108,7 @@ def read_PASSCAL_segy(fid, nTraces=1250, nSample=900000, TraceOff=0, strain_rate
     return data
 
 
-def padding(data: torch.Tensor, min_nx: int = 1024, min_nt: int = 1024) -> torch.Tensor:
+def padding(data: torch.Tensor, min_nx: int = 256, min_nt: int = 256) -> torch.Tensor:
     """Pad data to multiples of min_nx and min_nt.
 
     Args:
@@ -1290,8 +1284,8 @@ class DASIterableDataset(IterableDataset):
         suffix="",
         nt=1024 * 3,
         nx=1024 * 5,
-        min_nt=1024,
-        min_nx=1024,
+        min_nt=256,
+        min_nx=256,
         # Training
         training=False,
         phases=["P", "S"],
@@ -1302,6 +1296,8 @@ class DASIterableDataset(IterableDataset):
         transforms: Transform | None = None,
         label_config: LabelConfig = LabelConfig(),
         buffer_size: int = 100,
+        # Overfit mode: "fixed" (same crop), "random" (different crops), or None
+        overfit: str | None = None,
         # Inference
         skip_existing=False,
         pick_path="./",
@@ -1359,6 +1355,7 @@ class DASIterableDataset(IterableDataset):
         self.phases = phases
         self.label_config = label_config
         self.num_patch = num_patch
+        self.overfit = overfit
         self.event_feature_scale = event_feature_scale
         self.highpass_filter = highpass_filter
         self.skip_existing = skip_existing
@@ -1564,6 +1561,10 @@ class DASIterableDataset(IterableDataset):
 
     def _sample_training(self, file_list):
         """Training sample generator using transform pipeline."""
+        if self.overfit:
+            yield from self._sample_training_overfit(file_list)
+            return
+
         while True:
             file_list = np.random.permutation(file_list)
             for label_file in file_list:
@@ -1580,6 +1581,43 @@ class DASIterableDataset(IterableDataset):
                     output = self._sample_to_output(s)
                     output["file_name"] = sample.file_name + f"_{ii:02d}"
                     yield output
+
+    def _sample_training_overfit(self, file_list):
+        """Overfit mode: cache samples and replay them.
+
+        Caches are stored as instance attributes so they persist across
+        __iter__ calls (each epoch creates a new generator).
+
+        overfit="fixed":  cache output after transforms — same crop every step.
+        overfit="random": cache raw samples, re-apply transforms — different crops.
+        """
+        # Load samples once (first call only)
+        if not hasattr(self, "_overfit_samples"):
+            self._overfit_samples = []
+            for label_file in file_list:
+                sample = self._load_sample(label_file)
+                if sample is not None:
+                    self.sample_buffer.add(sample)
+                    self._overfit_samples.append(sample)
+            print(f"Overfit mode ({self.overfit}): cached {len(self._overfit_samples)} samples")
+
+            if self.overfit == "fixed":
+                self._overfit_outputs = []
+                for sample in self._overfit_samples:
+                    s = sample.copy()
+                    s = self.transforms(s)
+                    self._overfit_outputs.append(self._sample_to_output(s))
+
+        if self.overfit == "fixed":
+            while True:
+                for output in self._overfit_outputs:
+                    yield output
+        else:
+            while True:
+                for sample in self._overfit_samples:
+                    s = sample.copy()
+                    s = self.transforms(s)
+                    yield self._sample_to_output(s)
 
     def _sample_inference(self, file_list):
         """Inference sample generator supporting multiple formats."""

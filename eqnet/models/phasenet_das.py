@@ -8,16 +8,21 @@ Inherits from PhaseNet with DAS-specific configuration:
 from .phasenet import PhaseNet
 
 
-# DAS-specific UNet configuration overrides
+# DAS config: single channel, 2D spatial-temporal
+# Includes pre-configured values for optional features when enabled
 DAS_UNET_CONFIG = dict(
-    dim=8,  # reduced from 32 for faster training
-    channels=1,  # DAS is single channel
-    phase_channels=3,  # P, S, Noise
-    # DAS: downsample both space and time with stride 4
-    space_stride=4,
+    dim=8,
+    channels=1,
+    phase_channels=3,
+    time_kernel=7,
     time_stride=4,
     space_kernel=7,
-    time_kernel=7,
+    space_stride=4,
+    init_conv_space_kernel=7,
+    final_conv_space_kernel=3,
+    # pre-configured for init_cross_embed=True / cross_embed_downsample=True
+    init_cross_embed_space_kernel_sizes=(3, 7, 15),
+    cross_embed_downsample_space_kernel_sizes=(4, 8),
 )
 
 

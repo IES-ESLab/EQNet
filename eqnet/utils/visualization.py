@@ -62,257 +62,131 @@ def plot_autoencoder_das_train(meta, preds, epoch, figure_dir="figures"):
         plt.close(fig)
 
 
+def _das_phase_rgb(phase_pick, mask=None):
+    """Convert (nx, nt, 3) phase labels to RGB image (nt, nx, 3).
+
+    Channels: 0=noise, 1=P, 2=S. Display: P=red, S=blue, mask=green tint.
+    Transposes (nx, nt) -> (nt, nx) for display (time on y-axis).
+    """
+    p = phase_pick[:, :, 1].T  # (nt, nx)
+    s = phase_pick[:, :, 2].T
+    rgb = np.ones((*p.shape, 3))
+    rgb[:, :, 1] = np.clip(1.0 - p * 0.7, 0, 1)  # P -> red
+    rgb[:, :, 2] = np.clip(1.0 - p * 0.7, 0, 1)
+    rgb[:, :, 0] = np.clip(rgb[:, :, 0] - s * 0.7, 0, 1)  # S -> blue
+    rgb[:, :, 1] = np.clip(rgb[:, :, 1] - s * 0.7, 0, 1)
+    if mask is not None:
+        m = mask[:, :, 0].T if mask.ndim == 3 else mask.T
+        rgb[:, :, 0] = np.where(m > 0, rgb[:, :, 0] * 0.85, rgb[:, :, 0])
+        rgb[:, :, 2] = np.where(m > 0, rgb[:, :, 2] * 0.85, rgb[:, :, 2])
+    return rgb
+
+
 def plot_phasenet_das_train(meta, phase_pick, epoch, figure_dir="figures", dt=0.01, dx=10, prefix=""):
 
-    data = meta["data"].cpu().numpy().squeeze(1) # nb, nc, nx, nt
+    data = meta["data"].cpu().numpy().squeeze(1)  # (nb, nx, nt)
     nb, nx, nt = data.shape
 
     if phase_pick is not None:
-        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)
+        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)  # (nb, nx, nt, 3)
 
     if "phase_pick" in meta:
-        y_phase_pick = meta["phase_pick"].cpu().numpy()
-        y_phase_pick = y_phase_pick.transpose(0, 2, 3, 1)
+        y_phase_pick = meta["phase_pick"].cpu().numpy().transpose(0, 2, 3, 1)
     if "phase_mask" in meta:
-        y_phase_mask = meta["phase_mask"].cpu().numpy()
-        y_phase_mask = y_phase_mask.transpose(0, 2, 3, 1)
-    
+        y_phase_mask = meta["phase_mask"].cpu().numpy().transpose(0, 2, 3, 1)
+    else:
+        y_phase_mask = None
+
+    imshow_kwargs = dict(aspect="auto", interpolation="nearest")
+
     for i in range(nb):
+        waveform = data[i].T  # (nt, nx) — time on y-axis
+        vmax = np.percentile(np.abs(waveform), 95) or 1.0
 
-        dx = meta["dx_m"][i]
-        dt = meta["dt_s"][i]
+        fig, axes = plt.subplots(1, 3, figsize=(14, 5))
 
-        fig, ax = plt.subplots(1, 3, figsize=(10, 4), squeeze=False, sharex=True, sharey=True)
-        # fig, ax = plt.subplots(2, 3, figsize=(10, 7), squeeze=False, sharex=True, sharey=True)
+        # [1] DAS waveform
+        axes[0].imshow(waveform, cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
+        axes[0].set_title(f"Data ({meta['file_name'][i]})")
+        axes[0].set_ylabel("Time Sample")
+        axes[0].set_xlabel("Channel")
 
-        ax[0, 0].imshow(
-            data[i] - np.mean(data[i], axis=-1, keepdims=True) / np.std(data[i], axis=-1, keepdims=True),
-            vmin=-6,
-            vmax=6,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            cmap="seismic",
-            aspect="auto",
-        )
-        ax[0, 0].set_xlabel("Time (s)")
-        ax[0, 0].set_ylabel("Distance (km)")
-        ax[0, 0].set_title(f"Data ({meta['file_name'][i]})")
+        # [2] Label (P=red, S=blue, mask=green tint)
+        mask_i = y_phase_mask[i] if y_phase_mask is not None else None
+        label_rgb = _das_phase_rgb(y_phase_pick[i], mask=mask_i)
+        axes[1].imshow(label_rgb, **imshow_kwargs)
+        axes[1].set_title("Label")
+        axes[1].set_xlabel("Channel")
 
-        ax[0, 1].imshow(
-            y_phase_pick[i][...,[1, 2, 0]],
-            vmin=0,
-            vmax=1,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-        )
-        ax[0, 1].set_xlabel("Time (s)")
-        # ax[0, 1].set_ylabel("Distance (km)")
-        ax[0, 1].set_title("Noisy Label")
-
-        ax[0, 2].imshow(
-            phase_pick[i][...,[1, 2, 0]],
-            vmin=0,
-            vmax=1,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-        )
-        ax[0, 2].set_xlabel("Time (s)")
-        # ax[0, 2].set_ylabel("Distance (km)")
-        ax[0, 2].set_title("Prediction")
-
-        # ## debuging
-        # ax[1, 0].imshow(
-        #     meta["phase_mask"][i][0, :, :],
-        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
-        #     aspect="auto",
-        #     interpolation="none",
-        # )
-
-        # ax[1, 1].imshow(
-        #     meta["event_center_mask"][i][0, :, :],
-        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
-        #     aspect="auto",
-        #     interpolation="none",
-        # )
-
-        # ax[1, 2].imshow(
-        #     meta["event_time_mask"][i][0, :, :],
-        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
-        #     aspect="auto",
-        #     interpolation="none",
-        # )
+        # [3] Prediction
+        pred_rgb = _das_phase_rgb(phase_pick[i])
+        axes[2].imshow(pred_rgb, **imshow_kwargs)
+        axes[2].set_title("Prediction")
+        axes[2].set_xlabel("Channel")
 
         fig.tight_layout()
-
-        if "RANK" in os.environ:
-            rank = int(os.environ["RANK"])
-            fig.savefig(f"{figure_dir}/{epoch:02d}_{rank:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
-        else:
-            fig.savefig(f"{figure_dir}/{epoch:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
-
+        rank_str = f"_{int(os.environ['RANK']):02d}" if "RANK" in os.environ else ""
+        fig.savefig(f"{figure_dir}/{epoch:02d}{rank_str}_{i:02d}_{prefix}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-def plot_phasenet_das_plus_train(meta, phase_pick, polarity, event_center, event_time, epoch, figure_dir="figures", prefix=""):
-    
-    data = meta["data"].cpu().numpy().squeeze(1) # nb, nc, nx, nt
+def plot_phasenet_das_plus_train(meta, phase_pick, event_center, epoch, figure_dir="figures", prefix="", **kwargs):
+
+    data = meta["data"].cpu().numpy().squeeze(1)  # (nb, nx, nt)
     nb, nx, nt = data.shape
 
     if phase_pick is not None:
-        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)
-    if polarity is not None:
-        polarity = polarity.cpu().numpy().transpose(0, 2, 3, 1)
+        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)  # (nb, nx, nt, 3)
     if event_center is not None:
         nx_, nt_ = event_center.shape[-2:]
         if nx_ != nx:
             event_center = F.interpolate(event_center, size=(nx, nt_), mode="bilinear", align_corners=False)
         event_center = event_center.cpu().numpy().transpose(0, 2, 3, 1)
-    if event_time is not None:
-        nx_, nt_ = event_time.shape[-2:]
-        if nx_ != nx:
-            event_time = F.interpolate(event_time, size=(nx, nt_), mode="bilinear", align_corners=False)
-        event_time = event_time.cpu().numpy().transpose(0, 2, 3, 1)
 
-    if "phase_pick" in meta:
-        y_phase_pick = meta["phase_pick"].cpu().numpy()
-        y_phase_pick = y_phase_pick.transpose(0, 2, 3, 1)
-    if "phase_mask" in meta:
-        y_phase_mask = meta["phase_mask"].cpu().numpy()
-        y_phase_mask = y_phase_mask.transpose(0, 2, 3, 1)
-    if "event_center" in meta:
-        y_event_center = meta["event_center"].cpu().numpy()
-        y_event_center = y_event_center.transpose(0, 2, 3, 1)
-    if "event_time" in meta:
-        y_event_time = meta["event_time"].cpu().numpy()
-        y_event_time = y_event_time.transpose(0, 2, 3, 1)
-    # if "event_mask" in meta:
-    #     y_event_mask = meta["event_mask"].cpu().numpy()
-    #     y_event_mask = y_event_mask.transpose(0, 2, 3, 1)
-    # if "event_center_mask" in meta:
-    #     y_event_center_mask = meta["event_center_mask"].cpu().numpy()
-    #     y_event_center_mask = y_event_center_mask.transpose(0, 2, 3, 1)
-    if "event_time_mask" in meta:
-        y_event_time_mask = meta["event_time_mask"].cpu().numpy()
-        y_event_time_mask = y_event_time_mask.transpose(0, 2, 3, 1)
-    if "polarity" in meta:
-        y_polarity = meta["polarity"].cpu().numpy()
-        y_polarity = y_polarity.transpose(0, 2, 3, 1)
+    y_phase_pick = meta["phase_pick"].cpu().numpy().transpose(0, 2, 3, 1) if "phase_pick" in meta else None
+    y_phase_mask = meta["phase_mask"].cpu().numpy().transpose(0, 2, 3, 1) if "phase_mask" in meta else None
+    y_event_center = meta["event_center"].cpu().numpy().transpose(0, 2, 3, 1) if "event_center" in meta else None
+
+    imshow_kwargs = dict(aspect="auto", interpolation="nearest")
 
     for i in range(nb):
+        waveform = data[i].T  # (nt, nx)
+        vmax = np.percentile(np.abs(waveform), 95) or 1.0
 
-        dx = meta["dx_m"][i]
-        dt = meta["dt_s"][i]
+        fig, axes = plt.subplots(2, 3, figsize=(14, 8))
 
-        fig, ax = plt.subplots(2, 3, figsize=(10, 6), sharex=True, sharey=True)
-        # fig, ax = plt.subplots(3, 3, figsize=(10, 10), sharex=True, sharey=True)
+        # Row 1: Waveform, Phase Label, Phase Prediction
+        axes[0, 0].imshow(waveform, cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
+        axes[0, 0].set_title(f"Data ({meta['file_name'][i]})")
+        axes[0, 0].set_ylabel("Time Sample")
 
-        ax[0, 0].imshow(
-            data[i] - np.mean(data[i], axis=-1, keepdims=True) / np.std(data[i], axis=-1, keepdims=True),
-            vmin=-6,
-            vmax=6,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            cmap="seismic",
-            aspect="auto",
-        )
-        # ax[0, 0].set_xlabel("Time (s)")
-        ax[0, 0].set_ylabel("Distance (km)")
-        ax[0, 0].set_title(f"Data ({meta['file_name'][i]})")
+        mask_i = y_phase_mask[i] if y_phase_mask is not None else None
+        if y_phase_pick is not None:
+            axes[0, 1].imshow(_das_phase_rgb(y_phase_pick[i], mask=mask_i), **imshow_kwargs)
+        axes[0, 1].set_title("Phase Label")
 
-        ax[0, 1].imshow(
-            y_phase_pick[i][...,[1, 2, 0]],
-            vmin=0,
-            vmax=1,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-        )
-        # ax[0, 1].set_xlabel("Time (s)")
-        # ax[0, 1].set_ylabel("Distance (km)")
-        ax[0, 1].set_title("Noisy Label")
+        if phase_pick is not None:
+            axes[0, 2].imshow(_das_phase_rgb(phase_pick[i]), **imshow_kwargs)
+        axes[0, 2].set_title("Phase Prediction")
 
-        ax[0, 2].imshow(
-            phase_pick[i][...,[1, 2, 0]],
-            vmin=0,
-            vmax=1,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-        )
-        # ax[0, 2].set_xlabel("Time (s)")
-        # ax[0, 2].set_ylabel("Distance (km)")
-        ax[0, 2].set_title("Prediction")
+        # Row 2: empty, Event Center Label, Event Center Prediction
+        axes[1, 0].axis("off")
 
-        vmax = np.max(np.abs((event_time[i] - y_event_time[i]) * y_event_time_mask[i]))
-        vmin = -vmax
-        ax[1, 0].imshow(
-            (event_time[i] - y_event_time[i]) * y_event_time_mask[i],
-            vmin=vmin,
-            vmax=vmax,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-            cmap="seismic",
-        )
-        # ax[1, 0].legend(f"Time Error: {vmax:.2f} s")
-        ax[1, 0].text(0.02, 0.98, f"Time Error: {vmax/100:.2f} s", ha="left", va="top", transform=ax[1, 0].transAxes)
-        ax[1, 0].set_xlabel("Time (s)")
-        ax[1, 0].set_ylabel("Distance (km)")
-        # ax[1, 0].set_title("Time Error") 
+        if y_event_center is not None:
+            ec_label = y_event_center[i][:, :, 0].T  # (nt, nx)
+            axes[1, 1].imshow(ec_label, vmin=0, vmax=1, cmap="hot", **imshow_kwargs)
+        axes[1, 1].set_title("Event Center Label")
+        axes[1, 1].set_ylabel("Time Sample")
+        axes[1, 1].set_xlabel("Channel")
 
-        ax[1, 1].imshow(
-            y_event_center[i],
-            vmin=0,
-            vmax=1,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-        )
-        ax[1, 1].set_xlabel("Time (s)")
-        # ax[1, 1].set_ylabel("Distance (km)")
-        # ax[1, 1].set_title("Noisy Label")
-
-        ax[1, 2].imshow(
-            event_center[i],
-            vmin=0,
-            vmax=1,
-            extent=(0, nx * dx / 1e3, 0, nt * dt),
-            interpolation="none",
-            aspect="auto",
-        )
-        ax[1, 2].set_xlabel("Time (s)")
-        # ax[1, 2].set_ylabel("Distance (km)")
-        # ax[1, 2].set_title("Prediction")
-
-        # ## debuging
-        # ax[2, 0].imshow(
-        #     meta["phase_mask"][i][0, :, :],
-        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
-        #     aspect="auto",
-        #     interpolation="none",
-        # )
-        # ax[2, 1].imshow(
-        #     meta["event_center_mask"][i][0, :, :],
-        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
-        #     aspect="auto",
-        #     interpolation="none",
-        # )
-        # ax[2, 2].imshow(
-        #     meta["event_time_mask"][i][0, :, :],
-        #     extent=(0, nx * dx / 1e3, 0, nt * dt),
-        #     aspect="auto",
-        #     interpolation="none",
-        # )
+        if event_center is not None:
+            ec_pred = event_center[i][:, :, 0].T  # (nt, nx)
+            axes[1, 2].imshow(ec_pred, vmin=0, vmax=1, cmap="hot", **imshow_kwargs)
+        axes[1, 2].set_title("Event Center Prediction")
+        axes[1, 2].set_xlabel("Channel")
 
         fig.tight_layout()
-
-        if "RANK" in os.environ:
-            rank = int(os.environ["RANK"])
-            fig.savefig(f"{figure_dir}/{epoch:02d}_{rank:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
-        else:
-            fig.savefig(f"{figure_dir}/{epoch:02d}_{i:02d}_{prefix}.png", dpi=300, bbox_inches="tight")
-
+        rank_str = f"_{int(os.environ['RANK']):02d}" if "RANK" in os.environ else ""
+        fig.savefig(f"{figure_dir}/{epoch:02d}{rank_str}_{i:02d}_{prefix}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
 
@@ -496,7 +370,7 @@ def plot_phasenet_plus_train(
         axes[k + 1].grid("on")
 
         t = torch.arange(nt_event) * dt_event
-        t_label = torch.arange(meta["event_center"].shape[-1]) * dt
+        t_label = torch.arange(meta["event_center"].shape[-1]) * dt_event
         axes[k + 2].plot(t, event_center[i, 0, 0, :], "b")
         axes[k + 2].plot(t_label, meta["event_center"][i, 0, 0, :], "--C0")
         axes[k + 2].plot(t_label, meta["event_center_mask"][i, 0, 0, :], ":", color="gray")
