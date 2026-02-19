@@ -82,107 +82,167 @@ def _das_phase_rgb(phase_pick, mask=None):
     return rgb
 
 
-def plot_phasenet_das_train(meta, phase_pick, epoch, figure_dir="figures", dt=0.01, dx=10, prefix=""):
+def plot_phasenet_das_train(meta, phase_pick, epoch=0, figure_dir="figures", prefix="", **kwargs):
 
-    data = meta["data"].cpu().numpy().squeeze(1)  # (nb, nx, nt)
-    nb, nx, nt = data.shape
-
-    if phase_pick is not None:
-        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)  # (nb, nx, nt, 3)
-
-    if "phase_pick" in meta:
-        y_phase_pick = meta["phase_pick"].cpu().numpy().transpose(0, 2, 3, 1)
-    if "phase_mask" in meta:
-        y_phase_mask = meta["phase_mask"].cpu().numpy().transpose(0, 2, 3, 1)
-    else:
-        y_phase_mask = None
-
-    imshow_kwargs = dict(aspect="auto", interpolation="nearest")
-
-    for i in range(nb):
-        waveform = data[i].T  # (nt, nx) — time on y-axis
-        vmax = np.percentile(np.abs(waveform), 95) or 1.0
-
-        fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-
-        # [1] DAS waveform
-        axes[0].imshow(waveform, cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
-        axes[0].set_title(f"Data ({meta['file_name'][i]})")
-        axes[0].set_ylabel("Time Sample")
-        axes[0].set_xlabel("Channel")
-
-        # [2] Label (P=red, S=blue, mask=green tint)
-        mask_i = y_phase_mask[i] if y_phase_mask is not None else None
-        label_rgb = _das_phase_rgb(y_phase_pick[i], mask=mask_i)
-        axes[1].imshow(label_rgb, **imshow_kwargs)
-        axes[1].set_title("Label")
-        axes[1].set_xlabel("Channel")
-
-        # [3] Prediction
-        pred_rgb = _das_phase_rgb(phase_pick[i])
-        axes[2].imshow(pred_rgb, **imshow_kwargs)
-        axes[2].set_title("Prediction")
-        axes[2].set_xlabel("Channel")
-
-        fig.tight_layout()
-        rank_str = f"_{int(os.environ['RANK']):02d}" if "RANK" in os.environ else ""
-        fig.savefig(f"{figure_dir}/{epoch:02d}{rank_str}_{i:02d}_{prefix}.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-def plot_phasenet_das_plus_train(meta, phase_pick, event_center, epoch, figure_dir="figures", prefix="", **kwargs):
-
-    data = meta["data"].cpu().numpy().squeeze(1)  # (nb, nx, nt)
-    nb, nx, nt = data.shape
+    norm_data = meta["data"].cpu().numpy().squeeze(1)  # (nb, nx, nt)
+    nb, nx, nt = norm_data.shape
+    raw = meta["raw_data"].cpu().numpy().squeeze(1) if "raw_data" in meta else norm_data
 
     if phase_pick is not None:
         phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)  # (nb, nx, nt, 3)
-    if event_center is not None:
-        nx_, nt_ = event_center.shape[-2:]
-        if nx_ != nx:
-            event_center = F.interpolate(event_center, size=(nx, nt_), mode="bilinear", align_corners=False)
-        event_center = event_center.cpu().numpy().transpose(0, 2, 3, 1)
 
     y_phase_pick = meta["phase_pick"].cpu().numpy().transpose(0, 2, 3, 1) if "phase_pick" in meta else None
     y_phase_mask = meta["phase_mask"].cpu().numpy().transpose(0, 2, 3, 1) if "phase_mask" in meta else None
-    y_event_center = meta["event_center"].cpu().numpy().transpose(0, 2, 3, 1) if "event_center" in meta else None
 
     imshow_kwargs = dict(aspect="auto", interpolation="nearest")
 
     for i in range(nb):
-        waveform = data[i].T  # (nt, nx)
-        vmax = np.percentile(np.abs(waveform), 95) or 1.0
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-        fig, axes = plt.subplots(2, 3, figsize=(14, 8))
-
-        # Row 1: Waveform, Phase Label, Phase Prediction
-        axes[0, 0].imshow(waveform, cmap="seismic", vmin=-vmax, vmax=vmax, **imshow_kwargs)
-        axes[0, 0].set_title(f"Data ({meta['file_name'][i]})")
-        axes[0, 0].set_ylabel("Time Sample")
+        # Row 1: Raw Data | Phase Label
+        raw_i = raw[i].T
+        vmax_raw = np.percentile(np.abs(raw_i), 95) or 1.0
+        axes[0, 0].imshow(raw_i, cmap="seismic", vmin=-vmax_raw, vmax=vmax_raw, **imshow_kwargs)
+        axes[0, 0].set_title(f"Raw ({meta['file_name'][i]})")
+        axes[0, 0].set_ylabel("Time")
 
         mask_i = y_phase_mask[i] if y_phase_mask is not None else None
         if y_phase_pick is not None:
             axes[0, 1].imshow(_das_phase_rgb(y_phase_pick[i], mask=mask_i), **imshow_kwargs)
         axes[0, 1].set_title("Phase Label")
 
-        if phase_pick is not None:
-            axes[0, 2].imshow(_das_phase_rgb(phase_pick[i]), **imshow_kwargs)
-        axes[0, 2].set_title("Phase Prediction")
+        # Row 2: Normalized Data | Phase Prediction
+        norm_i = norm_data[i].T
+        vmax_norm = np.percentile(np.abs(norm_i), 95) or 1.0
+        axes[1, 0].imshow(norm_i, cmap="seismic", vmin=-vmax_norm, vmax=vmax_norm, **imshow_kwargs)
+        axes[1, 0].set_title("Normalized")
+        axes[1, 0].set_ylabel("Time")
 
-        # Row 2: empty, Event Center Label, Event Center Prediction
-        axes[1, 0].axis("off")
+        if phase_pick is not None:
+            axes[1, 1].imshow(_das_phase_rgb(phase_pick[i]), **imshow_kwargs)
+        axes[1, 1].set_title("Phase Pred")
+
+        for ax in axes[1]:
+            ax.set_xlabel("Channel")
+
+        fig.tight_layout()
+        rank_str = f"_{int(os.environ['RANK']):02d}" if "RANK" in os.environ else ""
+        fig.savefig(f"{figure_dir}/{epoch:02d}{rank_str}_{i:02d}_{prefix}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+def _plot_event_center(ax, fig, event_center, center_mask, imshow_kwargs):
+    """Plot event center: white bg, green mask tint, red overlay for Gaussian."""
+    ec = event_center.T  # (nt, nx)
+    rgb = np.ones((*ec.shape, 3))
+    # Green tint for center_mask
+    if center_mask is not None:
+        m = center_mask.T
+        rgb[:, :, 0] = np.where(m > 0, rgb[:, :, 0] * 0.85, rgb[:, :, 0])
+        rgb[:, :, 2] = np.where(m > 0, rgb[:, :, 2] * 0.85, rgb[:, :, 2])
+    ax.imshow(rgb, **imshow_kwargs)
+    # Red overlay for event center
+    event_rgba = np.zeros((*ec.shape, 4))
+    event_rgba[:, :, 0] = 1.0  # red
+    event_rgba[:, :, 3] = ec * 0.9
+    ax.imshow(event_rgba, **imshow_kwargs)
+
+
+def _plot_event_time(ax, fig, event_time, time_mask, imshow_kwargs, vlim=None):
+    """Plot event time masked to time_mask region with colorbar."""
+    nt, nx = event_time.shape
+    disp = np.where(time_mask > 0, event_time, np.nan)
+    if vlim is not None:
+        vmin, vmax = vlim
+    else:
+        vmin = np.nanmin(disp) if np.any(time_mask > 0) else 0.0
+        vmax = np.nanmax(disp) if np.any(time_mask > 0) else 1.0
+    im = ax.imshow(disp, cmap="seismic", vmin=vmin, vmax=vmax, **imshow_kwargs)
+    fig.colorbar(im, ax=ax, shrink=0.8)
+
+
+def plot_phasenet_das_plus_train(
+    meta, phase_pick, event_center=None, event_time=None,
+    epoch=0, figure_dir="figures", prefix="", **kwargs,
+):
+    norm_data = meta["data"].cpu().numpy().squeeze(1)  # (nb, nx, nt)
+    nb, nx, nt = norm_data.shape
+    raw = meta["raw_data"].cpu().numpy().squeeze(1) if "raw_data" in meta else norm_data
+
+    # Predictions to numpy
+    if phase_pick is not None:
+        phase_pick = phase_pick.cpu().numpy().transpose(0, 2, 3, 1)  # (nb, nx, nt, 3)
+    if event_center is not None:
+        event_center = event_center.cpu().numpy().squeeze(1)  # (nb, nx_e, nt_e)
+    if event_time is not None:
+        event_time = event_time.cpu().numpy().squeeze(1)
+
+    # Labels
+    y_phase_pick = meta["phase_pick"].cpu().numpy().transpose(0, 2, 3, 1) if "phase_pick" in meta else None
+    y_phase_mask = meta["phase_mask"].cpu().numpy().transpose(0, 2, 3, 1) if "phase_mask" in meta else None
+    y_event_center = meta["event_center"].cpu().numpy().squeeze(1) if "event_center" in meta else None
+    y_event_time = meta["event_time"].cpu().numpy().squeeze(1) if "event_time" in meta else None
+    y_center_mask = meta["event_center_mask"].cpu().numpy().squeeze(1) if "event_center_mask" in meta else None
+    y_time_mask = meta["event_time_mask"].cpu().numpy().squeeze(1) if "event_time_mask" in meta else None
+
+    imshow_kwargs = dict(aspect="auto", interpolation="nearest")
+
+    for i in range(nb):
+        fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+
+        # Row 1: Raw Data | Phase Label | Event Center Label | Event Time Label
+        raw_i = raw[i].T
+        vmax_raw = np.percentile(np.abs(raw_i), 95) or 1.0
+        axes[0, 0].imshow(raw_i, cmap="seismic", vmin=-vmax_raw, vmax=vmax_raw, **imshow_kwargs)
+        axes[0, 0].set_title(f"Raw ({meta['file_name'][i]})")
+        axes[0, 0].set_ylabel("Time")
+
+        mask_i = y_phase_mask[i] if y_phase_mask is not None else None
+        if y_phase_pick is not None:
+            axes[0, 1].imshow(_das_phase_rgb(y_phase_pick[i], mask=mask_i), **imshow_kwargs)
+        axes[0, 1].set_title("Phase Label")
+
+        cm = y_center_mask[i] if y_center_mask is not None else None
+        tm = y_time_mask[i] if y_time_mask is not None else None
 
         if y_event_center is not None:
-            ec_label = y_event_center[i][:, :, 0].T  # (nt, nx)
-            axes[1, 1].imshow(ec_label, vmin=0, vmax=1, cmap="hot", **imshow_kwargs)
-        axes[1, 1].set_title("Event Center Label")
-        axes[1, 1].set_ylabel("Time Sample")
-        axes[1, 1].set_xlabel("Channel")
+            _plot_event_center(axes[0, 2], fig, y_event_center[i], center_mask=cm, imshow_kwargs=imshow_kwargs)
+        axes[0, 2].set_title("Event Center Label")
+
+        # Compute shared event time range from time_mask region
+        et_vlim = None
+        if y_event_time is not None and tm is not None:
+            vals = [y_event_time[i][tm > 0]]
+            if event_time is not None:
+                vals.append(event_time[i][tm > 0])
+            vals = np.concatenate(vals)
+            if len(vals) > 0:
+                et_vlim = (vals.min(), vals.max())
+
+        if y_event_time is not None and tm is not None:
+            _plot_event_time(axes[0, 3], fig, y_event_time[i].T, tm.T, imshow_kwargs, vlim=et_vlim)
+        axes[0, 3].set_title("Event Time Label")
+
+        # Row 2: Normalized Data | Phase Pred | Event Center Pred | Event Time Pred
+        norm_i = norm_data[i].T
+        vmax_norm = np.percentile(np.abs(norm_i), 95) or 1.0
+        axes[1, 0].imshow(norm_i, cmap="seismic", vmin=-vmax_norm, vmax=vmax_norm, **imshow_kwargs)
+        axes[1, 0].set_title("Normalized")
+        axes[1, 0].set_ylabel("Time")
+
+        if phase_pick is not None:
+            axes[1, 1].imshow(_das_phase_rgb(phase_pick[i]), **imshow_kwargs)
+        axes[1, 1].set_title("Phase Pred")
 
         if event_center is not None:
-            ec_pred = event_center[i][:, :, 0].T  # (nt, nx)
-            axes[1, 2].imshow(ec_pred, vmin=0, vmax=1, cmap="hot", **imshow_kwargs)
-        axes[1, 2].set_title("Event Center Prediction")
-        axes[1, 2].set_xlabel("Channel")
+            _plot_event_center(axes[1, 2], fig, event_center[i], center_mask=None, imshow_kwargs=imshow_kwargs)
+        axes[1, 2].set_title("Event Center Pred")
+
+        if event_time is not None and tm is not None:
+            _plot_event_time(axes[1, 3], fig, event_time[i].T, tm.T, imshow_kwargs, vlim=et_vlim)
+        axes[1, 3].set_title("Event Time Pred")
+
+        for ax in axes[1]:
+            ax.set_xlabel("Channel")
 
         fig.tight_layout()
         rank_str = f"_{int(os.environ['RANK']):02d}" if "RANK" in os.environ else ""

@@ -994,10 +994,10 @@ def _to_output(
         "data": torch.nan_to_num(data),
         "phase_pick": torch.from_numpy(labels["phase_pick"]).float(),
         "phase_mask": torch.from_numpy(labels["phase_mask"]).float(),
-        "event_center": torch.from_numpy(labels["event_center"]).float()[:, :, ::s],
-        "event_time": torch.from_numpy(labels["event_time"]).float()[:, :, ::s],
-        "event_center_mask": torch.from_numpy(labels["event_center_mask"]).float()[:, :, ::s],
-        "event_time_mask": torch.from_numpy(labels["event_time_mask"]).float()[:, :, ::s],
+        "event_center": torch.from_numpy(labels["event_center"]).float()[:, ::s, ::s],
+        "event_time": torch.from_numpy(labels["event_time"]).float()[:, ::s, ::s],
+        "event_center_mask": torch.from_numpy(labels["event_center_mask"]).float()[:, ::s, ::s],
+        "event_time_mask": torch.from_numpy(labels["event_time_mask"]).float()[:, ::s, ::s],
         "file_name": sample.file_name,
         "height": data.shape[-2],
         "width": data.shape[-1],
@@ -1403,8 +1403,6 @@ class DASIterableDataset(IterableDataset):
         else:
             print(f"DASIterableDataset: {len(self.data_list)} data files")
 
-        # Pre-calculate length
-        self._data_len = self._count()
 
     def _setup_stacking_transforms(self):
         """Connect stacking transforms to sample buffer and noise loader."""
@@ -1502,9 +1500,6 @@ class DASIterableDataset(IterableDataset):
 
     def _sample_to_output(self, sample: Sample) -> dict[str, torch.Tensor]:
         return _to_output(sample, self.label_config, self.phases, self.event_feature_scale)
-
-    def __len__(self):
-        return self._data_len
 
     def _count(self):
         if self.training:

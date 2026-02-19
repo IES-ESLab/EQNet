@@ -268,6 +268,7 @@ def plot_results(batch, output, args, epoch, prefix=""):
             return
 
         phase = torch.softmax(output["phase"], dim=1).cpu().float()
+        batch["raw_data"] = batch["data"]
         batch["data"] = moving_normalize(batch["data"])
 
         # DAS models
@@ -277,8 +278,9 @@ def plot_results(batch, output, args, epoch, prefix=""):
             )
         elif args.model == "phasenet_das_plus":
             event_center = torch.sigmoid(output["event_center"]).cpu().float() if "event_center" in output else None
+            event_time = output["event_time"].cpu().float() if "event_time" in output else None
             eqnet_utils.plot_phasenet_das_plus_train(
-                batch, phase, event_center=event_center,
+                batch, phase, event_center=event_center, event_time=event_time,
                 epoch=epoch, figure_dir=args.figure_dir, prefix=prefix,
             )
         # Seismic models with polarity
