@@ -201,7 +201,7 @@ def extract_events(
     else:
         begin_channel_index = [0 for i in range(batch)]
     if ("begin_time_index" in kwargs) and (kwargs["begin_time_index"] is not None):
-        begin_time_index = [x.item() for x in kwargs["begin_time_index"]]
+        begin_time_index = [x.item()/event_scale for x in kwargs["begin_time_index"]]
     else:
         begin_time_index = [0 for i in range(batch)]
 
@@ -260,15 +260,18 @@ def extract_events(
                                 2,
                                 event_time[i, 0, index.item(), k].item() * 2.0 * (VPVS_RATIO - 1) / (VPVS_RATIO + 1),
                             )  # 2 is to prevent error of torch.max()
-                            itp = max(0, index.item() - int(ps_delta * 0.5))
-                            its = max(0, index.item() + int(ps_delta * 0.5))
+                            itp = max(0, index.item() * event_scale - int(ps_delta * 0.5)) # waveform is not downsampled
+                            its = max(0, index.item() * event_scale + int(ps_delta * 0.5))
 
                             # p_amp = torch.max(torch.abs(waveform[i, :, itp : min(itp + p_window, its), k]))
                             # s_amp = torch.max(torch.abs(waveform[i, :, its : its + s_window, k]))
                             waveform_cut = waveform[i, :, itp : min(itp + p_window, its), k]
                             p_amp = torch.max(waveform_cut) - torch.min(waveform_cut)
                             waveform_cut = waveform[i, :, its : its + s_window, k]
-                            s_amp = torch.max(waveform_cut) - torch.min(waveform_cut)
+                            if waveform_cut.numel() == 0:
+                                s_amp = torch.tensor(0.0)
+                            else:
+                                s_amp = torch.max(waveform_cut) - torch.min(waveform_cut)
                             event_dict["sp_ratio"] = s_amp.item() / p_amp.item()
 
                             ## calculate event amplitude
