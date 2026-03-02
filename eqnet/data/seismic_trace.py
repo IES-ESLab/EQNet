@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from glob import glob
+from pathlib import Path
 
 import fsspec
 import h5py
@@ -19,6 +20,8 @@ from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
 import datasets
+
+logger = logging.getLogger(__name__)
 
 # import warnings
 # warnings.filterwarnings("error")
@@ -398,6 +401,67 @@ def drop_channel(meta):
     return meta
 
 
+# =============================================================================
+# PZ (Pole-Zero) file handling for instrument response removal
+# =============================================================================
+
+def replacer(tmp):
+    """Extract station/channel/location info from filename for PZ file matching."""
+    tmp = tmp.split('.D.')[0]
+    sta_azi_loc = tmp.split('/')[-1].split('TW.')[1]
+    sta, loc, azi = sta_azi_loc.split('.')
+    return f'{sta}_{azi}_{loc}_'
+
+
+def _find_pz(pz_parent_dir: Path, keyword: str):
+    """Find PZ file matching the given keyword in the directory."""
+    result = list(pz_parent_dir.glob(f'*{keyword}*'))
+    if not result:
+        logger.info(f"No PZ file found for {keyword}")
+        return None
+    elif len(result) == 1:
+        return result[0]
+    else:
+        logger.warning(f'More than 1 pz file found for {keyword}, using latest one...')
+        year_dict = {}
+        for i, pz in enumerate(result):
+            fit_year = (pz.stem).split(keyword)[1].split('.')[0]
+            year_dict[i] = int(fit_year)
+
+        if not year_dict:
+            raise ValueError(f"No valid year found in filename for {keyword}.")
+
+        latest_pz_key = max(year_dict, key=year_dict.get)
+        logger.warning(f"Using {result[latest_pz_key].stem}")
+
+        return result[latest_pz_key]
+
+
+def get_sensitivity(pz_file):
+    """Extract sensitivity value from PZ file."""
+    sensitivity = 0.0
+    with open(pz_file, 'r') as r:
+        lines = r.readlines()
+        for line in lines:
+            if line[:13] == '* SENSITIVITY':
+                sensitivity = float(line.strip().split()[3])
+    if sensitivity == 0.0:
+        raise ValueError(f"No sensitivity found in {pz_file}, check it.")
+    return sensitivity
+
+
+def remove_sens_manually(meta, tmp, pz_dir):
+    """Remove instrument sensitivity using PZ file."""
+    keyword = replacer(tmp)
+    pz_file = _find_pz(pz_dir, keyword)
+    if pz_file is None:
+        return meta
+    sensitivity = get_sensitivity(pz_file)
+    for i in range(len(meta)):
+        meta[i].data = meta[i].data / sensitivity
+    return meta
+
+
 class SeismicTraceIterableDataset(IterableDataset):
     degree2km = 111.32
     nt = 4096  ## 8992
@@ -432,6 +496,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         resample_time=False,
         ## for prediction
         sampling_rate=100,
+        pz_dir=None,
         response_path=None,
         response_xml=None,
         highpass_filter=0.0,
@@ -503,6 +568,7 @@ class SeismicTraceIterableDataset(IterableDataset):
         if (hdf5_file is not None) and (not training):
             self.hdf5_fp = h5py.File(hdf5_file, "r", libver="latest", swmr=True)
         self.phases = phases
+        self.pz_dir = Path(pz_dir) if pz_dir is not None else None
         self.response_path = response_path
         self.response_xml = response_xml
         self.sampling_rate = sampling_rate
@@ -1032,7 +1098,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             tr.taper(max_percentage=0.05, type="cosine")
         return stream
 
-    def read_mseed(self, fname, response_path=None, response_xml=None, highpass_filter=False, sampling_rate=100):
+    def read_mseed(self, fname, pz_dir=None, response_path=None, response_xml=None, highpass_filter=False, sampling_rate=100):
         try:
             stream = obspy.Stream()
             for tmp in fname.split(","):
@@ -1041,6 +1107,9 @@ class SeismicTraceIterableDataset(IterableDataset):
                     if response_path is not None:
                         inv = obspy.read_inventory(os.path.join(response_path, meta[0].id[:-1]) + ".xml")
                         meta = meta.remove_sensitivity(inv)
+                    elif pz_dir is not None:
+                        # Use PZ file for instrument response removal
+                        meta = remove_sens_manually(meta, tmp, pz_dir)
                     stream += meta
                 # stream += obspy.read(tmp)
             stream = stream.merge(fill_value="latest")
@@ -1237,6 +1306,7 @@ class SeismicTraceIterableDataset(IterableDataset):
             if self.format == "mseed":
                 meta = self.read_mseed(
                     fname,
+                    pz_dir=self.pz_dir,
                     response_path=self.response_path,
                     response_xml=self.response_xml,
                     highpass_filter=self.highpass_filter,
