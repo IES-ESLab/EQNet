@@ -352,7 +352,7 @@ def remove_sens_manually(meta, tmp, pz_dir):
             for i in range(len(meta)):
                 meta[i].data = meta[i].data / sensitivity
         except RuntimeWarning:
-            logger.info(f"We have a runtime warning, check the dataset:\nmeta: {meta}, tmp: {tmp}, pz_file: {pz_file}, sensitivity: {sensitivity}")
+            logger.warning(f"We have a runtime warning, check the dataset:\nmeta: {meta}, tmp: {tmp}, pz_file: {pz_file}, sensitivity: {sensitivity}")
     return meta
 
 class SeismicTraceIterableDataset(IterableDataset):
@@ -823,7 +823,12 @@ class SeismicTraceIterableDataset(IterableDataset):
                 except Exception as e:
                     print(f"Error resampling {trace.id}:\n{e}")
 
-            trace = trace.detrend("demean")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", category=RuntimeWarning)
+                try:
+                    trace = trace.detrend("demean")
+                except RuntimeWarning:
+                    logger.warning(f"Check the trace: {trace}")
 
             ## detrend
             # try:
