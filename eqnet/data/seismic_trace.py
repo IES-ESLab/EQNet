@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
-# import warnings
+import warnings
 # warnings.filterwarnings("error")
 # import numpy
 # numpy.seterr(all='raise')
@@ -346,8 +346,13 @@ def remove_sens_manually(meta, tmp, pz_dir):
     keyword = replacer(tmp)
     pz_file = _find_pz(pz_dir, keyword)
     sensitivity = get_sensitivity(pz_file)
-    for i in range(len(meta)):
-        meta[i].data = meta[i].data / sensitivity
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=RuntimeWarning)
+        try:
+            for i in range(len(meta)):
+                meta[i].data = meta[i].data / sensitivity
+        except RuntimeWarning:
+            logger.info(f"We have a runtime warning, check the dataset:\nmeta: {meta}, tmp: {tmp}, pz_file: {pz_file}, sensitivity: {sensitivity}")
     return meta
 
 class SeismicTraceIterableDataset(IterableDataset):
@@ -796,6 +801,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                 stream += meta
                 # stream += obspy.read(tmp)
             stream = stream.merge(fill_value="latest")
+            logger.info(f"For {fname}: Stream length: {len(stream)}")
             #TODO: quite weird here, but keep it for now            
             if (response_path is None) and (response_xml is not None):
                 response = obspy.read_inventory(response_xml)
@@ -996,6 +1002,7 @@ class SeismicTraceIterableDataset(IterableDataset):
                     sampling_rate=self.sampling_rate,
                 )
                 fname = fname.split(",")[0]  ##E,N,Z
+                # logger.info(f"filename: {fname}")
             elif (self.format == "h5") and (self.dataset == "seismic_trace"):
                 meta = self.read_hdf5(fname)
             elif (self.format == "h5") and (self.dataset == "das"):
